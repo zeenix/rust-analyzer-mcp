@@ -328,9 +328,6 @@ impl RustAnalyzerClient {
         self.send_notification("initialized", Some(json!({})))
             .await?;
 
-        // Give rust-analyzer some time to process the workspace
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
         Ok(())
     }
 

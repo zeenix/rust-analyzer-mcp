@@ -1,14 +1,11 @@
 pub mod fixtures;
 pub mod mock_lsp;
-pub mod server_pool;
 pub mod test_client;
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use tokio::process::{Child, Command};
 
 /// Creates a test server instance with mock LSP
 pub async fn create_test_server() -> TestServer {
@@ -19,7 +16,7 @@ pub async fn create_test_server() -> TestServer {
 
 pub struct TestServer {
     pub workspace: TempDir,
-    pub process: Option<Child>,
+    pub process: Option<tokio::process::Child>,
     pub mock_lsp: Option<mock_lsp::MockLSPServer>,
 }
 

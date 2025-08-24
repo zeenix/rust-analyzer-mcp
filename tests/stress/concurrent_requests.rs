@@ -3,7 +3,6 @@ use futures::future::join_all;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -15,29 +14,8 @@ async fn test_concurrent_tool_calls() -> Result<()> {
     let project = fixtures::TestProject::simple();
     project.create_in(workspace.path())?;
 
-    let client = Arc::new(Mutex::new(MCPTestClient::start(workspace.path())?));
-
-    // Initialize once
-    {
-        let mut c = client.lock().await;
-        c.initialize()?;
-    }
-
-    // Wait for rust-analyzer with smart polling
-    for _ in 0..30 {
-        let mut c = client.lock().await;
-        if let Ok(response) = c.get_symbols("src/main.rs") {
-            if let Some(content) = response.get("content") {
-                if let Some(text) = content[0].get("text") {
-                    if text.as_str() != Some("null") && text.as_str() != Some("[]") {
-                        break;
-                    }
-                }
-            }
-        }
-        drop(c);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let client = Arc::new(MCPTestClient::start(workspace.path()).await?);
+    client.initialize_and_wait(workspace.path()).await?;
 
     // Create multiple concurrent requests
     let tasks = vec![
@@ -66,10 +44,7 @@ async fn test_concurrent_tool_calls() -> Result<()> {
     // Execute all requests concurrently
     let futures = tasks.into_iter().map(|(tool, args)| {
         let client = Arc::clone(&client);
-        tokio::spawn(async move {
-            let mut c = client.lock().await;
-            c.call_tool(tool, args)
-        })
+        async move { client.call_tool(tool, args).await }
     });
 
     let results = join_all(futures).await;
@@ -79,12 +54,8 @@ async fn test_concurrent_tool_calls() -> Result<()> {
     // All requests should complete
     assert_eq!(results.len(), 6);
     for result in results {
-        assert!(result.is_ok(), "Request should not panic");
-        let response = result?;
-        assert!(
-            response.is_ok() || response.is_err(),
-            "Should get a response"
-        );
+        // Results are direct Result<Value> from async blocks
+        assert!(result.is_ok() || result.is_err(), "Should get a response");
     }
 
     // Concurrent execution should be faster than sequential
@@ -104,28 +75,14 @@ async fn test_many_sequential_requests() -> Result<()> {
     let project = fixtures::TestProject::simple();
     project.create_in(workspace.path())?;
 
-    let mut client = MCPTestClient::start(workspace.path())?;
-    client.initialize()?;
-
-    // Wait for rust-analyzer with smart polling
-    for _ in 0..30 {
-        if let Ok(response) = client.get_symbols("src/main.rs") {
-            if let Some(content) = response.get("content") {
-                if let Some(text) = content[0].get("text") {
-                    if text.as_str() != Some("null") && text.as_str() != Some("[]") {
-                        break;
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let client = MCPTestClient::start(workspace.path()).await?;
+    client.initialize_and_wait(workspace.path()).await?;
 
     let start = Instant::now();
 
     // Send many requests sequentially
     for i in 0..50 {
-        let _ = client.get_symbols("src/main.rs");
+        let _ = client.get_symbols("src/main.rs").await;
         if i % 10 == 0 {
             println!("Completed {} requests", i);
         }
@@ -149,29 +106,8 @@ async fn test_rapid_fire_requests() -> Result<()> {
     let project = fixtures::TestProject::simple();
     project.create_in(workspace.path())?;
 
-    let client = Arc::new(Mutex::new(MCPTestClient::start(workspace.path())?));
-
-    // Initialize
-    {
-        let mut c = client.lock().await;
-        c.initialize()?;
-    }
-
-    // Wait for rust-analyzer with smart polling
-    for _ in 0..30 {
-        let mut c = client.lock().await;
-        if let Ok(response) = c.get_symbols("src/main.rs") {
-            if let Some(content) = response.get("content") {
-                if let Some(text) = content[0].get("text") {
-                    if text.as_str() != Some("null") && text.as_str() != Some("[]") {
-                        break;
-                    }
-                }
-            }
-        }
-        drop(c);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let client = Arc::new(MCPTestClient::start(workspace.path()).await?);
+    client.initialize_and_wait(workspace.path()).await?;
 
     // Send requests as fast as possible without waiting
     let mut handles = vec![];
@@ -179,16 +115,12 @@ async fn test_rapid_fire_requests() -> Result<()> {
     for i in 0..20 {
         let client = Arc::clone(&client);
         let handle = tokio::spawn(async move {
-            let mut c = client.lock().await;
             let start = Instant::now();
-            let result = c.get_symbols("src/main.rs");
+            let result = client.get_symbols("src/main.rs").await;
             let elapsed = start.elapsed();
             (i, result, elapsed)
         });
         handles.push(handle);
-
-        // Small delay to avoid overwhelming the system
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // Collect results
@@ -229,29 +161,32 @@ async fn test_large_file_processing() -> Result<()> {
     let project = fixtures::TestProject::large_codebase();
     project.create_in(workspace.path())?;
 
-    let mut client = MCPTestClient::start(workspace.path())?;
-    client.initialize()?;
-
-    // Wait for rust-analyzer with smart polling (longer for large project)
-    for _ in 0..50 {
-        if let Ok(response) = client.get_symbols("src/lib.rs") {
-            if let Some(content) = response.get("content") {
-                if let Some(text) = content[0].get("text") {
-                    if text.as_str() != Some("null") && text.as_str() != Some("[]") {
-                        break;
-                    }
+    let client = MCPTestClient::start(workspace.path()).await?;
+    // Use longer timeout for large project initialization
+    client
+        .send_request_with_timeout(
+            "initialize",
+            Some(json!({
+                "protocolVersion": "0.1.0",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0.0"
                 }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+            })),
+            Duration::from_secs(30),
+        )
+        .await?;
+
+    // Wait for rust-analyzer initialization
+    client.initialize_and_wait(workspace.path()).await?;
 
     let start = Instant::now();
 
     // Process multiple large files sequentially
     for i in 0..10 {
         let file_path = format!("src/module_{}.rs", i);
-        let _ = client.get_symbols(&file_path);
+        let _ = client.get_symbols(&file_path).await;
     }
 
     let elapsed = start.elapsed();
@@ -272,16 +207,16 @@ async fn test_error_recovery() -> Result<()> {
     let project = fixtures::TestProject::simple();
     project.create_in(workspace.path())?;
 
-    let mut client = MCPTestClient::start(workspace.path())?;
-    client.initialize()?;
+    let client = MCPTestClient::start(workspace.path()).await?;
+    client.initialize().await?;
 
     // Send invalid requests
     for _ in 0..5 {
-        let _ = client.get_symbols("non_existent_file.rs");
+        let _ = client.get_symbols("non_existent_file.rs").await;
     }
 
     // Server should still work after errors
-    let response = client.get_symbols("src/main.rs");
+    let response = client.get_symbols("src/main.rs").await;
     assert!(response.is_ok(), "Server should recover from errors");
 
     Ok(())
@@ -293,11 +228,8 @@ async fn test_memory_stability() -> Result<()> {
     let project = fixtures::TestProject::simple();
     project.create_in(workspace.path())?;
 
-    let mut client = MCPTestClient::start(workspace.path())?;
-    client.initialize()?;
-
-    // Wait for initialization
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let client = MCPTestClient::start(workspace.path()).await?;
+    client.initialize_and_wait(workspace.path()).await?;
 
     // Send many requests to test memory stability
     for iteration in 0..10 {
@@ -305,17 +237,14 @@ async fn test_memory_stability() -> Result<()> {
 
         // Mix of different request types
         for _ in 0..10 {
-            let _ = client.get_symbols("src/main.rs");
-            let _ = client.get_hover("src/main.rs", 1, 10);
-            let _ = client.get_completion("src/main.rs", 2, 5);
+            let _ = client.get_symbols("src/main.rs").await;
+            let _ = client.get_hover("src/main.rs", 1, 10).await;
+            let _ = client.get_completion("src/main.rs", 2, 5).await;
         }
-
-        // Give system time to clean up
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // Final request should still work
-    let final_response = client.get_symbols("src/main.rs");
+    let final_response = client.get_symbols("src/main.rs").await;
     assert!(
         final_response.is_ok(),
         "Server should remain stable after many requests"

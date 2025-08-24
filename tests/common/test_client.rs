@@ -1,61 +1,105 @@
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tokio::time::timeout;
 
-/// MCP test client for integration testing
+/// MCP test client for integration testing - fully async
 pub struct MCPTestClient {
-    process: Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    process: Option<Child>,
+    stdin: Mutex<tokio::process::ChildStdin>,
+    stdout: Mutex<BufReader<tokio::process::ChildStdout>>,
     request_id: AtomicU64,
 }
 
 impl MCPTestClient {
     /// Start a new MCP server process
-    pub fn start(workspace: &Path) -> Result<Self> {
-        let mut process = Command::new("cargo")
-            .args(&["run", "--", workspace.to_str().unwrap()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+    pub async fn start(workspace: &Path) -> Result<Self> {
+        // Use the built binary directly instead of cargo run for speed and isolation
+        let binary = if std::path::Path::new("target/release/rust-analyzer-mcp").exists() {
+            "target/release/rust-analyzer-mcp"
+        } else if std::path::Path::new("target/debug/rust-analyzer-mcp").exists() {
+            "target/debug/rust-analyzer-mcp"
+        } else {
+            // Fall back to cargo run if binary not built
+            return Self::start_with_cargo(workspace).await;
+        };
+
+        let mut process = Command::new(binary)
+            .arg(workspace.to_str().unwrap())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
         let stdout = BufReader::new(process.stdout.take().unwrap());
 
         Ok(Self {
-            process,
-            stdin,
-            stdout,
+            process: Some(process),
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(stdout),
+            request_id: AtomicU64::new(1),
+        })
+    }
+
+    /// Start using cargo run (fallback)
+    async fn start_with_cargo(workspace: &Path) -> Result<Self> {
+        let mut process = Command::new("cargo")
+            .args(&["run", "--", workspace.to_str().unwrap()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        let stdin = process.stdin.take().unwrap();
+        let stdout = BufReader::new(process.stdout.take().unwrap());
+
+        Ok(Self {
+            process: Some(process),
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(stdout),
             request_id: AtomicU64::new(1),
         })
     }
 
     /// Start with a specific binary path
-    pub fn start_with_binary(binary: &Path, workspace: &Path) -> Result<Self> {
+    pub async fn start_with_binary(binary: &Path, workspace: &Path) -> Result<Self> {
         let mut process = Command::new(binary)
             .arg(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
         let stdout = BufReader::new(process.stdout.take().unwrap());
 
         Ok(Self {
-            process,
-            stdin,
-            stdout,
+            process: Some(process),
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(stdout),
             request_id: AtomicU64::new(1),
         })
     }
 
-    /// Send a request and wait for response
-    pub fn send_request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
+    /// Send a request and wait for response with timeout
+    pub async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        self.send_request_with_timeout(method, params, Duration::from_secs(10))
+            .await
+    }
+
+    /// Send a request with custom timeout
+    pub async fn send_request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout_duration: Duration,
+    ) -> Result<Value> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
 
         let mut request = json!({
@@ -70,12 +114,22 @@ impl MCPTestClient {
 
         // Send request
         let request_str = serde_json::to_string(&request)?;
-        writeln!(self.stdin, "{}", request_str)?;
-        self.stdin.flush()?;
+        {
+            let mut stdin = self.stdin.lock().await;
+            stdin.write_all(request_str.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await?;
+        }
 
-        // Read response
-        let mut response_line = String::new();
-        self.stdout.read_line(&mut response_line)?;
+        // Read response with timeout
+        let response_line = timeout(timeout_duration, async {
+            let mut line = String::new();
+            let mut stdout = self.stdout.lock().await;
+            stdout.read_line(&mut line).await?;
+            Ok::<String, anyhow::Error>(line)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Request timeout after {:?}", timeout_duration))??;
 
         let response: Value = serde_json::from_str(&response_line)?;
 
@@ -88,7 +142,7 @@ impl MCPTestClient {
     }
 
     /// Send a notification (no response expected)
-    pub fn send_notification(&mut self, method: &str, params: Option<Value>) -> Result<()> {
+    pub async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<()> {
         let mut notification = json!({
             "jsonrpc": "2.0",
             "method": method
@@ -99,14 +153,16 @@ impl MCPTestClient {
         }
 
         let notification_str = serde_json::to_string(&notification)?;
-        writeln!(self.stdin, "{}", notification_str)?;
-        self.stdin.flush()?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(notification_str.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
 
         Ok(())
     }
 
     /// Initialize the MCP server
-    pub fn initialize(&mut self) -> Result<Value> {
+    pub async fn initialize(&self) -> Result<Value> {
         self.send_request(
             "initialize",
             Some(json!({
@@ -118,10 +174,56 @@ impl MCPTestClient {
                 }
             })),
         )
+        .await
+    }
+
+    /// Initialize and wait for rust-analyzer to be ready
+    pub async fn initialize_and_wait(&self, _workspace: &Path) -> Result<()> {
+        self.initialize().await?;
+
+        // rust-analyzer returns null while indexing, so we need to poll.
+        // Use small polling intervals to minimize waiting.
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(30);
+        let poll_interval = Duration::from_millis(50); // Small interval to minimize wait
+
+        loop {
+            if start.elapsed() > timeout {
+                return Err(anyhow::anyhow!(
+                    "Timeout waiting for rust-analyzer to be ready after 30 seconds"
+                ));
+            }
+
+            // Try to get symbols
+            let symbols_response = self
+                .call_tool("rust_analyzer_symbols", json!({"file_path": "src/main.rs"}))
+                .await;
+
+            // Check if we got valid symbols (not null or empty)
+            if let Ok(response) = symbols_response {
+                if let Some(content) = response.get("content") {
+                    if let Some(text) = content[0].get("text") {
+                        if text.as_str() != Some("null") && text.as_str() != Some("[]") {
+                            if let Ok(symbols) =
+                                serde_json::from_str::<Vec<Value>>(text.as_str().unwrap_or("[]"))
+                            {
+                                if !symbols.is_empty() {
+                                    // rust-analyzer is ready
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Not ready yet, wait a small interval before retrying
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     /// Call a tool
-    pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
+    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
         self.send_request(
             "tools/call",
             Some(json!({
@@ -129,54 +231,97 @@ impl MCPTestClient {
                 "arguments": arguments
             })),
         )
+        .await
+    }
+
+    /// Call a tool with custom timeout
+    pub async fn call_tool_with_timeout(
+        &self,
+        name: &str,
+        arguments: Value,
+        timeout_duration: Duration,
+    ) -> Result<Value> {
+        self.send_request_with_timeout(
+            "tools/call",
+            Some(json!({
+                "name": name,
+                "arguments": arguments
+            })),
+            timeout_duration,
+        )
+        .await
     }
 
     /// Set workspace
-    pub fn set_workspace(&mut self, workspace: &Path) -> Result<Value> {
+    pub async fn set_workspace(&self, workspace: &Path) -> Result<Value> {
         self.call_tool(
             "rust_analyzer_set_workspace",
             json!({
                 "workspace_path": workspace.to_str().unwrap()
             }),
         )
+        .await
     }
 
     /// Get symbols for a file
-    pub fn get_symbols(&mut self, file_path: &str) -> Result<Value> {
+    pub async fn get_symbols(&self, file_path: &str) -> Result<Value> {
         self.call_tool(
             "rust_analyzer_symbols",
             json!({
                 "file_path": file_path
             }),
         )
+        .await
+    }
+
+    /// Get symbols with retry for initialization
+    pub async fn get_symbols_with_retry(&self, file_path: &str) -> Result<Value> {
+        // Just delegate to get_symbols since rust-analyzer should already be initialized
+        self.get_symbols(file_path).await
     }
 
     /// Get definition at position
-    pub fn get_definition(&mut self, file_path: &str, line: u32, character: u32) -> Result<Value> {
-        self.call_tool(
+    pub async fn get_definition(
+        &self,
+        file_path: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Value> {
+        // Try with longer timeout for definition requests
+        self.call_tool_with_timeout(
             "rust_analyzer_definition",
             json!({
                 "file_path": file_path,
                 "line": line,
                 "character": character
             }),
+            Duration::from_secs(15),
         )
+        .await
     }
 
     /// Get references at position
-    pub fn get_references(&mut self, file_path: &str, line: u32, character: u32) -> Result<Value> {
-        self.call_tool(
+    pub async fn get_references(
+        &self,
+        file_path: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Value> {
+        // Try with longer timeout for references requests
+        self.call_tool_with_timeout(
             "rust_analyzer_references",
             json!({
                 "file_path": file_path,
                 "line": line,
                 "character": character
             }),
+            Duration::from_secs(15),
         )
+        .await
     }
 
     /// Get hover information at position
-    pub fn get_hover(&mut self, file_path: &str, line: u32, character: u32) -> Result<Value> {
+    pub async fn get_hover(&self, file_path: &str, line: u32, character: u32) -> Result<Value> {
         self.call_tool(
             "rust_analyzer_hover",
             json!({
@@ -185,10 +330,16 @@ impl MCPTestClient {
                 "character": character
             }),
         )
+        .await
     }
 
     /// Get completions at position
-    pub fn get_completion(&mut self, file_path: &str, line: u32, character: u32) -> Result<Value> {
+    pub async fn get_completion(
+        &self,
+        file_path: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Value> {
         self.call_tool(
             "rust_analyzer_completion",
             json!({
@@ -197,28 +348,33 @@ impl MCPTestClient {
                 "character": character
             }),
         )
+        .await
     }
 
     /// Format a file
-    pub fn format(&mut self, file_path: &str) -> Result<Value> {
-        self.call_tool(
+    pub async fn format(&self, file_path: &str) -> Result<Value> {
+        // Try with longer timeout for format requests
+        self.call_tool_with_timeout(
             "rust_analyzer_format",
             json!({
                 "file_path": file_path
             }),
+            Duration::from_secs(15),
         )
+        .await
     }
 
     /// Shutdown the server
-    pub fn shutdown(&mut self) -> Result<()> {
-        self.send_notification("shutdown", None)?;
+    pub async fn shutdown(&self) -> Result<()> {
+        self.send_notification("shutdown", None).await?;
         Ok(())
     }
 }
 
 impl Drop for MCPTestClient {
     fn drop(&mut self) {
-        let _ = self.shutdown();
-        let _ = self.process.kill();
+        if let Some(mut process) = self.process.take() {
+            let _ = process.kill();
+        }
     }
 }
