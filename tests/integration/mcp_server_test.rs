@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rstest::*;
 use serde_json::{json, Value};
-use serial_test::serial;
+// Removed serial_test as tests use independent workspaces
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -10,6 +10,38 @@ use tokio::time::timeout;
 #[path = "../common/mod.rs"]
 mod common;
 use common::{fixtures, test_client::MCPTestClient};
+
+/// Helper to wait for rust-analyzer to be ready with smart polling
+async fn wait_for_analyzer_ready(client: &mut MCPTestClient, _workspace: &PathBuf) -> Result<()> {
+    let start = std::time::Instant::now();
+    let max_wait = Duration::from_secs(10);
+
+    while start.elapsed() < max_wait {
+        // Try to get symbols to check if analyzer is ready
+        if let Ok(response) = client.get_symbols("src/main.rs") {
+            if let Some(content) = response.get("content") {
+                if let Some(text) = content[0].get("text") {
+                    // Check if we got actual symbols, not null or empty
+                    if text.as_str() != Some("null") && text.as_str() != Some("[]") {
+                        if let Ok(symbols) =
+                            serde_json::from_str::<Vec<Value>>(text.as_str().unwrap_or("[]"))
+                        {
+                            if !symbols.is_empty() {
+                                return Ok(()); // Analyzer is ready
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "Timeout waiting for rust-analyzer to be ready"
+    ))
+}
 
 #[fixture]
 fn test_workspace() -> PathBuf {
@@ -21,7 +53,6 @@ fn test_workspace() -> PathBuf {
 
 #[rstest]
 #[tokio::test]
-#[serial]
 async fn test_server_initialization(test_workspace: PathBuf) -> Result<()> {
     let mut client = MCPTestClient::start(&test_workspace)?;
 
@@ -44,13 +75,12 @@ async fn test_server_initialization(test_workspace: PathBuf) -> Result<()> {
 
 #[rstest]
 #[tokio::test]
-#[serial]
 async fn test_symbols_tool(test_workspace: PathBuf) -> Result<()> {
     let mut client = MCPTestClient::start(&test_workspace)?;
     client.initialize()?;
 
-    // Wait for rust-analyzer to initialize
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for rust-analyzer to be ready with smart polling
+    wait_for_analyzer_ready(&mut client, &test_workspace).await?;
 
     // Get symbols for main.rs
     let response = timeout(Duration::from_secs(10), async {
@@ -92,24 +122,44 @@ async fn test_symbols_tool(test_workspace: PathBuf) -> Result<()> {
 
 #[rstest]
 #[tokio::test]
-#[serial]
 async fn test_definition_tool(test_workspace: PathBuf) -> Result<()> {
     let mut client = MCPTestClient::start(&test_workspace)?;
     client.initialize()?;
 
-    // Wait for rust-analyzer to initialize
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for rust-analyzer to be ready with smart polling
+    wait_for_analyzer_ready(&mut client, &test_workspace).await?;
 
-    // Get definition for 'greet' call in main function
-    let response = timeout(Duration::from_secs(10), async {
-        client.get_definition("src/main.rs", 1, 20)
-    })
-    .await??;
+    // Get definition for 'greet' call in main function - retry with short delays
+    let mut response = Value::Null;
+    for attempt in 0..5 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        response = timeout(Duration::from_secs(10), async {
+            client.get_definition("src/main.rs", 1, 20)
+        })
+        .await??;
+
+        // Check if we got a valid response
+        if let Some(content) = response.get("content") {
+            if let Some(text) = content[0].get("text") {
+                if text.as_str() != Some("null") {
+                    break; // Got a valid response
+                }
+            }
+        }
+    }
 
     // Parse response
     if let Some(content) = response.get("content") {
         if let Some(text) = content[0].get("text") {
-            let definitions: Vec<Value> = serde_json::from_str(text.as_str().unwrap_or("[]"))?;
+            // Handle the response - it might be "null" string initially
+            let definitions: Vec<Value> = if text.is_null() || text.as_str() == Some("null") {
+                vec![]
+            } else {
+                serde_json::from_str(text.as_str().unwrap_or("[]"))?
+            };
 
             // Check that we have a definition
             assert!(!definitions.is_empty(), "Should find definition for greet");
@@ -128,24 +178,44 @@ async fn test_definition_tool(test_workspace: PathBuf) -> Result<()> {
 
 #[rstest]
 #[tokio::test]
-#[serial]
 async fn test_references_tool(test_workspace: PathBuf) -> Result<()> {
     let mut client = MCPTestClient::start(&test_workspace)?;
     client.initialize()?;
 
-    // Wait for rust-analyzer to initialize
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for rust-analyzer to be ready with smart polling
+    wait_for_analyzer_ready(&mut client, &test_workspace).await?;
 
-    // Get references for 'greet' function
-    let response = timeout(Duration::from_secs(10), async {
-        client.get_references("src/main.rs", 9, 3)
-    })
-    .await??;
+    // Get references for 'greet' function - retry with short delays
+    let mut response = Value::Null;
+    for attempt in 0..5 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        response = timeout(Duration::from_secs(10), async {
+            client.get_references("src/main.rs", 9, 3)
+        })
+        .await??;
+
+        // Check if we got a valid response
+        if let Some(content) = response.get("content") {
+            if let Some(text) = content[0].get("text") {
+                if text.as_str() != Some("null") {
+                    break; // Got a valid response
+                }
+            }
+        }
+    }
 
     // Parse response
     if let Some(content) = response.get("content") {
         if let Some(text) = content[0].get("text") {
-            let references: Vec<Value> = serde_json::from_str(text.as_str().unwrap_or("[]"))?;
+            // Handle the response - it might be "null" string initially
+            let references: Vec<Value> = if text.is_null() || text.as_str() == Some("null") {
+                vec![]
+            } else {
+                serde_json::from_str(text.as_str().unwrap_or("[]"))?
+            };
 
             // Check that we have references
             assert!(
@@ -174,24 +244,44 @@ async fn test_references_tool(test_workspace: PathBuf) -> Result<()> {
 
 #[rstest]
 #[tokio::test]
-#[serial]
 async fn test_hover_tool(test_workspace: PathBuf) -> Result<()> {
     let mut client = MCPTestClient::start(&test_workspace)?;
     client.initialize()?;
 
-    // Wait for rust-analyzer to initialize
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for rust-analyzer to be ready with smart polling
+    wait_for_analyzer_ready(&mut client, &test_workspace).await?;
 
-    // Get hover information for 'Calculator' struct
-    let response = timeout(Duration::from_secs(10), async {
-        client.get_hover("src/main.rs", 13, 7)
-    })
-    .await??;
+    // Get hover information for 'Calculator' struct - retry with short delays
+    let mut response = Value::Null;
+    for attempt in 0..5 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        response = timeout(Duration::from_secs(10), async {
+            client.get_hover("src/main.rs", 13, 7)
+        })
+        .await??;
+
+        // Check if we got a valid response
+        if let Some(content) = response.get("content") {
+            if let Some(text) = content[0].get("text") {
+                if text.as_str() != Some("null") {
+                    break; // Got a valid response
+                }
+            }
+        }
+    }
 
     // Parse response
     if let Some(content) = response.get("content") {
         if let Some(text) = content[0].get("text") {
-            let hover: Value = serde_json::from_str(text.as_str().unwrap_or("{}"))?;
+            // Handle the response - it might be "null" string initially
+            let hover: Value = if text.is_null() || text.as_str() == Some("null") {
+                json!({})
+            } else {
+                serde_json::from_str(text.as_str().unwrap_or("{}"))?
+            };
 
             // Check that we have hover content
             assert!(
@@ -217,13 +307,12 @@ async fn test_hover_tool(test_workspace: PathBuf) -> Result<()> {
 
 #[rstest]
 #[tokio::test]
-#[serial]
 async fn test_completion_tool(test_workspace: PathBuf) -> Result<()> {
     let mut client = MCPTestClient::start(&test_workspace)?;
     client.initialize()?;
 
-    // Wait for rust-analyzer to initialize
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for rust-analyzer to be ready with smart polling
+    wait_for_analyzer_ready(&mut client, &test_workspace).await?;
 
     // Get completions in main function
     let response = timeout(Duration::from_secs(10), async {
@@ -254,13 +343,12 @@ async fn test_completion_tool(test_workspace: PathBuf) -> Result<()> {
 
 #[rstest]
 #[tokio::test]
-#[serial]
 async fn test_format_tool(test_workspace: PathBuf) -> Result<()> {
     let mut client = MCPTestClient::start(&test_workspace)?;
     client.initialize()?;
 
-    // Wait for rust-analyzer to initialize
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for rust-analyzer to be ready with smart polling
+    wait_for_analyzer_ready(&mut client, &test_workspace).await?;
 
     // Format main.rs
     let response = timeout(Duration::from_secs(10), async {
@@ -290,7 +378,6 @@ async fn test_format_tool(test_workspace: PathBuf) -> Result<()> {
 
 #[rstest]
 #[tokio::test]
-#[serial]
 async fn test_workspace_change(test_workspace: PathBuf) -> Result<()> {
     let mut client = MCPTestClient::start(&test_workspace)?;
     client.initialize()?;
@@ -324,7 +411,6 @@ async fn test_workspace_change(test_workspace: PathBuf) -> Result<()> {
 #[case::invalid_file("non_existent.rs")]
 #[case::invalid_path("../../../etc/passwd")]
 #[tokio::test]
-#[serial]
 async fn test_error_handling_invalid_file(
     test_workspace: PathBuf,
     #[case] file_path: &str,
@@ -357,7 +443,6 @@ async fn test_error_handling_invalid_file(
 #[case::huge_column(0, 999999)]
 #[case::both_invalid(u32::MAX, u32::MAX)]
 #[tokio::test]
-#[serial]
 async fn test_error_handling_invalid_position(
     test_workspace: PathBuf,
     #[case] line: u32,

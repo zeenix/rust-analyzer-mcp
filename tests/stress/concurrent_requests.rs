@@ -23,8 +23,21 @@ async fn test_concurrent_tool_calls() -> Result<()> {
         c.initialize()?;
     }
 
-    // Wait for rust-analyzer to initialize
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for rust-analyzer with smart polling
+    for _ in 0..30 {
+        let mut c = client.lock().await;
+        if let Ok(response) = c.get_symbols("src/main.rs") {
+            if let Some(content) = response.get("content") {
+                if let Some(text) = content[0].get("text") {
+                    if text.as_str() != Some("null") && text.as_str() != Some("[]") {
+                        break;
+                    }
+                }
+            }
+        }
+        drop(c);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // Create multiple concurrent requests
     let tasks = vec![
@@ -94,8 +107,19 @@ async fn test_many_sequential_requests() -> Result<()> {
     let mut client = MCPTestClient::start(workspace.path())?;
     client.initialize()?;
 
-    // Wait for rust-analyzer to initialize
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for rust-analyzer with smart polling
+    for _ in 0..30 {
+        if let Ok(response) = client.get_symbols("src/main.rs") {
+            if let Some(content) = response.get("content") {
+                if let Some(text) = content[0].get("text") {
+                    if text.as_str() != Some("null") && text.as_str() != Some("[]") {
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     let start = Instant::now();
 
@@ -133,8 +157,21 @@ async fn test_rapid_fire_requests() -> Result<()> {
         c.initialize()?;
     }
 
-    // Wait for rust-analyzer to initialize
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for rust-analyzer with smart polling
+    for _ in 0..30 {
+        let mut c = client.lock().await;
+        if let Ok(response) = c.get_symbols("src/main.rs") {
+            if let Some(content) = response.get("content") {
+                if let Some(text) = content[0].get("text") {
+                    if text.as_str() != Some("null") && text.as_str() != Some("[]") {
+                        break;
+                    }
+                }
+            }
+        }
+        drop(c);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // Send requests as fast as possible without waiting
     let mut handles = vec![];
@@ -195,8 +232,19 @@ async fn test_large_file_processing() -> Result<()> {
     let mut client = MCPTestClient::start(workspace.path())?;
     client.initialize()?;
 
-    // Wait for rust-analyzer to initialize with large project
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait for rust-analyzer with smart polling (longer for large project)
+    for _ in 0..50 {
+        if let Ok(response) = client.get_symbols("src/lib.rs") {
+            if let Some(content) = response.get("content") {
+                if let Some(text) = content[0].get("text") {
+                    if text.as_str() != Some("null") && text.as_str() != Some("[]") {
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     let start = Instant::now();
 

@@ -1,5 +1,6 @@
 pub mod fixtures;
 pub mod mock_lsp;
+pub mod server_pool;
 pub mod test_client;
 
 use anyhow::Result;
