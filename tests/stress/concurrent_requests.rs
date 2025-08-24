@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures::future::join_all;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -199,15 +200,7 @@ async fn test_large_file_processing() -> Result<()> {
 
     let start = Instant::now();
 
-    // Process multiple large files
-    let mut tasks = vec![];
-    for i in 0..10 {
-        let file_path = format!("src/module_{}.rs", i);
-        tasks.push(async { client.get_symbols(&file_path) });
-    }
-
-    // This would need proper async handling in real implementation
-    // For now, process sequentially
+    // Process multiple large files sequentially
     for i in 0..10 {
         let file_path = format!("src/module_{}.rs", i);
         let _ = client.get_symbols(&file_path);

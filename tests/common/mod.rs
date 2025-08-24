@@ -25,7 +25,7 @@ pub struct TestServer {
 impl TestServer {
     pub async fn new() -> Result<Self> {
         let workspace = TempDir::new()?;
-        fixtures::TestProject::simple().create_in(&workspace)?;
+        fixtures::TestProject::simple().create_in(workspace.path())?;
 
         Ok(Self {
             workspace,
@@ -36,7 +36,7 @@ impl TestServer {
 
     pub async fn with_mock_lsp() -> Result<Self> {
         let workspace = TempDir::new()?;
-        fixtures::TestProject::simple().create_in(&workspace)?;
+        fixtures::TestProject::simple().create_in(workspace.path())?;
 
         let mock_lsp = mock_lsp::MockLSPServer::start().await;
 

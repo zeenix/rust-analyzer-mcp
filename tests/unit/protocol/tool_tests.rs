@@ -68,7 +68,7 @@ fn test_all_tools_have_valid_schemas() {
         ("rust_analyzer_set_workspace", vec!["workspace_path"]),
     ];
 
-    for (name, required_fields) in tools {
+    for (_name, required_fields) in tools {
         let schema = json!({
             "type": "object",
             "properties": {},

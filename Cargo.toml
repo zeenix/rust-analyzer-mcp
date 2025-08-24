@@ -45,7 +45,6 @@ tempfile = "3.8"            # Temporary directories for tests
 test-log = "0.2"            # Capture logs in tests
 serial_test = "3.0"         # Serial test execution
 rstest = "0.23"             # Parameterized tests
-insta = "1.36"              # Snapshot testing
 
 # JSON/Protocol testing
 jsonschema = "0.25"         # JSON schema validation
