@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -79,6 +79,7 @@ pub struct RustAnalyzerClient {
     stdin: Option<BufWriter<tokio::process::ChildStdin>>,
     pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     initialized: bool,
+    open_documents: Arc<Mutex<HashSet<String>>>,
 }
 
 impl RustAnalyzerClient {
@@ -90,6 +91,7 @@ impl RustAnalyzerClient {
             stdin: None,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             initialized: false,
+            open_documents: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -177,10 +179,9 @@ impl RustAnalyzerClient {
                                 tokio::io::AsyncReadExt::read_exact(&mut reader, &mut json_buffer)
                                     .await
                             {
-                                info!(
-                                    "Received LSP response: {}",
-                                    String::from_utf8_lossy(&json_buffer)
-                                );
+                                let response_str = String::from_utf8_lossy(&json_buffer);
+                                info!("Received LSP response: {}", response_str);
+
                                 if let Ok(response) =
                                     serde_json::from_slice::<LSPResponse>(&json_buffer)
                                 {
@@ -192,6 +193,10 @@ impl RustAnalyzerClient {
                                                 let _ = sender.send(json!(null));
                                             } else {
                                                 let result = response.result.unwrap_or(json!(null));
+                                                info!(
+                                                    "Sending result for request {}: {:?}",
+                                                    id, result
+                                                );
                                                 let _ = sender.send(result);
                                             }
                                         }
@@ -321,6 +326,15 @@ impl RustAnalyzerClient {
     }
 
     pub async fn open_document(&mut self, uri: &str, content: &str) -> Result<()> {
+        // Check if document is already open
+        {
+            let open_docs = self.open_documents.lock().await;
+            if open_docs.contains(uri) {
+                info!("Document already open: {}", uri);
+                return Ok(());
+            }
+        }
+
         info!("Opening document: {}", uri);
         let params = json!({
             "textDocument": {
@@ -333,6 +347,12 @@ impl RustAnalyzerClient {
 
         self.send_notification("textDocument/didOpen", Some(params))
             .await?;
+
+        // Mark document as open
+        {
+            let mut open_docs = self.open_documents.lock().await;
+            open_docs.insert(uri.to_string());
+        }
 
         // Give rust-analyzer time to process the document
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -433,6 +453,8 @@ impl RustAnalyzerClient {
             let _ = process.kill().await;
         }
 
+        // Clear open documents
+        self.open_documents.lock().await.clear();
         self.initialized = false;
         Ok(())
     }

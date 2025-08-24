@@ -1,1 +1,20 @@
-/target
+# Rust build artifacts
+/target/
+/test-project/target/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Debug files
+*.pdb
+
+# Python cache
+__pycache__/
+*.pyc

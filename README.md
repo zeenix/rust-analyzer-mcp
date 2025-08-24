@@ -80,20 +80,15 @@ The server communicates via stdio and follows the MCP protocol.
 
 ## Available Tools
 
-### `rust_analyzer_hover`
-Get hover information (documentation, type info) for a symbol at a specific position.
+### Working Features ✅
+
+#### `rust_analyzer_symbols`
+Get all symbols (functions, structs, enums, etc.) in a file.
 
 **Parameters:**
-- `file_path`: Path to the Rust file (relative to workspace)
-- `line`: Line number (0-based)
-- `character`: Character position (0-based)
+- `file_path`: Path to the Rust file
 
-**Example usage:**
-```
-Get hover information for the symbol at line 10, character 5 in src/main.rs
-```
-
-### `rust_analyzer_definition`
+#### `rust_analyzer_definition`
 Find the definition of a symbol at a specific position.
 
 **Parameters:**
@@ -101,7 +96,7 @@ Find the definition of a symbol at a specific position.
 - `line`: Line number (0-based)  
 - `character`: Character position (0-based)
 
-### `rust_analyzer_references`
+#### `rust_analyzer_references`
 Find all references to a symbol at a specific position.
 
 **Parameters:**
@@ -109,7 +104,15 @@ Find all references to a symbol at a specific position.
 - `line`: Line number (0-based)
 - `character`: Character position (0-based)
 
-### `rust_analyzer_completion`
+#### `rust_analyzer_hover`
+Get hover information (documentation, type info) for a symbol at a specific position.
+
+**Parameters:**
+- `file_path`: Path to the Rust file (relative to workspace)
+- `line`: Line number (0-based)
+- `character`: Character position (0-based)
+
+#### `rust_analyzer_completion`
 Get code completion suggestions at a specific position.
 
 **Parameters:**
@@ -117,25 +120,21 @@ Get code completion suggestions at a specific position.
 - `line`: Line number (0-based)
 - `character`: Character position (0-based)
 
-### `rust_analyzer_symbols`
-Get all symbols (functions, structs, enums, etc.) in a file.
-
-**Parameters:**
-- `file_path`: Path to the Rust file
-
-### `rust_analyzer_format`
+#### `rust_analyzer_format`
 Format a Rust file using rust-analyzer's formatter.
 
 **Parameters:**
 - `file_path`: Path to the Rust file
 
-### `rust_analyzer_code_actions`
-Get available code actions (quick fixes, refactorings) for a range.
+### Limited Functionality ⚠️
+
+#### `rust_analyzer_code_actions`
+Get available code actions (quick fixes, refactorings) for a range. *Currently returns null.*
 
 **Parameters:**
 - `file_path`: Path to the Rust file
-- `line`: Start line number (0-based)
-- `character`: Start character position (0-based)
+- `start_line`: Start line number (0-based)
+- `start_character`: Start character position (0-based)
 - `end_line`: End line number (0-based)
 - `end_character`: End character position (0-based)
 
