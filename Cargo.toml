@@ -5,6 +5,7 @@ edition = "2021"
 description = "MCP server for rust-analyzer integration"
 authors = ["Zeeshan Ali Khan <zeenix@gmail.com>"]
 license = "MIT"
+license-file = "LICENSE"
 repository = "https://github.com/yourusername/rust-analyzer-mcp-server"
 keywords = ["mcp", "rust-analyzer", "language-server", "rust"]
 categories = ["development-tools"]
