@@ -94,9 +94,18 @@ impl RustAnalyzerClient {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        info!("Starting rust-analyzer process");
+        info!(
+            "Starting rust-analyzer process in workspace: {}",
+            self.workspace_root.display()
+        );
 
-        let mut child = Command::new("rust-analyzer")
+        // Find rust-analyzer executable
+        let rust_analyzer_path = which::which("rust-analyzer")
+            .map_err(|e| anyhow!("Failed to find rust-analyzer in PATH: {}. Please ensure rust-analyzer is installed.", e))?;
+
+        info!("Using rust-analyzer at: {}", rust_analyzer_path.display());
+
+        let mut child = Command::new(rust_analyzer_path)
             .current_dir(&self.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -112,8 +121,33 @@ impl RustAnalyzerClient {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("Failed to get stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Failed to get stderr"))?;
 
         self.stdin = Some(BufWriter::new(stdin));
+
+        // Log stderr in background
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buffer = String::new();
+            loop {
+                buffer.clear();
+                match reader.read_line(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if !buffer.trim().is_empty() {
+                            debug!("rust-analyzer stderr: {}", buffer.trim());
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error reading rust-analyzer stderr: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
 
         // Start response handler task
         let pending = Arc::clone(&self.pending_requests);
@@ -143,16 +177,30 @@ impl RustAnalyzerClient {
                                 tokio::io::AsyncReadExt::read_exact(&mut reader, &mut json_buffer)
                                     .await
                             {
+                                info!(
+                                    "Received LSP response: {}",
+                                    String::from_utf8_lossy(&json_buffer)
+                                );
                                 if let Ok(response) =
                                     serde_json::from_slice::<LSPResponse>(&json_buffer)
                                 {
                                     if let Some(id) = response.id {
                                         let mut pending_lock = pending.lock().await;
                                         if let Some(sender) = pending_lock.remove(&id) {
-                                            let result = response.result.unwrap_or(json!(null));
-                                            let _ = sender.send(result);
+                                            if let Some(error) = response.error {
+                                                error!("LSP error for request {}: {}", id, error);
+                                                let _ = sender.send(json!(null));
+                                            } else {
+                                                let result = response.result.unwrap_or(json!(null));
+                                                let _ = sender.send(result);
+                                            }
                                         }
                                     }
+                                } else {
+                                    error!(
+                                        "Failed to parse LSP response: {}",
+                                        String::from_utf8_lossy(&json_buffer)
+                                    );
                                 }
                             }
                         }
@@ -175,6 +223,27 @@ impl RustAnalyzerClient {
         Ok(())
     }
 
+    async fn send_notification(&mut self, method: &str, params: Option<Value>) -> Result<()> {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params.unwrap_or(json!({}))
+        });
+
+        let content = serde_json::to_string(&notification)?;
+        let message = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
+
+        info!("Sending LSP notification: {}", method);
+
+        if let Some(stdin) = &mut self.stdin {
+            stdin.write_all(message.as_bytes()).await?;
+            stdin.flush().await?;
+            Ok(())
+        } else {
+            Err(anyhow!("No stdin available"))
+        }
+    }
+
     async fn send_request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
         let mut request_id_lock = self.request_id.lock().await;
         let id = *request_id_lock;
@@ -185,13 +254,13 @@ impl RustAnalyzerClient {
             jsonrpc: "2.0".to_string(),
             id,
             method: method.to_string(),
-            params,
+            params: params.clone(),
         };
 
         let content = serde_json::to_string(&request)?;
         let message = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
 
-        debug!("Sending LSP request: {}", method);
+        info!("Sending LSP request: {} with params: {:?}", method, params);
 
         if let Some(stdin) = &mut self.stdin {
             stdin.write_all(message.as_bytes()).await?;
@@ -242,11 +311,17 @@ impl RustAnalyzerClient {
         });
 
         self.send_request("initialize", Some(init_params)).await?;
-        self.send_request("initialized", None).await?;
+        self.send_notification("initialized", Some(json!({})))
+            .await?;
+
+        // Give rust-analyzer some time to process the workspace
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
         Ok(())
     }
 
     pub async fn open_document(&mut self, uri: &str, content: &str) -> Result<()> {
+        info!("Opening document: {}", uri);
         let params = json!({
             "textDocument": {
                 "uri": uri,
@@ -256,8 +331,12 @@ impl RustAnalyzerClient {
             }
         });
 
-        self.send_request("textDocument/didOpen", Some(params))
+        self.send_notification("textDocument/didOpen", Some(params))
             .await?;
+
+        // Give rust-analyzer time to process the document
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
         Ok(())
     }
 
@@ -347,7 +426,7 @@ impl RustAnalyzerClient {
     pub async fn shutdown(&mut self) -> Result<()> {
         if self.initialized {
             let _ = self.send_request("shutdown", None).await;
-            let _ = self.send_request("exit", None).await;
+            let _ = self.send_notification("exit", None).await;
         }
 
         if let Some(mut process) = self.process.take() {
@@ -370,6 +449,13 @@ impl RustAnalyzerMCPServer {
         Self {
             client: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        }
+    }
+
+    pub fn with_workspace(workspace_root: PathBuf) -> Self {
+        Self {
+            client: None,
+            workspace_root,
         }
     }
 
@@ -633,8 +719,12 @@ impl RustAnalyzerMCPServer {
             .as_str()
             .ok_or_else(|| anyhow!("Missing file_path"))?;
 
+        debug!("Getting symbols for file: {}", file_path);
         let uri = self.open_document_if_needed(file_path).await?;
+        debug!("Document opened with URI: {}", uri);
+
         let result = self.client.as_mut().unwrap().document_symbols(&uri).await?;
+        debug!("Document symbols result: {:?}", result);
 
         Ok(ToolResult {
             content: vec![ContentItem {
@@ -777,6 +867,21 @@ impl RustAnalyzerMCPServer {
 
     async fn handle_request(&mut self, request: MCPRequest) -> MCPResponse {
         match request.method.as_str() {
+            "initialize" => MCPResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(json!({
+                    "protocolVersion": "0.1.0",
+                    "serverInfo": {
+                        "name": "rust-analyzer-mcp",
+                        "version": "0.1.0"
+                    },
+                    "capabilities": {
+                        "tools": {}
+                    }
+                })),
+                error: None,
+            },
             "tools/list" => MCPResponse {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,
@@ -846,8 +951,14 @@ async fn main() -> Result<()> {
     // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Get workspace path from command line or use current directory
+    let workspace_path = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
+
     // Create and run the server
-    let mut server = RustAnalyzerMCPServer::new();
+    let mut server = RustAnalyzerMCPServer::with_workspace(workspace_path);
     server.run().await?;
 
     Ok(())
