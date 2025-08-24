@@ -1,0 +1,32 @@
+[package]
+name = "rust-analyzer-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP server for rust-analyzer integration"
+authors = ["Zeeshan Ali Khan <zeenix@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/yourusername/rust-analyzer-mcp-server"
+keywords = ["mcp", "rust-analyzer", "language-server", "rust"]
+categories = ["development-tools"]
+
+[[bin]]
+name = "rust-analyzer-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+env_logger = "0.10"
+log = "0.4"
+futures = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
