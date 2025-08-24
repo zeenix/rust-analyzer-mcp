@@ -5,7 +5,6 @@ edition = "2021"
 description = "MCP server for rust-analyzer integration"
 authors = ["Zeeshan Ali Khan <zeenix@gmail.com>"]
 license = "MIT"
-license-file = "LICENSE"
 repository = "https://github.com/yourusername/rust-analyzer-mcp-server"
 keywords = ["mcp", "rust-analyzer", "language-server", "rust"]
 categories = ["development-tools"]
@@ -25,10 +24,39 @@ futures = "0.3"
 which = "6.0"
 
 [dev-dependencies]
+# Core testing
 tokio-test = "0.4"
+assert_cmd = "2.0"          # For testing CLI behavior
+predicates = "3.0"          # Assertion predicates
+
+# Mocking and test doubles
+mockall = "0.13"            # For creating mocks
+wiremock = "0.6"            # HTTP/WebSocket mocking
+
+# Property-based testing
+proptest = "1.6"            # Property testing
+arbitrary = "1.3"           # Arbitrary trait implementations
+
+# Benchmarking
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+# Test utilities
+tempfile = "3.8"            # Temporary directories for tests
+test-log = "0.2"            # Capture logs in tests
+serial_test = "3.0"         # Serial test execution
+rstest = "0.23"             # Parameterized tests
+insta = "1.36"              # Snapshot testing
+
+# JSON/Protocol testing
+jsonschema = "0.25"         # JSON schema validation
+serde_test = "1.0"          # Serde testing utilities
 
 [profile.release]
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[[bench]]
+name = "concurrent_requests"
+harness = false
 
