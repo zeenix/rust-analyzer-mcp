@@ -20,11 +20,20 @@ pub struct MCPRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MCPResponse {
-    pub jsonrpc: String,
-    pub id: Option<Value>,
-    pub result: Option<Value>,
-    pub error: Option<MCPError>,
+#[serde(untagged)]
+pub enum MCPResponse {
+    Success {
+        jsonrpc: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<Value>,
+        result: Value,
+    },
+    Error {
+        jsonrpc: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<Value>,
+        error: MCPError,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -889,10 +898,10 @@ impl RustAnalyzerMCPServer {
 
     async fn handle_request(&mut self, request: MCPRequest) -> MCPResponse {
         match request.method.as_str() {
-            "initialize" => MCPResponse {
+            "initialize" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,
-                result: Some(json!({
+                result: json!({
                     "protocolVersion": "0.1.0",
                     "serverInfo": {
                         "name": "rust-analyzer-mcp",
@@ -901,16 +910,14 @@ impl RustAnalyzerMCPServer {
                     "capabilities": {
                         "tools": {}
                     }
-                })),
-                error: None,
+                }),
             },
-            "tools/list" => MCPResponse {
+            "tools/list" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,
-                result: Some(json!({
+                result: json!({
                     "tools": Self::get_tools()
-                })),
-                error: None,
+                }),
             },
             "tools/call" => {
                 if let Some(params) = request.params {
@@ -921,48 +928,44 @@ impl RustAnalyzerMCPServer {
                         .unwrap_or_else(|| json!({}));
 
                     match self.handle_tool_call(tool_name, args).await {
-                        Ok(result) => MCPResponse {
+                        Ok(result) => MCPResponse::Success {
                             jsonrpc: "2.0".to_string(),
                             id: request.id,
-                            result: Some(serde_json::to_value(result).unwrap()),
-                            error: None,
+                            result: serde_json::to_value(result).unwrap(),
                         },
                         Err(e) => {
                             error!("Tool call error: {}", e);
-                            MCPResponse {
+                            MCPResponse::Error {
                                 jsonrpc: "2.0".to_string(),
                                 id: request.id,
-                                result: None,
-                                error: Some(MCPError {
+                                error: MCPError {
                                     code: -1,
                                     message: e.to_string(),
                                     data: None,
-                                }),
+                                },
                             }
                         }
                     }
                 } else {
-                    MCPResponse {
+                    MCPResponse::Error {
                         jsonrpc: "2.0".to_string(),
                         id: request.id,
-                        result: None,
-                        error: Some(MCPError {
+                        error: MCPError {
                             code: -32602,
                             message: "Invalid params".to_string(),
                             data: None,
-                        }),
+                        },
                     }
                 }
             }
-            _ => MCPResponse {
+            _ => MCPResponse::Error {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,
-                result: None,
-                error: Some(MCPError {
+                error: MCPError {
                     code: -32601,
-                    message: "Method not found".to_string(),
+                    message: format!("Method not found: {}", request.method),
                     data: None,
-                }),
+                },
             },
         }
     }
