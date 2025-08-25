@@ -54,6 +54,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
+          components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
       - name: Build and Test
         run: |
