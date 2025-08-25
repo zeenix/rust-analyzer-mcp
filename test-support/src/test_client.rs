@@ -169,10 +169,10 @@ impl MCPTestClient {
         self.initialize().await?;
 
         // rust-analyzer returns null while indexing, so we need to poll.
-        // Use small polling intervals to minimize waiting.
+        // We'll check multiple features to ensure full initialization.
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(30);
-        let poll_interval = Duration::from_millis(50); // Small interval to minimize wait
+        let poll_interval = Duration::from_millis(100);
 
         loop {
             if start.elapsed() > timeout {
@@ -181,32 +181,77 @@ impl MCPTestClient {
                 ));
             }
 
-            // Try to get symbols
-            let symbols_response = self
-                .call_tool("rust_analyzer_symbols", json!({"file_path": "src/main.rs"}))
-                .await;
+            // Check if symbols are ready
+            let symbols_ready = self.check_symbols_ready().await;
 
-            // Check if we got valid symbols (not null or empty)
-            if let Ok(response) = symbols_response {
-                if let Some(content) = response.get("content") {
-                    if let Some(text) = content[0].get("text") {
-                        if text.as_str() != Some("null") && text.as_str() != Some("[]") {
-                            if let Ok(symbols) =
-                                serde_json::from_str::<Vec<Value>>(text.as_str().unwrap_or("[]"))
-                            {
-                                if !symbols.is_empty() {
-                                    // rust-analyzer is ready
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                }
+            // Check if hover is ready
+            let hover_ready = self.check_hover_ready().await;
+
+            // Both checks must pass
+            if symbols_ready && hover_ready {
+                // Give it a tiny bit more time to ensure all features are ready
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return Ok(());
             }
 
-            // Not ready yet, wait a small interval before retrying
+            // Not ready yet, wait before retrying
             tokio::time::sleep(poll_interval).await;
         }
+    }
+
+    async fn check_symbols_ready(&self) -> bool {
+        let Ok(response) = self
+            .call_tool("rust_analyzer_symbols", json!({"file_path": "src/main.rs"}))
+            .await
+        else {
+            return false;
+        };
+
+        let Some(content) = response.get("content") else {
+            return false;
+        };
+
+        let Some(text) = content[0].get("text") else {
+            return false;
+        };
+
+        let Some(text_str) = text.as_str() else {
+            return false;
+        };
+
+        // Check if we got null or empty response
+        if text_str == "null" || text_str == "[]" {
+            return false;
+        }
+
+        // Try to parse symbols
+        let Ok(symbols) = serde_json::from_str::<Vec<Value>>(text_str) else {
+            return false;
+        };
+
+        !symbols.is_empty()
+    }
+
+    async fn check_hover_ready(&self) -> bool {
+        let Ok(response) = self
+            .call_tool(
+                "rust_analyzer_hover",
+                json!({"file_path": "src/main.rs", "line": 1, "character": 10}),
+            )
+            .await
+        else {
+            return false;
+        };
+
+        let Some(content) = response.get("content") else {
+            return false;
+        };
+
+        let Some(text) = content[0].get("text") else {
+            return false;
+        };
+
+        text.as_str() != Some("null")
     }
 
     /// Call a tool

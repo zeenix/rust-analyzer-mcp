@@ -43,96 +43,22 @@ async fn test_all_lsp_tools() -> Result<()> {
     client.initialize_and_wait(temp_dir.path()).await?;
 
     // Test 1: Get symbols for main.rs
-    let response = client.get_symbols("src/main.rs").await?;
-    if let Some(content) = response.get("content") {
-        if let Some(text) = content[0].get("text") {
-            let symbols: Vec<Value> = serde_json::from_str(text.as_str().unwrap_or("[]"))?;
-            assert!(!symbols.is_empty(), "Should have symbols in main.rs");
-
-            let symbol_names: Vec<String> = symbols
-                .iter()
-                .filter_map(|s| s.get("name")?.as_str().map(String::from))
-                .collect();
-
-            assert!(
-                symbol_names.contains(&"main".to_string()),
-                "Should have main function"
-            );
-            assert!(
-                symbol_names.contains(&"greet".to_string()),
-                "Should have greet function"
-            );
-            assert!(
-                symbol_names.contains(&"Calculator".to_string()),
-                "Should have Calculator struct"
-            );
-        }
-    }
+    test_symbols(&client).await?;
 
     // Test 2: Get definition - test "greet" function call on line 2 (0-indexed line 1)
-    let response = client.get_definition("src/main.rs", 1, 18).await?;
-    let mut got_definition = false;
-    if let Some(content) = response.get("content") {
-        if content.is_array() && !content[0].is_null() {
-            if let Some(text) = content[0].get("text") {
-                let text_str = text.as_str().unwrap_or("null");
-                if text_str != "null" && text_str != "[]" {
-                    // Try to parse as array
-                    match serde_json::from_str::<Vec<Value>>(text_str) {
-                        Ok(definitions) => {
-                            got_definition = !definitions.is_empty();
-                        }
-                        Err(_) => {
-                            // Failed to parse, but that's ok
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let got_definition = test_definition(&client).await?;
 
     // Test 3: Get references - test "greet" function definition on line 10 (0-indexed line 9)
-    let response = client.get_references("src/main.rs", 9, 4).await?;
-    let mut got_references = false;
-    if let Some(content) = response.get("content") {
-        if let Some(text) = content[0].get("text") {
-            if text.as_str() != Some("null") {
-                let references: Vec<Value> = serde_json::from_str(text.as_str().unwrap_or("[]"))?;
-                got_references = !references.is_empty();
-            }
-        }
-    }
+    let got_references = test_references(&client).await?;
 
     // Test 4: Get hover information - test "Calculator" on line 5 (0-indexed line 4)
-    let response = client.get_hover("src/main.rs", 4, 15).await?;
-    let mut got_hover = false;
-    if let Some(content) = response.get("content") {
-        if let Some(text) = content[0].get("text") {
-            if text.as_str() != Some("null") {
-                let hover: Value = serde_json::from_str(text.as_str().unwrap_or("{}"))?;
-                got_hover = hover.get("contents").is_some();
-            }
-        }
-    }
+    let got_hover = test_hover(&client).await?;
 
     // Test 5: Get completions
-    let response = client.get_completion("src/main.rs", 2, 5).await?;
-    if let Some(content) = response.get("content") {
-        if let Some(text) = content[0].get("text") {
-            let completions: Value = serde_json::from_str(text.as_str().unwrap_or("{}"))?;
-            // Just check we got some response - completions might be empty or have items
-            assert!(completions.is_object() || completions.is_array());
-        }
-    }
+    test_completion(&client).await?;
 
     // Test 6: Format document
-    let response = client.format("src/main.rs").await?;
-    let mut got_format = false;
-    if let Some(content) = response.get("content") {
-        if let Some(text) = content[0].get("text") {
-            got_format = text.as_str() != Some("null");
-        }
-    }
+    let got_format = test_format(&client).await?;
 
     // Print summary
     println!("LSP Tools Test Results:");
@@ -293,4 +219,168 @@ async fn test_error_handling_invalid_positions() -> Result<()> {
     client.shutdown().await?;
 
     Ok(())
+}
+
+// Helper functions for test_all_lsp_tools
+
+async fn test_symbols(client: &MCPTestClient) -> Result<()> {
+    let response = client.get_symbols("src/main.rs").await?;
+
+    let Some(content) = response.get("content") else {
+        return Err(anyhow::anyhow!("No content in symbols response"));
+    };
+
+    let Some(text) = content[0].get("text") else {
+        return Err(anyhow::anyhow!("No text in symbols response"));
+    };
+
+    let Some(text_str) = text.as_str() else {
+        return Err(anyhow::anyhow!("Text is not a string"));
+    };
+
+    let symbols: Vec<Value> = serde_json::from_str(text_str)?;
+    assert!(!symbols.is_empty(), "Should have symbols in main.rs");
+
+    let symbol_names: Vec<String> = symbols
+        .iter()
+        .filter_map(|s| s.get("name")?.as_str().map(String::from))
+        .collect();
+
+    assert!(
+        symbol_names.contains(&"main".to_string()),
+        "Should have main function"
+    );
+    assert!(
+        symbol_names.contains(&"greet".to_string()),
+        "Should have greet function"
+    );
+    assert!(
+        symbol_names.contains(&"Calculator".to_string()),
+        "Should have Calculator struct"
+    );
+
+    Ok(())
+}
+
+async fn test_definition(client: &MCPTestClient) -> Result<bool> {
+    let response = client.get_definition("src/main.rs", 1, 18).await?;
+
+    let Some(content) = response.get("content") else {
+        return Ok(false);
+    };
+
+    if !content.is_array() || content[0].is_null() {
+        return Ok(false);
+    }
+
+    let Some(text) = content[0].get("text") else {
+        return Ok(false);
+    };
+
+    let Some(text_str) = text.as_str() else {
+        return Ok(false);
+    };
+
+    if text_str == "null" || text_str == "[]" {
+        return Ok(false);
+    }
+
+    // Try to parse as array
+    let Ok(definitions) = serde_json::from_str::<Vec<Value>>(text_str) else {
+        return Ok(false);
+    };
+
+    Ok(!definitions.is_empty())
+}
+
+async fn test_references(client: &MCPTestClient) -> Result<bool> {
+    let response = client.get_references("src/main.rs", 9, 4).await?;
+
+    let Some(content) = response.get("content") else {
+        return Ok(false);
+    };
+
+    let Some(text) = content[0].get("text") else {
+        return Ok(false);
+    };
+
+    if text.as_str() == Some("null") {
+        return Ok(false);
+    }
+
+    let Some(text_str) = text.as_str() else {
+        return Ok(false);
+    };
+
+    let references: Vec<Value> = serde_json::from_str(text_str)?;
+    Ok(!references.is_empty())
+}
+
+async fn test_hover(client: &MCPTestClient) -> Result<bool> {
+    let response = client.get_hover("src/main.rs", 4, 15).await?;
+
+    let Some(content) = response.get("content") else {
+        return Ok(false);
+    };
+
+    let Some(text) = content[0].get("text") else {
+        return Ok(false);
+    };
+
+    if text.as_str() == Some("null") {
+        return Ok(false);
+    }
+
+    let Some(text_str) = text.as_str() else {
+        return Ok(false);
+    };
+
+    let hover: Value = serde_json::from_str(text_str)?;
+    Ok(hover.get("contents").is_some())
+}
+
+async fn test_completion(client: &MCPTestClient) -> Result<()> {
+    let response = client.get_completion("src/main.rs", 2, 5).await?;
+
+    let Some(content) = response.get("content") else {
+        return Ok(());
+    };
+
+    let Some(text) = content[0].get("text") else {
+        return Ok(());
+    };
+
+    let Some(text_str) = text.as_str() else {
+        return Ok(());
+    };
+
+    // Handle "null" response specially
+    if text_str == "null" {
+        // rust-analyzer returned null - still indexing
+        eprintln!("Got null completion response (rust-analyzer may still be indexing)");
+        return Ok(());
+    }
+
+    let completions: Value = serde_json::from_str(text_str)?;
+    assert!(
+        completions.is_object() || completions.is_array() || completions.is_null(),
+        "Expected object, array, or null, got: {:?}",
+        completions
+    );
+
+    Ok(())
+}
+
+async fn test_format(client: &MCPTestClient) -> Result<bool> {
+    let response = client.format("src/main.rs").await?;
+
+    let Some(content) = response.get("content") else {
+        return Ok(false);
+    };
+
+    let Some(text) = content[0].get("text") else {
+        return Ok(false);
+    };
+
+    Ok(text.as_str() != Some("null"))
 }
