@@ -1,32 +1,8 @@
 use anyhow::Result;
 use serde_json::Value;
-use std::sync::Arc;
-use tempfile::TempDir;
-use tokio::sync::OnceCell;
 
 // Import test support library
 use test_support::{MCPTestClient, TestProject};
-
-// Shared client and workspace for all tests in this module to avoid repeated initialization
-static SHARED_CLIENT: OnceCell<Arc<MCPTestClient>> = OnceCell::const_new();
-static WORKSPACE_DIR: OnceCell<Arc<TempDir>> = OnceCell::const_new();
-
-async fn get_shared_client() -> Result<Arc<MCPTestClient>> {
-    let client = SHARED_CLIENT
-        .get_or_init(|| async {
-            let temp_dir = Arc::new(tempfile::tempdir().unwrap());
-            let project = TestProject::simple();
-            project.create_in(temp_dir.path()).unwrap();
-
-            WORKSPACE_DIR.set(temp_dir.clone()).ok();
-
-            let client = MCPTestClient::start(temp_dir.path()).await.unwrap();
-            client.initialize_and_wait(temp_dir.path()).await.unwrap();
-            Arc::new(client)
-        })
-        .await;
-    Ok(client.clone())
-}
 
 #[tokio::test]
 async fn test_server_initialization() -> Result<()> {
@@ -50,13 +26,21 @@ async fn test_server_initialization() -> Result<()> {
     let capabilities = &init_response["capabilities"];
     assert!(capabilities.get("tools").is_some());
 
+    // Cleanup before test ends
+    client.shutdown().await?;
+
     Ok(())
 }
 
 #[tokio::test]
 async fn test_all_lsp_tools() -> Result<()> {
-    // Use shared client to avoid multiple rust-analyzer instances
-    let client = get_shared_client().await?;
+    // Create a client for this test
+    let temp_dir = tempfile::tempdir()?;
+    let project = TestProject::simple();
+    project.create_in(temp_dir.path())?;
+
+    let client = MCPTestClient::start(temp_dir.path()).await?;
+    client.initialize_and_wait(temp_dir.path()).await?;
 
     // Test 1: Get symbols for main.rs
     let response = client.get_symbols("src/main.rs").await?;
@@ -187,6 +171,9 @@ async fn test_all_lsp_tools() -> Result<()> {
         }
     );
 
+    // Cleanup before test ends to ensure it happens in runtime context
+    client.shutdown().await?;
+
     Ok(())
 }
 
@@ -219,12 +206,21 @@ async fn test_workspace_change() -> Result<()> {
         }
     }
 
+    // Cleanup before test ends
+    client.shutdown().await?;
+
     Ok(())
 }
 
 #[tokio::test]
 async fn test_error_handling_invalid_files() -> Result<()> {
-    let client = get_shared_client().await?;
+    // Create a fresh client for this test
+    let temp_dir = tempfile::tempdir()?;
+    let project = TestProject::simple();
+    project.create_in(temp_dir.path())?;
+
+    let client = MCPTestClient::start(temp_dir.path()).await?;
+    client.initialize_and_wait(temp_dir.path()).await?;
 
     // Test multiple invalid file paths
     let invalid_paths = vec!["non_existent.rs", "../../../etc/passwd"];
@@ -249,12 +245,21 @@ async fn test_error_handling_invalid_files() -> Result<()> {
         }
     }
 
+    // Cleanup before test ends
+    client.shutdown().await?;
+
     Ok(())
 }
 
 #[tokio::test]
 async fn test_error_handling_invalid_positions() -> Result<()> {
-    let client = get_shared_client().await?;
+    // Create a fresh client for this test
+    let temp_dir = tempfile::tempdir()?;
+    let project = TestProject::simple();
+    project.create_in(temp_dir.path())?;
+
+    let client = MCPTestClient::start(temp_dir.path()).await?;
+    client.initialize_and_wait(temp_dir.path()).await?;
 
     // Test multiple invalid positions
     let invalid_positions = vec![
@@ -283,6 +288,9 @@ async fn test_error_handling_invalid_positions() -> Result<()> {
             }
         }
     }
+
+    // Cleanup before test ends
+    client.shutdown().await?;
 
     Ok(())
 }

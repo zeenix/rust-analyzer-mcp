@@ -2,22 +2,28 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::{
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    process::Stdio,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
+    runtime::Handle,
     sync::Mutex,
     time::timeout,
 };
 
-/// MCP test client for integration testing - fully async
+/// MCP test client for integration testing - properly manages process lifecycle
 pub struct MCPTestClient {
-    process: Option<Child>,
+    process: Arc<Mutex<Option<Child>>>,
     stdin: Mutex<tokio::process::ChildStdin>,
     stdout: Mutex<BufReader<tokio::process::ChildStdout>>,
     request_id: AtomicU64,
+    shutdown: AtomicBool,
 }
 
 impl MCPTestClient {
@@ -35,19 +41,20 @@ impl MCPTestClient {
 
         let mut process = Command::new(binary)
             .arg(workspace.to_str().unwrap())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
         let stdout = BufReader::new(process.stdout.take().unwrap());
 
         Ok(Self {
-            process: Some(process),
+            process: Arc::new(Mutex::new(Some(process))),
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(stdout),
             request_id: AtomicU64::new(1),
+            shutdown: AtomicBool::new(false),
         })
     }
 
@@ -55,20 +62,36 @@ impl MCPTestClient {
     async fn start_with_cargo(workspace: &Path) -> Result<Self> {
         let mut process = Command::new("cargo")
             .args(&["run", "--", workspace.to_str().unwrap()])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
         let stdout = BufReader::new(process.stdout.take().unwrap());
 
         Ok(Self {
-            process: Some(process),
+            process: Arc::new(Mutex::new(Some(process))),
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(stdout),
             request_id: AtomicU64::new(1),
+            shutdown: AtomicBool::new(false),
         })
+    }
+
+    /// Explicitly shut down the client and its process
+    pub async fn shutdown(&self) -> Result<()> {
+        if self.shutdown.swap(true, Ordering::SeqCst) {
+            // Already shutdown
+            return Ok(());
+        }
+
+        let mut process_lock = self.process.lock().await;
+        if let Some(mut process) = process_lock.take() {
+            // Try graceful shutdown first
+            let _ = process.kill().await;
+        }
+        Ok(())
     }
 
     /// Send a request and wait for response with timeout
@@ -325,12 +348,21 @@ impl MCPTestClient {
 
 impl Drop for MCPTestClient {
     fn drop(&mut self) {
-        // Best effort cleanup - try to kill the process
-        // Note: This may fail if called during runtime shutdown
-        if let Some(mut process) = self.process.take() {
-            // Use start_kill() to initiate termination without blocking
-            // Ignore errors as the runtime may be shutting down
-            let _ = process.start_kill();
+        if self.shutdown.load(Ordering::SeqCst) {
+            // Already shutdown explicitly
+            return;
+        }
+
+        // We must be in a Tokio context for this Drop to be called
+        // If we're not, the test framework has a bug
+        if let Ok(handle) = Handle::try_current() {
+            // Schedule async cleanup
+            let process = Arc::clone(&self.process);
+            handle.spawn(async move {
+                if let Some(mut process) = process.lock().await.take() {
+                    let _ = process.kill().await;
+                }
+            });
         }
     }
 }
