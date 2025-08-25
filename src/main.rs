@@ -184,9 +184,9 @@ impl RustAnalyzerClient {
 
                             // Read the JSON content
                             let mut json_buffer = vec![0u8; length];
-                            if let Ok(_) =
-                                tokio::io::AsyncReadExt::read_exact(&mut reader, &mut json_buffer)
-                                    .await
+                            if (tokio::io::AsyncReadExt::read_exact(&mut reader, &mut json_buffer)
+                                .await)
+                                .is_ok()
                             {
                                 let response_str = String::from_utf8_lossy(&json_buffer);
                                 info!("Received LSP response: {}", response_str);
@@ -470,6 +470,12 @@ impl RustAnalyzerClient {
 pub struct RustAnalyzerMCPServer {
     client: Option<RustAnalyzerClient>,
     workspace_root: PathBuf,
+}
+
+impl Default for RustAnalyzerMCPServer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RustAnalyzerMCPServer {
