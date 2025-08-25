@@ -1,8 +1,5 @@
 use anyhow::Result;
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
-use tempfile::TempDir;
+use std::{collections::HashMap, fs, path::Path};
 
 #[derive(Debug)]
 pub struct TestProject {
@@ -159,46 +156,6 @@ impl Default for Config {
         Self { files }
     }
 
-    /// Creates a project with compilation errors for error handling tests
-    pub fn with_errors() -> Self {
-        let mut files = HashMap::new();
-
-        files.insert(
-            "Cargo.toml".to_string(),
-            r#"[package]
-name = "test-project-errors"
-version = "0.1.0"
-edition = "2021"
-"#
-            .to_string(),
-        );
-
-        files.insert(
-            "src/main.rs".to_string(),
-            r#"fn main() {
-    // Missing semicolon
-    let x = 5
-    
-    // Undefined variable
-    println!("{}", y);
-    
-    // Type mismatch
-    let s: String = 42;
-    
-    // Missing function
-    undefined_function();
-}
-
-fn incomplete_function() -> i32 {
-    // Missing return
-}
-"#
-            .to_string(),
-        );
-
-        Self { files }
-    }
-
     /// Creates a large project for performance testing
     pub fn large_codebase() -> Self {
         let mut files = HashMap::new();
@@ -280,13 +237,5 @@ mod tests {{
             fs::write(full_path, content)?;
         }
         Ok(())
-    }
-
-    /// Creates the project in a new temporary directory
-    pub fn create_temp() -> Result<(TempDir, Self)> {
-        let dir = TempDir::new()?;
-        let project = Self::simple();
-        project.create_in(dir.path())?;
-        Ok((dir, project))
     }
 }

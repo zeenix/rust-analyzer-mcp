@@ -1,17 +1,17 @@
 use anyhow::Result;
 use futures::future::join_all;
 use serde_json::json;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-#[path = "../common/mod.rs"]
-mod common;
-use common::{fixtures, test_client::MCPTestClient};
+use test_support::{MCPTestClient, TestProject};
 
 #[tokio::test]
 async fn test_concurrent_tool_calls() -> Result<()> {
     let workspace = tempfile::tempdir()?;
-    let project = fixtures::TestProject::simple();
+    let project = TestProject::simple();
     project.create_in(workspace.path())?;
 
     let client = Arc::new(MCPTestClient::start(workspace.path()).await?);
@@ -72,7 +72,7 @@ async fn test_concurrent_tool_calls() -> Result<()> {
 #[tokio::test]
 async fn test_many_sequential_requests() -> Result<()> {
     let workspace = tempfile::tempdir()?;
-    let project = fixtures::TestProject::simple();
+    let project = TestProject::simple();
     project.create_in(workspace.path())?;
 
     let client = MCPTestClient::start(workspace.path()).await?;
@@ -103,7 +103,7 @@ async fn test_many_sequential_requests() -> Result<()> {
 #[tokio::test]
 async fn test_rapid_fire_requests() -> Result<()> {
     let workspace = tempfile::tempdir()?;
-    let project = fixtures::TestProject::simple();
+    let project = TestProject::simple();
     project.create_in(workspace.path())?;
 
     let client = Arc::new(MCPTestClient::start(workspace.path()).await?);
@@ -158,7 +158,7 @@ async fn test_large_file_processing() -> Result<()> {
     let workspace = tempfile::tempdir()?;
 
     // Create a large project
-    let project = fixtures::TestProject::large_codebase();
+    let project = TestProject::large_codebase();
     project.create_in(workspace.path())?;
 
     let client = MCPTestClient::start(workspace.path()).await?;
@@ -204,7 +204,7 @@ async fn test_large_file_processing() -> Result<()> {
 #[tokio::test]
 async fn test_error_recovery() -> Result<()> {
     let workspace = tempfile::tempdir()?;
-    let project = fixtures::TestProject::simple();
+    let project = TestProject::simple();
     project.create_in(workspace.path())?;
 
     let client = MCPTestClient::start(workspace.path()).await?;
@@ -225,7 +225,7 @@ async fn test_error_recovery() -> Result<()> {
 #[tokio::test]
 async fn test_memory_stability() -> Result<()> {
     let workspace = tempfile::tempdir()?;
-    let project = fixtures::TestProject::simple();
+    let project = TestProject::simple();
     project.create_in(workspace.path())?;
 
     let client = MCPTestClient::start(workspace.path()).await?;
