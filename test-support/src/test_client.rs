@@ -71,26 +71,6 @@ impl MCPTestClient {
         })
     }
 
-    /// Start with a specific binary path
-    pub async fn start_with_binary(binary: &Path, workspace: &Path) -> Result<Self> {
-        let mut process = Command::new(binary)
-            .arg(workspace)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-
-        let stdin = process.stdin.take().unwrap();
-        let stdout = BufReader::new(process.stdout.take().unwrap());
-
-        Ok(Self {
-            process: Some(process),
-            stdin: Mutex::new(stdin),
-            stdout: Mutex::new(stdout),
-            request_id: AtomicU64::new(1),
-        })
-    }
-
     /// Send a request and wait for response with timeout
     pub async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value> {
         self.send_request_with_timeout(method, params, Duration::from_secs(10))
@@ -143,26 +123,6 @@ impl MCPTestClient {
         }
 
         Ok(response.get("result").cloned().unwrap_or(json!(null)))
-    }
-
-    /// Send a notification (no response expected)
-    pub async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<()> {
-        let mut notification = json!({
-            "jsonrpc": "2.0",
-            "method": method
-        });
-
-        if let Some(params) = params {
-            notification["params"] = params;
-        }
-
-        let notification_str = serde_json::to_string(&notification)?;
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(notification_str.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
-
-        Ok(())
     }
 
     /// Initialize the MCP server
@@ -278,12 +238,6 @@ impl MCPTestClient {
         .await
     }
 
-    /// Get symbols with retry for initialization
-    pub async fn get_symbols_with_retry(&self, file_path: &str) -> Result<Value> {
-        // Just delegate to get_symbols since rust-analyzer should already be initialized
-        self.get_symbols(file_path).await
-    }
-
     /// Get definition at position
     pub async fn get_definition(
         &self,
@@ -367,18 +321,16 @@ impl MCPTestClient {
         )
         .await
     }
-
-    /// Shutdown the server
-    pub async fn shutdown(&self) -> Result<()> {
-        self.send_notification("shutdown", None).await?;
-        Ok(())
-    }
 }
 
 impl Drop for MCPTestClient {
     fn drop(&mut self) {
+        // Best effort cleanup - try to kill the process
+        // Note: This may fail if called during runtime shutdown
         if let Some(mut process) = self.process.take() {
-            let _ = process.kill();
+            // Use start_kill() to initiate termination without blocking
+            // Ignore errors as the runtime may be shutting down
+            let _ = process.start_kill();
         }
     }
 }

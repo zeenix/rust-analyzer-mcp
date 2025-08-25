@@ -1720,6 +1720,7 @@ dependencies = [
  "serde_test",
  "tempfile",
  "test-log",
+ "test-support",
  "tokio",
  "tokio-test",
  "which",
@@ -1990,6 +1991,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "test-support"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "test-support"]
+
 [package]
 name = "rust-analyzer-mcp"
 version = "0.1.0"
@@ -24,6 +27,9 @@ futures = "0.3"
 which = "6.0"
 
 [dev-dependencies]
+# Test support library
+test-support = { path = "test-support" }
+
 # Core testing
 tokio-test = "0.4"
 assert_cmd = "2.0"          # For testing CLI behavior
