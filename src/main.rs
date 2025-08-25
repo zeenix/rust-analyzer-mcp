@@ -2,13 +2,17 @@ use anyhow::{anyhow, Result};
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, Command};
-use tokio::sync::{oneshot, Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    process::{Child, Command},
+    sync::{oneshot, Mutex},
+};
 
 // MCP Protocol structures
 #[derive(Debug, Serialize, Deserialize)]

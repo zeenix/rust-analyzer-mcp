@@ -1,8 +1,10 @@
 use anyhow::Result;
 use futures::future::join_all;
 use serde_json::json;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[path = "../common/mod.rs"]
 mod common;

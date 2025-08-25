@@ -1,7 +1,6 @@
 use anyhow::Result;
 use serde_json::Value;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::OnceCell;
 
 // Import common test utilities

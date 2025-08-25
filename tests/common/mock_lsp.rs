@@ -1,10 +1,11 @@
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
-use wiremock::matchers::{body_json, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{
+    matchers::{body_json, method, path},
+    Mock, MockServer, ResponseTemplate,
+};
 
 /// Mock LSP server for testing without rust-analyzer
 pub struct MockLSPServer {

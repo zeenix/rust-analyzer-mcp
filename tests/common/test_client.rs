@@ -1,12 +1,16 @@
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
-use tokio::time::timeout;
+use std::{
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, Command},
+    sync::Mutex,
+    time::timeout,
+};
 
 /// MCP test client for integration testing - fully async
 pub struct MCPTestClient {

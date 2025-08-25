@@ -1,7 +1,5 @@
 use anyhow::Result;
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
+use std::{collections::HashMap, fs, path::Path};
 use tempfile::TempDir;
 
 #[derive(Debug)]
