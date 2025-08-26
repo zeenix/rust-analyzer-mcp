@@ -214,7 +214,7 @@ impl RustAnalyzerClient {
                                 .is_ok()
                             {
                                 let response_str = String::from_utf8_lossy(&json_buffer);
-                                info!("Received LSP response: {}", response_str);
+                                debug!("Received LSP response: {}", response_str);
 
                                 if let Ok(response) =
                                     serde_json::from_slice::<LSPResponse>(&json_buffer)
