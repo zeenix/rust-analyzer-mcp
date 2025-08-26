@@ -942,8 +942,20 @@ impl RustAnalyzerMCPServer {
         }
         self.client = None;
 
-        // Set new workspace
-        self.workspace_root = PathBuf::from(workspace_path);
+        // Set new workspace with proper absolute path handling
+        let workspace_root = PathBuf::from(workspace_path);
+        self.workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
+            if workspace_root.is_absolute() {
+                workspace_root.clone()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(&workspace_root)
+            }
+        });
+
+        // Start the new client automatically
+        self.ensure_client_started().await?;
 
         Ok(ToolResult {
             content: vec![ContentItem {
