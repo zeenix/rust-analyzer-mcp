@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::Duration;
 
 // Import test support library
@@ -60,6 +60,9 @@ async fn test_all_lsp_tools() -> Result<()> {
     // Test 6: Format document
     let got_format = test_format(&client).await?;
 
+    // Test 7: Code actions
+    let got_code_actions = test_code_actions(&client).await?;
+
     // Print summary
     println!("LSP Tools Test Results:");
     println!("  Symbols: ✓");
@@ -94,6 +97,14 @@ async fn test_all_lsp_tools() -> Result<()> {
             "✓"
         } else {
             "⚠ (null response)"
+        }
+    );
+    println!(
+        "  Code Actions: {}",
+        if got_code_actions {
+            "✓"
+        } else {
+            "⚠ (null or empty response)"
         }
     );
 
@@ -370,4 +381,45 @@ async fn test_format(client: &MCPTestClient) -> Result<bool> {
     };
 
     Ok(text.as_str() != Some("null"))
+}
+
+async fn test_code_actions(client: &MCPTestClient) -> Result<bool> {
+    let response = client
+        .call_tool(
+            "rust_analyzer_code_actions",
+            json!({
+                "file_path": "src/main.rs",
+                "line": 13,
+                "character": 0,
+                "end_line": 16,
+                "end_character": 1
+            }),
+        )
+        .await?;
+
+    let Some(content) = response.get("content") else {
+        return Ok(false);
+    };
+
+    let Some(text) = content[0].get("text") else {
+        return Ok(false);
+    };
+
+    let Some(text_str) = text.as_str() else {
+        return Ok(false);
+    };
+
+    // Check if we got null or empty array
+    if text_str == "null" || text_str == "[]" {
+        return Ok(false);
+    }
+
+    // Try to parse as array to verify it's valid JSON
+    let Ok(actions) = serde_json::from_str::<Vec<Value>>(text_str) else {
+        return Ok(false);
+    };
+
+    // Even if we get an empty array, that's better than null
+    // Some files genuinely might not have code actions available
+    Ok(true)
 }

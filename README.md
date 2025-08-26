@@ -159,17 +159,20 @@ Format a Rust file using rust-analyzer's formatter.
 **Parameters:**
 - `file_path`: Path to the Rust file
 
-### Limited Functionality ⚠️
-
 #### `rust_analyzer_code_actions`
-Get available code actions (quick fixes, refactorings) for a range. *Currently returns null.*
+Get available code actions (quick fixes, refactorings) for a range.
 
 **Parameters:**
 - `file_path`: Path to the Rust file
-- `start_line`: Start line number (0-based)
-- `start_character`: Start character position (0-based)
+- `line`: Start line number (0-based)
+- `character`: Start character position (0-based)
 - `end_line`: End line number (0-based)
 - `end_character`: End character position (0-based)
+
+**Note:** Code actions availability depends on:
+- rust-analyzer being fully indexed
+- Having actual code issues or refactoring opportunities in the selected range
+- May return empty array if no actions are applicable
 
 ### `rust_analyzer_set_workspace`
 Change the workspace root directory.

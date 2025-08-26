@@ -327,7 +327,30 @@ impl RustAnalyzerClient {
                     },
                     "references": {},
                     "documentSymbol": {},
-                    "codeAction": {},
+                    "codeAction": {
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": {
+                                "valueSet": [
+                                    "quickfix",
+                                    "refactor",
+                                    "refactor.extract",
+                                    "refactor.inline",
+                                    "refactor.rewrite",
+                                    "source",
+                                    "source.organizeImports"
+                                ]
+                            }
+                        },
+                        "resolveSupport": {
+                            "properties": ["edit"]
+                        }
+                    },
+                    "publishDiagnostics": {
+                        "relatedInformation": true,
+                        "tagSupport": {
+                            "valueSet": [1, 2]
+                        }
+                    },
                     "formatting": {}
                 },
                 "workspace": {
@@ -450,13 +473,63 @@ impl RustAnalyzerClient {
         end_line: u32,
         end_char: u32,
     ) -> Result<Value> {
+        // First, try to get diagnostics for this range
+        let diag_params = json!({
+            "textDocument": { "uri": uri }
+        });
+
+        let diagnostics = match self
+            .send_request("textDocument/diagnostic", Some(diag_params))
+            .await
+        {
+            Ok(response) => {
+                // Extract diagnostics from the response
+                if let Some(items) = response.get("items") {
+                    items.clone()
+                } else {
+                    json!([])
+                }
+            }
+            Err(_) => json!([]), // If diagnostics fail, use empty array
+        };
+
+        // Filter diagnostics to only those in the requested range
+        let filtered_diagnostics = if let Some(diag_array) = diagnostics.as_array() {
+            let filtered: Vec<Value> = diag_array
+                .iter()
+                .filter(|d| {
+                    if let (Some(_range), Some(start), Some(end)) = (
+                        d.get("range"),
+                        d.get("range").and_then(|r| r.get("start")),
+                        d.get("range").and_then(|r| r.get("end")),
+                    ) {
+                        let diag_start_line =
+                            start.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32;
+                        let diag_end_line =
+                            end.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32;
+                        // Check if diagnostic overlaps with requested range
+                        diag_start_line <= end_line && diag_end_line >= start_line
+                    } else {
+                        false
+                    }
+                })
+                .cloned()
+                .collect();
+            json!(filtered)
+        } else {
+            json!([])
+        };
+
         let params = json!({
             "textDocument": { "uri": uri },
             "range": {
                 "start": { "line": start_line, "character": start_char },
                 "end": { "line": end_line, "character": end_char }
             },
-            "context": { "diagnostics": [] }
+            "context": {
+                "diagnostics": filtered_diagnostics,
+                "only": ["quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source"]
+            }
         });
 
         self.send_request("textDocument/codeAction", Some(params))
