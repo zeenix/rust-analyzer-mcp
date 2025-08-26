@@ -919,7 +919,7 @@ impl RustAnalyzerMCPServer {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,
                 result: json!({
-                    "protocolVersion": "0.1.0",
+                    "protocolVersion": "2024-11-05",
                     "serverInfo": {
                         "name": "rust-analyzer-mcp",
                         "version": "0.1.0"
