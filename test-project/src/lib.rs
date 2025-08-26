@@ -1,5 +1,5 @@
-pub mod utils;
 pub mod types;
+pub mod utils;
 
 pub use types::Config;
 pub use utils::process;
