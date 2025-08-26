@@ -234,12 +234,20 @@ impl MCPTestClient {
 
     /// Call a tool
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
-        self.send_request(
+        // Use longer timeout in CI environments to handle slower systems.
+        let timeout = if std::env::var("CI").is_ok() {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(10)
+        };
+
+        self.send_request_with_timeout(
             "tools/call",
             Some(json!({
                 "name": name,
                 "arguments": arguments
             })),
+            timeout,
         )
         .await
     }
