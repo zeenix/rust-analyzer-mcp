@@ -1,6 +1,8 @@
 # rust-analyzer MCP Server
 
-This is a Model Context Protocol (MCP) server that provides integration with rust-analyzer, allowing AI assistants to analyze Rust code, get hover information, find definitions, references, and more. Written in Rust for optimal performance and native integration.
+This is a Model Context Protocol (MCP) server that provides integration with rust-analyzer, allowing
+AI assistants to analyze Rust code, get hover information, find definitions, references, and more.
+Written in Rust for optimal performance and native integration.
 
 ## Prerequisites
 
