@@ -366,6 +366,7 @@ async fn test_completion(client: &MCPTestClient) -> Result<()> {
 }
 
 async fn test_format(client: &MCPTestClient) -> Result<bool> {
+    // Test 1: Format already-formatted file - should return null (no edits needed)
     let response = client.format("src/main.rs").await?;
 
     let Some(content) = response.get("content") else {
@@ -376,10 +377,45 @@ async fn test_format(client: &MCPTestClient) -> Result<bool> {
         return Ok(false);
     };
 
-    // Format can return null (no edits needed) or an array of edits.
-    // Both are valid responses indicating the formatter is working.
-    // We return true as long as we got a valid response.
-    Ok(text.is_string())
+    let Some(text_str) = text.as_str() else {
+        return Ok(false);
+    };
+
+    // main.rs is already formatted, so should return null
+    if text_str != "null" {
+        eprintln!("Expected null for formatted file, got: {}", text_str);
+        return Ok(false);
+    }
+
+    // Test 2: Format unformatted file - should return edits
+    let response = client.format("src/unformatted.rs").await?;
+
+    let Some(content) = response.get("content") else {
+        return Ok(false);
+    };
+
+    let Some(text) = content[0].get("text") else {
+        return Ok(false);
+    };
+
+    let Some(text_str) = text.as_str() else {
+        return Ok(false);
+    };
+
+    // unformatted.rs needs formatting, so should return an array of edits
+    if text_str == "null" {
+        eprintln!("Expected edits for unformatted file, got null");
+        return Ok(false);
+    }
+
+    // Parse and validate it's a non-empty array of edits
+    let edits: Vec<Value> = serde_json::from_str(text_str)?;
+    if edits.is_empty() {
+        eprintln!("Expected non-empty edits for unformatted file");
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 async fn test_code_actions(client: &MCPTestClient) -> Result<bool> {
