@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde_json::Value;
+use std::time::Duration;
 
 // Import test support library
 use test_support::MCPTestClient;
@@ -38,6 +39,11 @@ async fn test_all_lsp_tools() -> Result<()> {
 
     // Test 1: Get symbols for main.rs
     test_symbols(&client).await?;
+
+    // In CI, add extra delay to ensure rust-analyzer is fully ready for all operations
+    if std::env::var("CI").is_ok() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 
     // Test 2: Get definition - test "greet" function call on line 2 (0-indexed line 1)
     let got_definition = test_definition(&client).await?;

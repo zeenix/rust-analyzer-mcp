@@ -172,11 +172,11 @@ impl MCPTestClient {
         let start = std::time::Instant::now();
         // Use longer timeout in CI to handle slower initialization
         let timeout = if std::env::var("CI").is_ok() {
-            Duration::from_secs(60)
+            Duration::from_secs(90)
         } else {
             Duration::from_secs(30)
         };
-        let poll_interval = Duration::from_millis(100);
+        let poll_interval = Duration::from_millis(200);
 
         loop {
             if start.elapsed() > timeout {
@@ -195,8 +195,13 @@ impl MCPTestClient {
             let symbols_ready = self.check_symbols_ready().await;
 
             if symbols_ready {
-                // Give it a tiny bit more time to ensure all features are ready
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Give it more time to ensure all features are ready, especially in CI
+                let extra_delay = if std::env::var("CI").is_ok() {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(500)
+                };
+                tokio::time::sleep(extra_delay).await;
                 return Ok(());
             }
 
@@ -242,7 +247,7 @@ impl MCPTestClient {
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
         // Use longer timeout in CI environments to handle slower systems.
         let timeout = if std::env::var("CI").is_ok() {
-            Duration::from_secs(30)
+            Duration::from_secs(45)
         } else {
             Duration::from_secs(10)
         };
@@ -270,7 +275,7 @@ impl MCPTestClient {
                                 "Tool call attempt {} failed, retrying: {:?}",
                                 attempt, last_error
                             );
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
                         }
                     }
                 }
