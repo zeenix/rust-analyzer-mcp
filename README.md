@@ -154,10 +154,13 @@ Get code completion suggestions at a specific position.
 - `character`: Character position (0-based)
 
 #### `rust_analyzer_format`
-Format a Rust file using rust-analyzer's formatter.
+Format a Rust file using rust-analyzer's formatter. Returns an array of text edits to apply.
 
 **Parameters:**
 - `file_path`: Path to the Rust file
+
+Returns an empty array if the file is already formatted, or an array of edits with ranges and new
+text to apply.
 
 #### `rust_analyzer_code_actions`
 Get available code actions (quick fixes, refactorings) for a range.
