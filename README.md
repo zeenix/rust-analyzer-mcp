@@ -45,7 +45,7 @@ This Rust implementation offers several advantages over alternative implementati
    cargo build --release
    ```
 
-4. The binary will be available at `target/release/rust-analyzer-mcp-server`
+4. The binary will be available at `target/release/rust-analyzer-mcp`
 
 ## Configuration
 
@@ -57,18 +57,20 @@ Add this to your Claude Desktop configuration (`claude_desktop_config.json`):
 {
   "mcpServers": {
     "rust-analyzer": {
-      "command": "/path/to/rust-analyzer-mcp-server/target/release/rust-analyzer-mcp-server",
-      "cwd": "/path/to/your/rust/project"
+      "command": "/path/to/rust-analyzer-mcp/target/release/rust-analyzer-mcp"
     }
   }
 }
 ```
 
+**Note:** For Claude Desktop, you may want to specify a `cwd` parameter if you want to analyze a
+          specific project by default.
+
 ### Other MCP Clients
 
 For other MCP clients, run the server with:
 ```bash
-./target/release/rust-analyzer-mcp-server
+./target/release/rust-analyzer-mcp
 ```
 
 Or during development:
