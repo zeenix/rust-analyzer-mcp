@@ -97,6 +97,17 @@ pub struct RustAnalyzerClient {
 
 impl RustAnalyzerClient {
     pub fn new(workspace_root: PathBuf) -> Self {
+        // Ensure the workspace root is absolute
+        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
+            if workspace_root.is_absolute() {
+                workspace_root.clone()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(&workspace_root)
+            }
+        });
+
         Self {
             process: None,
             request_id: Arc::new(Mutex::new(1)),
@@ -574,6 +585,18 @@ impl RustAnalyzerMCPServer {
     }
 
     pub fn with_workspace(workspace_root: PathBuf) -> Self {
+        // Ensure the workspace root is absolute
+        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
+            // If canonicalize fails, try to make it absolute
+            if workspace_root.is_absolute() {
+                workspace_root.clone()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(&workspace_root)
+            }
+        });
+
         Self {
             client: None,
             workspace_root,
@@ -591,6 +614,10 @@ impl RustAnalyzerMCPServer {
 
     async fn open_document_if_needed(&mut self, file_path: &str) -> Result<String> {
         let absolute_path = self.workspace_root.join(file_path);
+        // Ensure we have an absolute path for the URI
+        let absolute_path = absolute_path
+            .canonicalize()
+            .unwrap_or_else(|_| absolute_path.clone());
         let uri = format!("file://{}", absolute_path.display());
         let content = tokio::fs::read_to_string(&absolute_path)
             .await
