@@ -2,16 +2,31 @@ fn main() {
     let message = greet("World");
     println!("{}", message);
 
-    let result = add(5, 3);
-    println!("5 + 3 = {}", result);
+    let calc = Calculator::new();
+    let result = calc.add(2, 3);
+    println!("Result: {}", result);
 }
 
 fn greet(name: &str) -> String {
     format!("Hello, {}!", name)
 }
 
-fn add(a: i32, b: i32) -> i32 {
-    a + b
+struct Calculator {
+    value: i32,
+}
+
+impl Calculator {
+    fn new() -> Self {
+        Self { value: 0 }
+    }
+
+    fn add(&self, a: i32, b: i32) -> i32 {
+        a + b
+    }
+
+    fn multiply(&self, a: i32, b: i32) -> i32 {
+        a * b
+    }
 }
 
 #[cfg(test)]
@@ -20,11 +35,13 @@ mod tests {
 
     #[test]
     fn test_greet() {
-        assert_eq!(greet("Alice"), "Hello, Alice!");
+        assert_eq!(greet("Test"), "Hello, Test!");
     }
 
     #[test]
-    fn test_add() {
-        assert_eq!(add(2, 3), 5);
+    fn test_calculator() {
+        let calc = Calculator::new();
+        assert_eq!(calc.add(2, 3), 5);
+        assert_eq!(calc.multiply(3, 4), 12);
     }
 }

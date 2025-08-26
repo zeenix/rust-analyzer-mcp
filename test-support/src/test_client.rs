@@ -169,54 +169,85 @@ impl MCPTestClient {
         self.initialize().await?;
 
         // rust-analyzer returns null while indexing, so we need to poll.
-        // Use small polling intervals to minimize waiting.
         let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(30);
-        let poll_interval = Duration::from_millis(50); // Small interval to minimize wait
+        let timeout = Duration::from_secs(30); // Reasonable timeout
+        let poll_interval = Duration::from_millis(100);
 
         loop {
             if start.elapsed() > timeout {
+                eprintln!(
+                    "Timeout after {:?}. Symbols ready: {}",
+                    start.elapsed(),
+                    self.check_symbols_ready().await
+                );
                 return Err(anyhow::anyhow!(
                     "Timeout waiting for rust-analyzer to be ready after 30 seconds"
                 ));
             }
 
-            // Try to get symbols
-            let symbols_response = self
-                .call_tool("rust_analyzer_symbols", json!({"file_path": "src/main.rs"}))
-                .await;
+            // Check if symbols are ready - this is the most reliable indicator
+            let symbols_ready = self.check_symbols_ready().await;
 
-            // Check if we got valid symbols (not null or empty)
-            if let Ok(response) = symbols_response {
-                if let Some(content) = response.get("content") {
-                    if let Some(text) = content[0].get("text") {
-                        if text.as_str() != Some("null") && text.as_str() != Some("[]") {
-                            if let Ok(symbols) =
-                                serde_json::from_str::<Vec<Value>>(text.as_str().unwrap_or("[]"))
-                            {
-                                if !symbols.is_empty() {
-                                    // rust-analyzer is ready
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                }
+            if symbols_ready {
+                // Give it a tiny bit more time to ensure all features are ready
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                return Ok(());
             }
 
-            // Not ready yet, wait a small interval before retrying
+            // Not ready yet, wait before retrying
             tokio::time::sleep(poll_interval).await;
         }
     }
 
+    async fn check_symbols_ready(&self) -> bool {
+        let Ok(response) = self
+            .call_tool("rust_analyzer_symbols", json!({"file_path": "src/main.rs"}))
+            .await
+        else {
+            return false;
+        };
+
+        let Some(content) = response.get("content") else {
+            return false;
+        };
+
+        let Some(text) = content[0].get("text") else {
+            return false;
+        };
+
+        let Some(text_str) = text.as_str() else {
+            return false;
+        };
+
+        // Check if we got null or empty response
+        if text_str == "null" || text_str == "[]" {
+            return false;
+        }
+
+        // Try to parse symbols
+        let Ok(symbols) = serde_json::from_str::<Vec<Value>>(text_str) else {
+            return false;
+        };
+
+        !symbols.is_empty()
+    }
+
     /// Call a tool
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
-        self.send_request(
+        // Use longer timeout in CI environments to handle slower systems.
+        let timeout = if std::env::var("CI").is_ok() {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(10)
+        };
+
+        self.send_request_with_timeout(
             "tools/call",
             Some(json!({
                 "name": name,
                 "arguments": arguments
             })),
+            timeout,
         )
         .await
     }
@@ -268,15 +299,13 @@ impl MCPTestClient {
         line: u32,
         character: u32,
     ) -> Result<Value> {
-        // Try with longer timeout for definition requests
-        self.call_tool_with_timeout(
+        self.call_tool(
             "rust_analyzer_definition",
             json!({
                 "file_path": file_path,
                 "line": line,
                 "character": character
             }),
-            Duration::from_secs(15),
         )
         .await
     }
@@ -288,15 +317,13 @@ impl MCPTestClient {
         line: u32,
         character: u32,
     ) -> Result<Value> {
-        // Try with longer timeout for references requests
-        self.call_tool_with_timeout(
+        self.call_tool(
             "rust_analyzer_references",
             json!({
                 "file_path": file_path,
                 "line": line,
                 "character": character
             }),
-            Duration::from_secs(15),
         )
         .await
     }
@@ -334,13 +361,11 @@ impl MCPTestClient {
 
     /// Format a file
     pub async fn format(&self, file_path: &str) -> Result<Value> {
-        // Try with longer timeout for format requests
-        self.call_tool_with_timeout(
+        self.call_tool(
             "rust_analyzer_format",
             json!({
                 "file_path": file_path
             }),
-            Duration::from_secs(15),
         )
         .await
     }
