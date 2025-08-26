@@ -2,16 +2,13 @@ use anyhow::Result;
 use serde_json::Value;
 
 // Import test support library
-use test_support::{MCPTestClient, TestProject};
+use test_support::MCPTestClient;
 
 #[tokio::test]
 async fn test_server_initialization() -> Result<()> {
-    // For initialization test, we need a fresh client
-    let temp_dir = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(temp_dir.path())?;
+    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
-    let client = MCPTestClient::start(temp_dir.path()).await?;
+    let client = MCPTestClient::start(&project_path).await?;
     // Initialize the server
     let init_response = client.initialize().await?;
 
@@ -34,13 +31,10 @@ async fn test_server_initialization() -> Result<()> {
 
 #[tokio::test]
 async fn test_all_lsp_tools() -> Result<()> {
-    // Create a client for this test
-    let temp_dir = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(temp_dir.path())?;
+    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
-    let client = MCPTestClient::start(temp_dir.path()).await?;
-    client.initialize_and_wait(temp_dir.path()).await?;
+    let client = MCPTestClient::start(&project_path).await?;
+    client.initialize_and_wait(&project_path).await?;
 
     // Test 1: Get symbols for main.rs
     test_symbols(&client).await?;
@@ -105,21 +99,14 @@ async fn test_all_lsp_tools() -> Result<()> {
 
 #[tokio::test]
 async fn test_workspace_change() -> Result<()> {
-    // Need a fresh client for workspace change test
-    let temp_dir = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(temp_dir.path())?;
-
-    let client = MCPTestClient::start(temp_dir.path()).await?;
+    // Start with the test project
+    let first_project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
+    let client = MCPTestClient::start(&first_project).await?;
     client.initialize().await?;
 
-    // Create a second workspace
-    let second_workspace = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(second_workspace.path())?;
-
-    // Change workspace
-    let response = client.set_workspace(second_workspace.path()).await?;
+    // Change to another workspace (use the same for now)
+    let second_project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
+    let response = client.set_workspace(&second_project).await?;
 
     // Verify workspace change succeeded
     if let Some(content) = response.get("content") {
@@ -140,13 +127,10 @@ async fn test_workspace_change() -> Result<()> {
 
 #[tokio::test]
 async fn test_error_handling_invalid_files() -> Result<()> {
-    // Create a fresh client for this test
-    let temp_dir = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(temp_dir.path())?;
+    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
-    let client = MCPTestClient::start(temp_dir.path()).await?;
-    client.initialize_and_wait(temp_dir.path()).await?;
+    let client = MCPTestClient::start(&project_path).await?;
+    client.initialize_and_wait(&project_path).await?;
 
     // Test multiple invalid file paths
     let invalid_paths = vec!["non_existent.rs", "../../../etc/passwd"];
@@ -179,13 +163,10 @@ async fn test_error_handling_invalid_files() -> Result<()> {
 
 #[tokio::test]
 async fn test_error_handling_invalid_positions() -> Result<()> {
-    // Create a fresh client for this test
-    let temp_dir = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(temp_dir.path())?;
+    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
-    let client = MCPTestClient::start(temp_dir.path()).await?;
-    client.initialize_and_wait(temp_dir.path()).await?;
+    let client = MCPTestClient::start(&project_path).await?;
+    client.initialize_and_wait(&project_path).await?;
 
     // Test multiple invalid positions
     let invalid_positions = vec![

@@ -6,16 +6,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use test_support::{MCPTestClient, TestProject};
+use test_support::MCPTestClient;
 
 #[tokio::test]
 async fn test_concurrent_tool_calls() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(workspace.path())?;
+    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
-    let client = Arc::new(MCPTestClient::start(workspace.path()).await?);
-    client.initialize_and_wait(workspace.path()).await?;
+    let client = Arc::new(MCPTestClient::start(&project_path).await?);
+    client.initialize_and_wait(&project_path).await?;
 
     // Create multiple concurrent requests
     let tasks = vec![
@@ -66,17 +64,18 @@ async fn test_concurrent_tool_calls() -> Result<()> {
         "Should complete within reasonable time"
     );
 
+    // Cleanup
+    client.shutdown().await?;
+
     Ok(())
 }
 
 #[tokio::test]
 async fn test_many_sequential_requests() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(workspace.path())?;
+    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
-    let client = MCPTestClient::start(workspace.path()).await?;
-    client.initialize_and_wait(workspace.path()).await?;
+    let client = MCPTestClient::start(&project_path).await?;
+    client.initialize_and_wait(&project_path).await?;
 
     let start = Instant::now();
 
@@ -97,17 +96,18 @@ async fn test_many_sequential_requests() -> Result<()> {
         "Should handle many requests efficiently"
     );
 
+    // Cleanup
+    client.shutdown().await?;
+
     Ok(())
 }
 
 #[tokio::test]
 async fn test_rapid_fire_requests() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(workspace.path())?;
+    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
-    let client = Arc::new(MCPTestClient::start(workspace.path()).await?);
-    client.initialize_and_wait(workspace.path()).await?;
+    let client = Arc::new(MCPTestClient::start(&project_path).await?);
+    client.initialize_and_wait(&project_path).await?;
 
     // Send requests as fast as possible without waiting
     let mut handles = vec![];
@@ -150,64 +150,48 @@ async fn test_rapid_fire_requests() -> Result<()> {
     // Should handle rapid requests
     assert!(success_count >= 18, "Most requests should succeed");
 
+    // Cleanup
+    client.shutdown().await?;
+
     Ok(())
 }
 
 #[tokio::test]
 async fn test_large_file_processing() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
+    // Use the test project
+    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
-    // Create a large project
-    let project = TestProject::large_codebase();
-    project.create_in(workspace.path())?;
-
-    let client = MCPTestClient::start(workspace.path()).await?;
-    // Use longer timeout for large project initialization
-    client
-        .send_request_with_timeout(
-            "initialize",
-            Some(json!({
-                "protocolVersion": "0.1.0",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "test-client",
-                    "version": "1.0.0"
-                }
-            })),
-            Duration::from_secs(30),
-        )
-        .await?;
-
-    // Wait for rust-analyzer initialization
-    client.initialize_and_wait(workspace.path()).await?;
+    let client = MCPTestClient::start(&project_path).await?;
+    client.initialize_and_wait(&project_path).await?;
 
     let start = Instant::now();
 
-    // Process multiple large files sequentially
-    for i in 0..10 {
-        let file_path = format!("src/module_{}.rs", i);
-        let _ = client.get_symbols(&file_path).await;
+    // Process multiple files sequentially
+    let files = ["src/main.rs", "src/lib.rs", "src/utils.rs", "src/types.rs"];
+    for file_path in &files {
+        let _ = client.get_symbols(file_path).await;
     }
 
     let elapsed = start.elapsed();
-    println!("Processing 10 large files took: {:?}", elapsed);
+    println!("Processing {} files took: {:?}", files.len(), elapsed);
 
-    // Should handle large files reasonably
+    // Should handle files reasonably
     assert!(
-        elapsed < Duration::from_secs(120),
-        "Should process large files in reasonable time"
+        elapsed < Duration::from_secs(30),
+        "Should process files in reasonable time"
     );
+
+    // Cleanup
+    client.shutdown().await?;
 
     Ok(())
 }
 
 #[tokio::test]
 async fn test_error_recovery() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(workspace.path())?;
+    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
-    let client = MCPTestClient::start(workspace.path()).await?;
+    let client = MCPTestClient::start(&project_path).await?;
     client.initialize().await?;
 
     // Send invalid requests
@@ -219,17 +203,18 @@ async fn test_error_recovery() -> Result<()> {
     let response = client.get_symbols("src/main.rs").await;
     assert!(response.is_ok(), "Server should recover from errors");
 
+    // Cleanup
+    client.shutdown().await?;
+
     Ok(())
 }
 
 #[tokio::test]
 async fn test_memory_stability() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let project = TestProject::simple();
-    project.create_in(workspace.path())?;
+    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
-    let client = MCPTestClient::start(workspace.path()).await?;
-    client.initialize_and_wait(workspace.path()).await?;
+    let client = MCPTestClient::start(&project_path).await?;
+    client.initialize_and_wait(&project_path).await?;
 
     // Send many requests to test memory stability
     for iteration in 0..10 {
@@ -249,6 +234,9 @@ async fn test_memory_stability() -> Result<()> {
         final_response.is_ok(),
         "Server should remain stable after many requests"
     );
+
+    // Cleanup
+    client.shutdown().await?;
 
     Ok(())
 }

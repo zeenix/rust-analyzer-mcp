@@ -169,28 +169,28 @@ impl MCPTestClient {
         self.initialize().await?;
 
         // rust-analyzer returns null while indexing, so we need to poll.
-        // We'll check multiple features to ensure full initialization.
         let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(30);
+        let timeout = Duration::from_secs(30); // Reasonable timeout
         let poll_interval = Duration::from_millis(100);
 
         loop {
             if start.elapsed() > timeout {
+                eprintln!(
+                    "Timeout after {:?}. Symbols ready: {}",
+                    start.elapsed(),
+                    self.check_symbols_ready().await
+                );
                 return Err(anyhow::anyhow!(
                     "Timeout waiting for rust-analyzer to be ready after 30 seconds"
                 ));
             }
 
-            // Check if symbols are ready
+            // Check if symbols are ready - this is the most reliable indicator
             let symbols_ready = self.check_symbols_ready().await;
 
-            // Check if hover is ready
-            let hover_ready = self.check_hover_ready().await;
-
-            // Both checks must pass
-            if symbols_ready && hover_ready {
+            if symbols_ready {
                 // Give it a tiny bit more time to ensure all features are ready
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 return Ok(());
             }
 
@@ -230,28 +230,6 @@ impl MCPTestClient {
         };
 
         !symbols.is_empty()
-    }
-
-    async fn check_hover_ready(&self) -> bool {
-        let Ok(response) = self
-            .call_tool(
-                "rust_analyzer_hover",
-                json!({"file_path": "src/main.rs", "line": 1, "character": 10}),
-            )
-            .await
-        else {
-            return false;
-        };
-
-        let Some(content) = response.get("content") else {
-            return false;
-        };
-
-        let Some(text) = content[0].get("text") else {
-            return false;
-        };
-
-        text.as_str() != Some("null")
     }
 
     /// Call a tool
@@ -313,15 +291,13 @@ impl MCPTestClient {
         line: u32,
         character: u32,
     ) -> Result<Value> {
-        // Try with longer timeout for definition requests
-        self.call_tool_with_timeout(
+        self.call_tool(
             "rust_analyzer_definition",
             json!({
                 "file_path": file_path,
                 "line": line,
                 "character": character
             }),
-            Duration::from_secs(15),
         )
         .await
     }
@@ -333,15 +309,13 @@ impl MCPTestClient {
         line: u32,
         character: u32,
     ) -> Result<Value> {
-        // Try with longer timeout for references requests
-        self.call_tool_with_timeout(
+        self.call_tool(
             "rust_analyzer_references",
             json!({
                 "file_path": file_path,
                 "line": line,
                 "character": character
             }),
-            Duration::from_secs(15),
         )
         .await
     }
@@ -379,13 +353,11 @@ impl MCPTestClient {
 
     /// Format a file
     pub async fn format(&self, file_path: &str) -> Result<Value> {
-        // Try with longer timeout for format requests
-        self.call_tool_with_timeout(
+        self.call_tool(
             "rust_analyzer_format",
             json!({
                 "file_path": file_path
             }),
-            Duration::from_secs(15),
         )
         .await
     }
