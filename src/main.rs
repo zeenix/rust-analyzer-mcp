@@ -116,7 +116,17 @@ impl RustAnalyzerClient {
 
         // Find rust-analyzer executable
         let rust_analyzer_path = which::which("rust-analyzer")
-            .map_err(|e| anyhow!("Failed to find rust-analyzer in PATH: {}. Please ensure rust-analyzer is installed.", e))?;
+            .or_else(|_| {
+                // Try common installation locations if not in PATH
+                let home = std::env::var("HOME").unwrap_or_else(|_| String::from("~"));
+                let cargo_bin = PathBuf::from(home).join(".cargo/bin/rust-analyzer");
+                if cargo_bin.exists() {
+                    Ok(cargo_bin)
+                } else {
+                    which::which("rust-analyzer")
+                }
+            })
+            .map_err(|e| anyhow!("Failed to find rust-analyzer in PATH or ~/.cargo/bin: {}. Please ensure rust-analyzer is installed.", e))?;
 
         info!("Using rust-analyzer at: {}", rust_analyzer_path.display());
 
@@ -909,7 +919,7 @@ impl RustAnalyzerMCPServer {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,
                 result: json!({
-                    "protocolVersion": "0.1.0",
+                    "protocolVersion": "2024-11-05",
                     "serverInfo": {
                         "name": "rust-analyzer-mcp",
                         "version": "0.1.0"

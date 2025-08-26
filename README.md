@@ -1,6 +1,8 @@
 # rust-analyzer MCP Server
 
-This is a Model Context Protocol (MCP) server that provides integration with rust-analyzer, allowing AI assistants to analyze Rust code, get hover information, find definitions, references, and more. Written in Rust for optimal performance and native integration.
+This is a Model Context Protocol (MCP) server that provides integration with rust-analyzer, allowing
+AI assistants to analyze Rust code, get hover information, find definitions, references, and more.
+Written in Rust for optimal performance and native integration.
 
 ## Prerequisites
 
@@ -45,9 +47,38 @@ This Rust implementation offers several advantages over alternative implementati
    cargo build --release
    ```
 
-4. The binary will be available at `target/release/rust-analyzer-mcp-server`
+4. The binary will be available at `target/release/rust-analyzer-mcp`
 
 ## Configuration
+
+### Claude Code Configuration
+
+Add an MCP server configuration to one of these locations:
+
+**Option 1: Project-specific** (`.mcp.json` in your Rust project root):
+```json
+{
+  "mcpServers": {
+    "rust-analyzer": {
+      "command": "/path/to/rust-analyzer-mcp/target/release/rust-analyzer-mcp"
+    }
+  }
+}
+```
+
+**Option 2: User-wide** (`~/.claude.json` or `~/.claude/settings.json`):
+```json
+{
+  "mcpServers": {
+    "rust-analyzer": {
+      "command": "/path/to/rust-analyzer-mcp/target/release/rust-analyzer-mcp"
+    }
+  }
+}
+```
+
+**Note:** Replace `/path/to/rust-analyzer-mcp` with the actual path to this repository where you
+built the binary. You can also configure servers using Claude Code's CLI wizard too.
 
 ### Claude Desktop Configuration
 
@@ -57,18 +88,20 @@ Add this to your Claude Desktop configuration (`claude_desktop_config.json`):
 {
   "mcpServers": {
     "rust-analyzer": {
-      "command": "/path/to/rust-analyzer-mcp-server/target/release/rust-analyzer-mcp-server",
-      "cwd": "/path/to/your/rust/project"
+      "command": "/path/to/rust-analyzer-mcp/target/release/rust-analyzer-mcp"
     }
   }
 }
 ```
 
+**Note:** For Claude Desktop, you may want to specify a `cwd` parameter if you want to analyze a
+          specific project by default.
+
 ### Other MCP Clients
 
 For other MCP clients, run the server with:
 ```bash
-./target/release/rust-analyzer-mcp-server
+./target/release/rust-analyzer-mcp
 ```
 
 Or during development:
