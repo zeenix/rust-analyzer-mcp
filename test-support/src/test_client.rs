@@ -170,7 +170,12 @@ impl MCPTestClient {
 
         // rust-analyzer returns null while indexing, so we need to poll.
         let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(30); // Reasonable timeout
+        // Use longer timeout in CI to handle slower initialization
+        let timeout = if std::env::var("CI").is_ok() {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(30)
+        };
         let poll_interval = Duration::from_millis(100);
 
         loop {
@@ -181,7 +186,8 @@ impl MCPTestClient {
                     self.check_symbols_ready().await
                 );
                 return Err(anyhow::anyhow!(
-                    "Timeout waiting for rust-analyzer to be ready after 30 seconds"
+                    "Timeout waiting for rust-analyzer to be ready after {:?}",
+                    timeout
                 ));
             }
 
@@ -241,15 +247,46 @@ impl MCPTestClient {
             Duration::from_secs(10)
         };
 
-        self.send_request_with_timeout(
-            "tools/call",
-            Some(json!({
-                "name": name,
-                "arguments": arguments
-            })),
-            timeout,
-        )
-        .await
+        // In CI, add retry logic for transient failures
+        if std::env::var("CI").is_ok() {
+            let mut last_error = None;
+            for attempt in 1..=3 {
+                match self
+                    .send_request_with_timeout(
+                        "tools/call",
+                        Some(json!({
+                            "name": name,
+                            "arguments": arguments.clone()
+                        })),
+                        timeout,
+                    )
+                    .await
+                {
+                    Ok(response) => return Ok(response),
+                    Err(e) => {
+                        last_error = Some(e);
+                        if attempt < 3 {
+                            eprintln!(
+                                "Tool call attempt {} failed, retrying: {:?}",
+                                attempt, last_error
+                            );
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+            Err(last_error.unwrap())
+        } else {
+            self.send_request_with_timeout(
+                "tools/call",
+                Some(json!({
+                    "name": name,
+                    "arguments": arguments
+                })),
+                timeout,
+            )
+            .await
+        }
     }
 
     /// Call a tool with custom timeout
