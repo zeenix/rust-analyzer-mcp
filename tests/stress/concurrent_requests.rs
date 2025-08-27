@@ -1,6 +1,7 @@
 use anyhow::Result;
 use futures::future::join_all;
 use serde_json::json;
+use serial_test::serial;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -9,6 +10,7 @@ use std::{
 use test_support::MCPTestClient;
 
 #[tokio::test]
+#[serial] // Prevent resource contention with other stress tests
 async fn test_concurrent_tool_calls() -> Result<()> {
     let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
@@ -115,6 +117,7 @@ async fn test_concurrent_tool_calls() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial] // Prevent resource contention
 async fn test_many_sequential_requests() -> Result<()> {
     let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
@@ -147,6 +150,7 @@ async fn test_many_sequential_requests() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial] // This test is resource-intensive and must run alone
 async fn test_rapid_fire_requests() -> Result<()> {
     let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
@@ -223,6 +227,7 @@ async fn test_rapid_fire_requests() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial] // Prevent interference with other tests
 async fn test_large_file_processing() -> Result<()> {
     // Use the test project
     let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
@@ -254,6 +259,7 @@ async fn test_large_file_processing() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial] // Run in isolation
 async fn test_error_recovery() -> Result<()> {
     let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
@@ -276,6 +282,7 @@ async fn test_error_recovery() -> Result<()> {
 }
 
 #[tokio::test]
+#[serial] // Memory stability test needs isolation
 async fn test_memory_stability() -> Result<()> {
     let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
 
