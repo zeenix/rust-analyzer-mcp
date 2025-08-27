@@ -7,12 +7,17 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{Child, Command},
     sync::{oneshot, Mutex},
 };
+
+// Timeout constants
+const LSP_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DOCUMENT_OPEN_DELAY_MILLIS: u64 = 200;
 
 // MCP Protocol structures
 #[derive(Debug, Serialize, Deserialize)]
@@ -313,7 +318,7 @@ impl RustAnalyzerClient {
         self.pending_requests.lock().await.insert(id, tx);
 
         // Wait for response with timeout
-        tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        tokio::time::timeout(Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS), rx)
             .await
             .map_err(|_| anyhow!("Request timeout"))?
             .map_err(|_| anyhow!("Request cancelled"))
@@ -409,7 +414,7 @@ impl RustAnalyzerClient {
         }
 
         // Give rust-analyzer time to process the document
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(DOCUMENT_OPEN_DELAY_MILLIS)).await;
 
         Ok(())
     }

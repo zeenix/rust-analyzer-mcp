@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 // Import test support library
-use test_support::MCPTestClient;
+use test_support::{is_ci, timeouts, MCPTestClient};
 
 #[tokio::test]
 async fn test_server_initialization() -> Result<()> {
@@ -41,8 +41,8 @@ async fn test_all_lsp_tools() -> Result<()> {
     test_symbols(&client).await?;
 
     // In CI, add extra delay to ensure rust-analyzer is fully ready for all operations
-    if std::env::var("CI").is_ok() {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    if is_ci() {
+        tokio::time::sleep(timeouts::ci_test_delay()).await;
     }
 
     // Test 2: Get definition - test "greet" function call on line 2 (0-indexed line 1)

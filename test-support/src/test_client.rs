@@ -17,6 +17,8 @@ use tokio::{
     time::timeout,
 };
 
+use crate::timeouts;
+
 /// MCP test client for integration testing - properly manages process lifecycle
 pub struct MCPTestClient {
     process: Arc<Mutex<Option<Child>>>,
@@ -96,7 +98,7 @@ impl MCPTestClient {
 
     /// Send a request and wait for response with timeout
     pub async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value> {
-        self.send_request_with_timeout(method, params, Duration::from_secs(10))
+        self.send_request_with_timeout(method, params, timeouts::request())
             .await
     }
 
@@ -170,13 +172,8 @@ impl MCPTestClient {
 
         // rust-analyzer returns null while indexing, so we need to poll.
         let start = std::time::Instant::now();
-        // Use longer timeout in CI to handle slower initialization
-        let timeout = if std::env::var("CI").is_ok() {
-            Duration::from_secs(90)
-        } else {
-            Duration::from_secs(30)
-        };
-        let poll_interval = Duration::from_millis(200);
+        let timeout = timeouts::init_wait();
+        let poll_interval = timeouts::init_poll();
 
         loop {
             if start.elapsed() > timeout {
@@ -196,12 +193,7 @@ impl MCPTestClient {
 
             if symbols_ready {
                 // Give it more time to ensure all features are ready, especially in CI
-                let extra_delay = if std::env::var("CI").is_ok() {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_millis(500)
-                };
-                tokio::time::sleep(extra_delay).await;
+                tokio::time::sleep(timeouts::init_extra_delay()).await;
                 return Ok(());
             }
 
@@ -245,15 +237,10 @@ impl MCPTestClient {
 
     /// Call a tool
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
-        // Use longer timeout in CI environments to handle slower systems.
-        let timeout = if std::env::var("CI").is_ok() {
-            Duration::from_secs(45)
-        } else {
-            Duration::from_secs(10)
-        };
+        let timeout = timeouts::tool_call();
 
         // In CI, add retry logic for transient failures
-        if std::env::var("CI").is_ok() {
+        if crate::is_ci() {
             let mut last_error = None;
             for attempt in 1..=3 {
                 match self
@@ -275,7 +262,7 @@ impl MCPTestClient {
                                 "Tool call attempt {} failed, retrying: {:?}",
                                 attempt, last_error
                             );
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            tokio::time::sleep(timeouts::tool_retry_delay()).await;
                         }
                     }
                 }

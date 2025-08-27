@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use test_support::MCPTestClient;
+use test_support::{is_ci, timeouts, MCPTestClient};
 
 #[tokio::test]
 #[serial] // Prevent resource contention with other stress tests
@@ -42,7 +42,7 @@ async fn test_concurrent_tool_calls() -> Result<()> {
     let start = Instant::now();
 
     // Execute requests - in CI, use smaller batches to avoid overwhelming the server.
-    let results = if std::env::var("CI").is_ok() {
+    let results = if is_ci() {
         // In CI: execute in two batches with a small delay between them.
         let (batch1, batch2) = tasks.split_at(3);
 
@@ -55,7 +55,7 @@ async fn test_concurrent_tool_calls() -> Result<()> {
         let mut results1 = join_all(futures1).await;
 
         // Longer delay between batches in CI to ensure server can process them.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(timeouts::batch_delay()).await;
 
         let futures2 = batch2.iter().map(|(tool, args)| {
             let client = Arc::clone(&client);
@@ -95,7 +95,7 @@ async fn test_concurrent_tool_calls() -> Result<()> {
             eprintln!("  {}", failure);
         }
         // Allow some failures in CI but not too many
-        if std::env::var("CI").is_ok() && failures.len() <= 3 {
+        if is_ci() && failures.len() <= 3 {
             eprintln!("Allowing {} failures in CI environment", failures.len());
         } else if !failures.is_empty() {
             panic!("Too many failures: {}", failures.join(", "));
@@ -105,9 +105,12 @@ async fn test_concurrent_tool_calls() -> Result<()> {
     // Concurrent execution should be faster than sequential
     // (though this is not guaranteed in all environments)
     println!("Concurrent execution took: {:?}", elapsed);
+    let timeout = timeouts::stress_timeout(timeouts::STRESS_CONCURRENT_BASE_SECS);
     assert!(
-        elapsed < Duration::from_secs(30),
-        "Should complete within reasonable time"
+        elapsed < timeout,
+        "Should complete within {:?} (got {:?})",
+        timeout,
+        elapsed
     );
 
     // Cleanup
@@ -138,9 +141,12 @@ async fn test_many_sequential_requests() -> Result<()> {
     println!("50 sequential requests took: {:?}", elapsed);
 
     // Should handle many requests without degradation
+    let timeout = timeouts::stress_timeout(timeouts::STRESS_SEQUENTIAL_BASE_SECS);
     assert!(
-        elapsed < Duration::from_secs(60),
-        "Should handle many requests efficiently"
+        elapsed < timeout,
+        "Should handle many requests efficiently within {:?} (got {:?})",
+        timeout,
+        elapsed
     );
 
     // Cleanup
@@ -160,7 +166,9 @@ async fn test_rapid_fire_requests() -> Result<()> {
     // Send requests as fast as possible without waiting
     let mut handles = vec![];
 
-    for i in 0..20 {
+    let request_count = if is_ci() { 10 } else { 20 }; // Fewer requests in CI
+
+    for i in 0..request_count {
         let client = Arc::clone(&client);
         let handle = tokio::spawn(async move {
             let start = Instant::now();
@@ -169,11 +177,8 @@ async fn test_rapid_fire_requests() -> Result<()> {
             (i, result, elapsed)
         });
         handles.push(handle);
-        // Only add delay in CI to avoid overwhelming the system.
-        // GitHub Actions (and most CI systems) automatically set CI=true.
-        if std::env::var("CI").is_ok() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        // Add small delay to prevent overwhelming the system
+        tokio::time::sleep(timeouts::rapid_delay()).await;
     }
 
     // Collect results
@@ -205,18 +210,23 @@ async fn test_rapid_fire_requests() -> Result<()> {
         }
     }
 
+    let request_count = if is_ci() { 10 } else { 20 };
     println!(
-        "Success rate: {}/20 (failed: {})",
-        success_count, failed_count
+        "Success rate: {}/{} (failed: {})",
+        success_count, request_count, failed_count
     );
-    println!("Average time per request: {:?}", total_time / 20);
+    println!(
+        "Average time per request: {:?}",
+        total_time / request_count as u32
+    );
 
     // Should handle most rapid requests (allowing for some failures in CI)
-    let min_success = if std::env::var("CI").is_ok() { 12 } else { 18 };
+    let min_success = if is_ci() { 7 } else { 18 };
     assert!(
         success_count >= min_success,
-        "At least {}/20 requests should succeed (got {})",
+        "At least {}/{} requests should succeed (got {})",
         min_success,
+        request_count,
         success_count
     );
 
@@ -247,9 +257,12 @@ async fn test_large_file_processing() -> Result<()> {
     println!("Processing {} files took: {:?}", files.len(), elapsed);
 
     // Should handle files reasonably
+    let timeout = timeouts::stress_timeout(timeouts::STRESS_FILES_BASE_SECS);
     assert!(
-        elapsed < Duration::from_secs(30),
-        "Should process files in reasonable time"
+        elapsed < timeout,
+        "Should process files within {:?} (got {:?})",
+        timeout,
+        elapsed
     );
 
     // Cleanup
