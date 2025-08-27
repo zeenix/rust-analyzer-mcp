@@ -1,6 +1,5 @@
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::time::Duration;
 
 // Import test support library
 use test_support::{is_ci, timeouts, MCPTestClient};
