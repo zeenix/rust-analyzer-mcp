@@ -1,6 +1,11 @@
 pub mod types;
 pub mod utils;
 
+// Include modules for testing diagnostics
+// These are intentionally not behind cfg(test) so they're always analyzed
+mod diagnostics_test;
+mod simple_error;
+
 pub use types::Config;
 pub use utils::process;
 

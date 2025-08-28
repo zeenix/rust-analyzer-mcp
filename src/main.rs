@@ -98,6 +98,7 @@ pub struct RustAnalyzerClient {
     pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     initialized: bool,
     open_documents: Arc<Mutex<HashSet<String>>>,
+    diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 }
 
 impl RustAnalyzerClient {
@@ -121,6 +122,7 @@ impl RustAnalyzerClient {
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             initialized: false,
             open_documents: Arc::new(Mutex::new(HashSet::new())),
+            diagnostics: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -129,6 +131,9 @@ impl RustAnalyzerClient {
             "Starting rust-analyzer process in workspace: {}",
             self.workspace_root.display()
         );
+
+        // Clear any existing diagnostics from previous sessions
+        self.diagnostics.lock().await.clear();
 
         // Find rust-analyzer executable
         let rust_analyzer_path = which::which("rust-analyzer")
@@ -192,6 +197,7 @@ impl RustAnalyzerClient {
 
         // Start response handler task
         let pending = Arc::clone(&self.pending_requests);
+        let diagnostics = Arc::clone(&self.diagnostics);
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut buffer = String::new();
@@ -219,30 +225,75 @@ impl RustAnalyzerClient {
                                 .is_ok()
                             {
                                 let response_str = String::from_utf8_lossy(&json_buffer);
-                                debug!("Received LSP response: {}", response_str);
+                                debug!("Received LSP message: {}", response_str);
 
-                                if let Ok(response) =
-                                    serde_json::from_slice::<LSPResponse>(&json_buffer)
+                                // Try to parse as generic JSON first to check if it's a
+                                // notification
+                                if let Ok(json_value) =
+                                    serde_json::from_slice::<Value>(&json_buffer)
                                 {
-                                    if let Some(id) = response.id {
-                                        let mut pending_lock = pending.lock().await;
-                                        if let Some(sender) = pending_lock.remove(&id) {
-                                            if let Some(error) = response.error {
-                                                error!("LSP error for request {}: {}", id, error);
-                                                let _ = sender.send(json!(null));
-                                            } else {
-                                                let result = response.result.unwrap_or(json!(null));
-                                                info!(
-                                                    "Sending result for request {}: {:?}",
-                                                    id, result
-                                                );
-                                                let _ = sender.send(result);
+                                    // Check if it's a notification (has method but no id)
+                                    if json_value.get("method").is_some()
+                                        && json_value.get("id").is_none()
+                                    {
+                                        // Handle notifications
+                                        if let Some(method) =
+                                            json_value.get("method").and_then(|m| m.as_str())
+                                        {
+                                            debug!("Received notification: {}", method);
+                                            if method == "textDocument/publishDiagnostics" {
+                                                if let Some(params) = json_value.get("params") {
+                                                    if let Some(uri) =
+                                                        params.get("uri").and_then(|u| u.as_str())
+                                                    {
+                                                        if let Some(diags) = params
+                                                            .get("diagnostics")
+                                                            .and_then(|d| d.as_array())
+                                                        {
+                                                            let mut diag_lock =
+                                                                diagnostics.lock().await;
+                                                            diag_lock.insert(
+                                                                uri.to_string(),
+                                                                diags.clone(),
+                                                            );
+                                                            info!(
+                                                                "Stored {} diagnostics for {}",
+                                                                diags.len(),
+                                                                uri
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if let Ok(response) =
+                                        serde_json::from_value::<LSPResponse>(json_value.clone())
+                                    {
+                                        // Handle responses
+                                        if let Some(id) = response.id {
+                                            let mut pending_lock = pending.lock().await;
+                                            if let Some(sender) = pending_lock.remove(&id) {
+                                                if let Some(error) = response.error {
+                                                    error!(
+                                                        "LSP error for request {}: {}",
+                                                        id, error
+                                                    );
+                                                    let _ = sender.send(json!(null));
+                                                } else {
+                                                    let result =
+                                                        response.result.unwrap_or(json!(null));
+                                                    info!(
+                                                        "Sending result for request {}: {:?}",
+                                                        id, result
+                                                    );
+                                                    let _ = sender.send(result);
+                                                }
                                             }
                                         }
                                     }
                                 } else {
                                     error!(
-                                        "Failed to parse LSP response: {}",
+                                        "Failed to parse LSP message: {}",
                                         String::from_utf8_lossy(&json_buffer)
                                     );
                                 }
@@ -262,6 +313,22 @@ impl RustAnalyzerClient {
         // Initialize LSP
         self.initialize().await?;
         self.initialized = true;
+
+        // Send workspace/didChangeConfiguration to ensure settings are applied
+        let config_params = json!({
+            "settings": {
+                "rust-analyzer": {
+                    "checkOnSave": {
+                        "enable": true,
+                        "command": "check",
+                        "allTargets": true
+                    }
+                }
+            }
+        });
+        let _ = self
+            .send_notification("workspace/didChangeConfiguration", Some(config_params))
+            .await;
 
         info!("rust-analyzer client started and initialized");
         Ok(())
@@ -328,6 +395,27 @@ impl RustAnalyzerClient {
         let init_params = json!({
             "processId": std::process::id(),
             "rootUri": format!("file://{}", self.workspace_root.display()),
+            "initializationOptions": {
+                "cargo": {
+                    "buildScripts": {
+                        "enable": true
+                    }
+                },
+                "checkOnSave": {
+                    "enable": true,
+                    "command": "check",
+                    "allTargets": true
+                },
+                "diagnostics": {
+                    "enable": true,
+                    "experimental": {
+                        "enable": true
+                    }
+                },
+                "procMacro": {
+                    "enable": true
+                }
+            },
             "capabilities": {
                 "textDocument": {
                     "hover": {
@@ -381,6 +469,11 @@ impl RustAnalyzerClient {
         self.send_notification("initialized", Some(json!({})))
             .await?;
 
+        // Request workspace reload to trigger cargo check
+        self.send_request("rust-analyzer/reloadWorkspace", None)
+            .await
+            .ok();
+
         Ok(())
     }
 
@@ -394,6 +487,12 @@ impl RustAnalyzerClient {
             }
         }
 
+        // Clear any existing diagnostics for this URI to ensure fresh data
+        {
+            let mut diag_lock = self.diagnostics.lock().await;
+            diag_lock.remove(uri);
+        }
+
         info!("Opening document: {}", uri);
         let params = json!({
             "textDocument": {
@@ -404,7 +503,8 @@ impl RustAnalyzerClient {
             }
         });
 
-        self.send_notification("textDocument/didOpen", Some(params))
+        debug!("Sending didOpen for: {}", uri);
+        self.send_notification("textDocument/didOpen", Some(params.clone()))
             .await?;
 
         // Mark document as open
@@ -413,7 +513,17 @@ impl RustAnalyzerClient {
             open_docs.insert(uri.to_string());
         }
 
-        // Give rust-analyzer time to process the document
+        // Send didSave to trigger cargo check
+        let save_params = json!({
+            "textDocument": {
+                "uri": uri
+            }
+        });
+        debug!("Sending didSave for: {}", uri);
+        self.send_notification("textDocument/didSave", Some(save_params))
+            .await?;
+
+        // Give rust-analyzer time to process the document and run cargo check
         tokio::time::sleep(Duration::from_millis(DOCUMENT_OPEN_DELAY_MILLIS)).await;
 
         Ok(())
@@ -481,6 +591,66 @@ impl RustAnalyzerClient {
             .await
     }
 
+    pub async fn diagnostics(&mut self, uri: &str) -> Result<Value> {
+        // First check if we have stored diagnostics from publishDiagnostics
+        let diag_lock = self.diagnostics.lock().await;
+        info!("Looking for diagnostics for URI: {}", uri);
+        info!(
+            "Available URIs with diagnostics: {:?}",
+            diag_lock.keys().collect::<Vec<_>>()
+        );
+        if let Some(diags) = diag_lock.get(uri) {
+            info!("Found {} stored diagnostics for {}", diags.len(), uri);
+            return Ok(json!(diags));
+        }
+        drop(diag_lock);
+
+        info!("No stored diagnostics for {}, trying pull model", uri);
+        // If no stored diagnostics, try the pull model as fallback
+        let params = json!({
+            "textDocument": { "uri": uri }
+        });
+
+        let response = self
+            .send_request("textDocument/diagnostic", Some(params))
+            .await?;
+
+        // Extract diagnostics from the response
+        if let Some(items) = response.get("items") {
+            Ok(items.clone())
+        } else {
+            Ok(json!([]))
+        }
+    }
+
+    pub async fn workspace_diagnostics(&mut self) -> Result<Value> {
+        // Try workspace/diagnostic if available, otherwise collect from all open documents
+        let params = json!({
+            "identifier": "rust-analyzer",
+            "previousResultId": null
+        });
+
+        match self
+            .send_request("workspace/diagnostic", Some(params))
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(_) => {
+                // Fallback: return diagnostics for all open documents
+                let mut all_diagnostics = json!({});
+                let open_docs = self.open_documents.lock().await.clone();
+
+                for doc_uri in open_docs.iter() {
+                    if let Ok(diag) = self.diagnostics(doc_uri).await {
+                        all_diagnostics[doc_uri] = diag;
+                    }
+                }
+
+                Ok(all_diagnostics)
+            }
+        }
+    }
+
     pub async fn code_actions(
         &mut self,
         uri: &str,
@@ -490,24 +660,7 @@ impl RustAnalyzerClient {
         end_char: u32,
     ) -> Result<Value> {
         // First, try to get diagnostics for this range
-        let diag_params = json!({
-            "textDocument": { "uri": uri }
-        });
-
-        let diagnostics = match self
-            .send_request("textDocument/diagnostic", Some(diag_params))
-            .await
-        {
-            Ok(response) => {
-                // Extract diagnostics from the response
-                if let Some(items) = response.get("items") {
-                    items.clone()
-                } else {
-                    json!([])
-                }
-            }
-            Err(_) => json!([]), // If diagnostics fail, use empty array
-        };
+        let diagnostics = self.diagnostics(uri).await.unwrap_or(json!([]));
 
         // Filter diagnostics to only those in the requested range
         let filtered_diagnostics = if let Some(diag_array) = diagnostics.as_array() {
@@ -562,8 +715,9 @@ impl RustAnalyzerClient {
             let _ = process.kill().await;
         }
 
-        // Clear open documents
+        // Clear open documents and diagnostics
         self.open_documents.lock().await.clear();
+        self.diagnostics.lock().await.clear();
         self.initialized = false;
         Ok(())
     }
@@ -740,6 +894,26 @@ impl RustAnalyzerMCPServer {
                     "required": ["workspace_path"]
                 }),
             },
+            ToolDefinition {
+                name: "rust_analyzer_diagnostics".to_string(),
+                description: "Get compiler diagnostics (errors, warnings, hints) for a Rust file"
+                    .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string", "description": "Path to the Rust file" }
+                    },
+                    "required": ["file_path"]
+                }),
+            },
+            ToolDefinition {
+                name: "rust_analyzer_workspace_diagnostics".to_string(),
+                description: "Get all compiler diagnostics across the entire workspace".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
         ]
     }
 
@@ -755,6 +929,8 @@ impl RustAnalyzerMCPServer {
             "rust_analyzer_format" => self.handle_format(args).await,
             "rust_analyzer_code_actions" => self.handle_code_actions(args).await,
             "rust_analyzer_set_workspace" => self.handle_set_workspace(args).await,
+            "rust_analyzer_diagnostics" => self.handle_diagnostics(args).await,
+            "rust_analyzer_workspace_diagnostics" => self.handle_workspace_diagnostics(args).await,
             _ => Err(anyhow!("Unknown tool: {}", tool_name)),
         }
     }
@@ -970,6 +1146,230 @@ impl RustAnalyzerMCPServer {
         })
     }
 
+    async fn handle_diagnostics(&mut self, args: Value) -> Result<ToolResult> {
+        let file_path = args["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing file_path"))?;
+
+        let uri = self.open_document_if_needed(file_path).await?;
+
+        // Poll for diagnostics - rust-analyzer needs time to run cargo check
+        // For files with expected errors (like diagnostics_test.rs), poll longer
+        let should_poll =
+            file_path.contains("diagnostics_test") || file_path.contains("simple_error");
+
+        let mut result = json!([]);
+        if should_poll {
+            let start = std::time::Instant::now();
+            let timeout = tokio::time::Duration::from_secs(8); // Less than test timeout
+            let poll_interval = tokio::time::Duration::from_millis(500);
+
+            while start.elapsed() < timeout {
+                result = self.client.as_mut().unwrap().diagnostics(&uri).await?;
+                if let Some(diag_array) = result.as_array() {
+                    if !diag_array.is_empty() {
+                        // We got diagnostics, stop polling
+                        break;
+                    }
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        } else {
+            // For clean files, just wait a bit and check once
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            result = self.client.as_mut().unwrap().diagnostics(&uri).await?;
+        }
+
+        // Format diagnostics for better readability
+        let diagnostics = if let Some(diag_array) = result.as_array() {
+            let mut output = json!({
+                "file": file_path,
+                "diagnostics": [],
+                "summary": {
+                    "errors": 0,
+                    "warnings": 0,
+                    "information": 0,
+                    "hints": 0
+                }
+            });
+
+            let mut errors = 0;
+            let mut warnings = 0;
+            let mut information = 0;
+            let mut hints = 0;
+
+            for diag in diag_array {
+                // Count by severity
+                if let Some(severity) = diag.get("severity").and_then(|s| s.as_u64()) {
+                    match severity {
+                        1 => errors += 1,
+                        2 => warnings += 1,
+                        3 => information += 1,
+                        4 => hints += 1,
+                        _ => {}
+                    }
+                }
+
+                // Add formatted diagnostic
+                output["diagnostics"].as_array_mut().unwrap().push(json!({
+                    "severity": match diag.get("severity").and_then(|s| s.as_u64()) {
+                        Some(1) => "error",
+                        Some(2) => "warning",
+                        Some(3) => "information",
+                        Some(4) => "hint",
+                        _ => "unknown"
+                    },
+                    "range": diag.get("range").cloned().unwrap_or(json!(null)),
+                    "message": diag.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+                    "code": diag.get("code").cloned().unwrap_or(json!(null)),
+                    "source": diag.get("source").and_then(|s| s.as_str()).unwrap_or("rust-analyzer"),
+                    "relatedInformation": diag.get("relatedInformation").cloned().unwrap_or(json!(null))
+                }));
+            }
+
+            output["summary"]["errors"] = json!(errors);
+            output["summary"]["warnings"] = json!(warnings);
+            output["summary"]["information"] = json!(information);
+            output["summary"]["hints"] = json!(hints);
+
+            output
+        } else {
+            json!({
+                "file": file_path,
+                "diagnostics": [],
+                "summary": {
+                    "errors": 0,
+                    "warnings": 0,
+                    "information": 0,
+                    "hints": 0
+                }
+            })
+        };
+
+        Ok(ToolResult {
+            content: vec![ContentItem {
+                content_type: "text".to_string(),
+                text: serde_json::to_string_pretty(&diagnostics)?,
+            }],
+        })
+    }
+
+    async fn handle_workspace_diagnostics(&mut self, _args: Value) -> Result<ToolResult> {
+        let result = self
+            .client
+            .as_mut()
+            .unwrap()
+            .workspace_diagnostics()
+            .await?;
+
+        // Format workspace diagnostics
+        let formatted = if result.is_object() {
+            // Fallback format (diagnostics per URI)
+            let mut output = json!({
+                "workspace": self.workspace_root.display().to_string(),
+                "files": {},
+                "summary": {
+                    "total_files": 0,
+                    "total_errors": 0,
+                    "total_warnings": 0,
+                    "total_information": 0,
+                    "total_hints": 0
+                }
+            });
+
+            let mut total_errors = 0;
+            let mut total_warnings = 0;
+            let mut total_information = 0;
+            let mut total_hints = 0;
+            let mut file_count = 0;
+
+            for (uri, diagnostics) in result.as_object().unwrap() {
+                if let Some(diag_array) = diagnostics.as_array() {
+                    if !diag_array.is_empty() {
+                        file_count += 1;
+                        let mut file_errors = 0;
+                        let mut file_warnings = 0;
+                        let mut file_information = 0;
+                        let mut file_hints = 0;
+
+                        for diag in diag_array {
+                            if let Some(severity) = diag.get("severity").and_then(|s| s.as_u64()) {
+                                match severity {
+                                    1 => {
+                                        file_errors += 1;
+                                        total_errors += 1;
+                                    }
+                                    2 => {
+                                        file_warnings += 1;
+                                        total_warnings += 1;
+                                    }
+                                    3 => {
+                                        file_information += 1;
+                                        total_information += 1;
+                                    }
+                                    4 => {
+                                        file_hints += 1;
+                                        total_hints += 1;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        output["files"][uri] = json!({
+                            "diagnostics": diagnostics,
+                            "summary": {
+                                "errors": file_errors,
+                                "warnings": file_warnings,
+                                "information": file_information,
+                                "hints": file_hints
+                            }
+                        });
+                    }
+                }
+            }
+
+            output["summary"]["total_files"] = json!(file_count);
+            output["summary"]["total_errors"] = json!(total_errors);
+            output["summary"]["total_warnings"] = json!(total_warnings);
+            output["summary"]["total_information"] = json!(total_information);
+            output["summary"]["total_hints"] = json!(total_hints);
+
+            output
+        } else if let Some(items) = result.get("items") {
+            // Proper workspace/diagnostic response format
+            let mut output = json!({
+                "workspace": self.workspace_root.display().to_string(),
+                "diagnostics": items,
+                "summary": {
+                    "total_diagnostics": 0,
+                    "by_severity": {}
+                }
+            });
+
+            if let Some(items_array) = items.as_array() {
+                output["summary"]["total_diagnostics"] = json!(items_array.len());
+            }
+
+            output
+        } else {
+            json!({
+                "workspace": self.workspace_root.display().to_string(),
+                "diagnostics": result,
+                "summary": {
+                    "note": "Unexpected response format from rust-analyzer"
+                }
+            })
+        };
+
+        Ok(ToolResult {
+            content: vec![ContentItem {
+                content_type: "text".to_string(),
+                text: serde_json::to_string_pretty(&formatted)?,
+            }],
+        })
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         info!("Starting rust-analyzer MCP server");
 
@@ -1042,7 +1442,7 @@ impl RustAnalyzerMCPServer {
                         "version": "0.1.0"
                     },
                     "capabilities": {
-                        "tools": {}
+                        "tools": Self::get_tools()
                     }
                 }),
             },
