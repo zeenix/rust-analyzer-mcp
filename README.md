@@ -177,6 +177,23 @@ Get available code actions (quick fixes, refactorings) for a range.
 - Having actual code issues or refactoring opportunities in the selected range
 - May return empty array if no actions are applicable
 
+#### `rust_analyzer_diagnostics`
+Get diagnostics (errors, warnings, hints) for a specific file.
+
+**Parameters:**
+- `file_path`: Path to the Rust file
+
+Returns diagnostics with severity levels (error, warning, hint, information), messages, and location
+ranges. Includes a summary count of diagnostics by severity.
+
+#### `rust_analyzer_workspace_diagnostics`
+Get all diagnostics across the entire workspace.
+
+**Parameters:** None
+
+Returns aggregated diagnostics for all files in the workspace with file paths, severity levels,
+messages, and a summary of total counts by severity.
+
 ### `rust_analyzer_set_workspace`
 Change the workspace root directory.
 
@@ -208,6 +225,16 @@ Here are some example prompts you can use with Claude when this MCP server is co
 4. **Refactoring Help:**
    ```
    What code actions are available for the code between line 10-15 in src/utils.rs?
+   ```
+
+5. **Error Checking:**
+   ```
+   Can you get the diagnostics for src/main.rs and tell me about any errors or warnings?
+   ```
+
+6. **Workspace Analysis:**
+   ```
+   Show me all the diagnostics across the entire workspace using rust-analyzer.
    ```
 
 ## Project Structure
