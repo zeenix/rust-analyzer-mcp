@@ -45,16 +45,39 @@ impl IsolatedProject {
         // Copy the entire test-project directory recursively.
         copy_dir_all(&source_path, &project_path)?;
 
-        // Log what files are in src/ for debugging
-        if let Ok(entries) = std::fs::read_dir(project_path.join("src")) {
-            let files: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect();
-            eprintln!(
-                "[IsolatedProject] Created from {} with src files: {:?}",
-                source_dir, files
-            );
+        // Verify the copy was complete and log what files are in src/
+        let src_dir = project_path.join("src");
+        if !src_dir.exists() {
+            return Err(anyhow::anyhow!(
+                "src/ directory not created in isolated project"
+            ));
+        }
+
+        let entries = std::fs::read_dir(&src_dir)?;
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        files.sort(); // Sort for consistent ordering
+
+        eprintln!(
+            "[IsolatedProject] Created from {} with src files: {:?}",
+            source_dir, files
+        );
+
+        // Verify critical files exist
+        if source_dir == "test-project" {
+            let required_files = ["lib.rs", "types.rs", "utils.rs"];
+            for file in required_files {
+                let file_path = src_dir.join(file);
+                if !file_path.exists() {
+                    return Err(anyhow::anyhow!(
+                        "Required file {} missing after copy. Found files: {:?}",
+                        file,
+                        files
+                    ));
+                }
+            }
         }
 
         Ok(Self {
@@ -80,19 +103,37 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 
     fs::create_dir_all(dst)?;
 
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
+    // Collect all entries first to ensure we don't miss any
+    let entries: Vec<_> = fs::read_dir(src)?.collect::<Result<Vec<_>, _>>()?;
+
+    eprintln!(
+        "[copy_dir_all] Copying {} entries from {:?} to {:?}",
+        entries.len(),
+        src,
+        dst
+    );
+
+    for entry in entries {
         let ty = entry.file_type()?;
         let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
+        let file_name = entry.file_name();
+        let dst_path = dst.join(&file_name);
 
         if ty.is_dir() {
             // Skip target directory to avoid copying build artifacts.
-            if entry.file_name() != "target" {
+            if file_name != "target" {
                 copy_dir_all(&src_path, &dst_path)?;
             }
         } else {
             fs::copy(&src_path, &dst_path)?;
+            // Verify the file was copied
+            if !dst_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "Failed to copy file {:?} to {:?}",
+                    src_path,
+                    dst_path
+                ));
+            }
         }
     }
 
