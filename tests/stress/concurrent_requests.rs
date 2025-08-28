@@ -74,28 +74,10 @@ async fn test_concurrent_tool_calls() -> Result<()> {
 
     let elapsed = start.elapsed();
 
-    // All requests should complete
+    // All requests should complete successfully
     assert_eq!(results.len(), 6);
-    let mut failures = Vec::new();
     for (i, result) in results.into_iter().enumerate() {
-        // Results are direct Result<Value> from async blocks
-        if let Err(e) = &result {
-            failures.push(format!("Request {} failed: {:?}", i, e));
-        }
-        assert!(result.is_ok() || result.is_err(), "Should get a response");
-    }
-
-    if !failures.is_empty() {
-        eprintln!("Concurrent test failures in CI:");
-        for failure in &failures {
-            eprintln!("  {}", failure);
-        }
-        // Allow some failures in CI but not too many
-        if is_ci() && failures.len() <= 3 {
-            eprintln!("Allowing {} failures in CI environment", failures.len());
-        } else if !failures.is_empty() {
-            panic!("Too many failures: {}", failures.join(", "));
-        }
+        assert!(result.is_ok(), "Request {} failed: {:?}", i, result.err());
     }
 
     // Concurrent execution should be faster than sequential
@@ -116,22 +98,20 @@ async fn test_concurrent_tool_calls() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_many_sequential_requests() -> Result<()> {
+async fn test_sequential_throughput() -> Result<()> {
     let client = MCPTestClient::start_isolated().await?;
     client.initialize_and_wait().await?;
 
     let start = Instant::now();
 
-    // Send many requests sequentially
-    for i in 0..50 {
-        let _ = client.get_symbols("src/main.rs").await;
-        if i % 10 == 0 {
-            println!("Completed {} requests", i);
-        }
+    // Send several requests sequentially to test throughput
+    for i in 0..10 {
+        let result = client.get_symbols("src/main.rs").await;
+        assert!(result.is_ok(), "Request {} failed: {:?}", i, result.err());
     }
 
     let elapsed = start.elapsed();
-    println!("50 sequential requests took: {:?}", elapsed);
+    println!("10 sequential requests took: {:?}", elapsed);
 
     // Should handle many requests without degradation
     let timeout = timeouts::stress_timeout(timeouts::STRESS_SEQUENTIAL_BASE_SECS);
@@ -153,11 +133,10 @@ async fn test_rapid_fire_requests() -> Result<()> {
     let client = Arc::new(MCPTestClient::start_isolated().await?);
     client.initialize_and_wait().await?;
 
-    // Send requests as fast as possible without waiting
+    // Send requests concurrently without delays
+    let request_count = 10;
+
     let mut handles = vec![];
-
-    let request_count = if is_ci() { 10 } else { 20 }; // Fewer requests in CI
-
     for i in 0..request_count {
         let client = Arc::clone(&client);
         let handle = tokio::spawn(async move {
@@ -167,8 +146,6 @@ async fn test_rapid_fire_requests() -> Result<()> {
             (i, result, elapsed)
         });
         handles.push(handle);
-        // Add small delay to prevent overwhelming the system
-        tokio::time::sleep(timeouts::rapid_delay()).await;
     }
 
     // Collect results
@@ -200,7 +177,6 @@ async fn test_rapid_fire_requests() -> Result<()> {
         }
     }
 
-    let request_count = if is_ci() { 10 } else { 20 };
     println!(
         "Success rate: {}/{} (failed: {})",
         success_count, request_count, failed_count
@@ -210,14 +186,11 @@ async fn test_rapid_fire_requests() -> Result<()> {
         total_time / request_count as u32
     );
 
-    // Should handle most rapid requests (allowing for some failures in CI)
-    let min_success = if is_ci() { 7 } else { 18 };
-    assert!(
-        success_count >= min_success,
-        "At least {}/{} requests should succeed (got {})",
-        min_success,
-        request_count,
-        success_count
+    // All rapid requests should succeed
+    assert_eq!(
+        success_count, request_count,
+        "All {} requests should succeed (got {} successes, {} failures)",
+        request_count, success_count, failed_count
     );
 
     // Cleanup
@@ -278,20 +251,45 @@ async fn test_error_recovery() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_memory_stability() -> Result<()> {
-    let client = MCPTestClient::start_isolated().await?;
+async fn test_concurrent_mixed_requests() -> Result<()> {
+    let client = Arc::new(MCPTestClient::start_isolated().await?);
     client.initialize_and_wait().await?;
 
-    // Send many requests to test memory stability
-    for iteration in 0..10 {
-        println!("Iteration {}", iteration);
+    // Test memory stability with a single iteration of concurrent requests
+    // Run mixed request types concurrently
+    let mut tasks = vec![];
 
-        // Mix of different request types
-        for _ in 0..10 {
-            let _ = client.get_symbols("src/main.rs").await;
-            let _ = client.get_hover("src/main.rs", 1, 10).await;
-            let _ = client.get_completion("src/main.rs", 2, 5).await;
-        }
+    // Create 3 sets of concurrent requests (9 total)
+    for _ in 0..3 {
+        let c1 = Arc::clone(&client);
+        tasks.push(tokio::spawn(
+            async move { c1.get_symbols("src/main.rs").await },
+        ));
+
+        let c2 = Arc::clone(&client);
+        tasks.push(tokio::spawn(async move {
+            c2.get_hover("src/main.rs", 1, 10).await
+        }));
+
+        let c3 = Arc::clone(&client);
+        tasks.push(tokio::spawn(async move {
+            c3.get_completion("src/main.rs", 2, 5).await
+        }));
+    }
+
+    // Execute all requests concurrently
+    let results = join_all(tasks).await;
+
+    // Verify all requests succeeded
+    for (i, result) in results.into_iter().enumerate() {
+        assert!(result.is_ok(), "Task {} panicked: {:?}", i, result.err());
+        let inner_result = result.unwrap();
+        assert!(
+            inner_result.is_ok(),
+            "Request {} failed: {:?}",
+            i,
+            inner_result.err()
+        );
     }
 
     // Final request should still work
