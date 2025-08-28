@@ -45,6 +45,18 @@ impl IsolatedProject {
         // Copy the entire test-project directory recursively.
         copy_dir_all(&source_path, &project_path)?;
 
+        // Log what files are in src/ for debugging
+        if let Ok(entries) = std::fs::read_dir(project_path.join("src")) {
+            let files: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            eprintln!(
+                "[IsolatedProject] Created from {} with src files: {:?}",
+                source_dir, files
+            );
+        }
+
         Ok(Self {
             _temp_dir: temp_dir,
             project_path,

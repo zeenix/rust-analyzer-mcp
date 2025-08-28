@@ -36,6 +36,7 @@ impl MCPTestClient {
     pub async fn start_isolated() -> Result<Self> {
         let isolated_project = IsolatedProject::new()?;
         let workspace = isolated_project.path().to_path_buf();
+        eprintln!("[start_isolated] Using workspace: {:?}", workspace);
 
         let client = Self::start_internal(&workspace, Some(isolated_project)).await?;
         Ok(client)
@@ -46,6 +47,10 @@ impl MCPTestClient {
     pub async fn start_isolated_diagnostics() -> Result<Self> {
         let isolated_project = IsolatedProject::new_diagnostics()?;
         let workspace = isolated_project.path().to_path_buf();
+        eprintln!(
+            "[start_isolated_diagnostics] Using workspace: {:?}",
+            workspace
+        );
 
         let client = Self::start_internal(&workspace, Some(isolated_project)).await?;
         Ok(client)

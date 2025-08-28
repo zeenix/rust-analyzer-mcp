@@ -100,7 +100,15 @@ async fn test_file_diagnostics() -> Result<()> {
 async fn test_file_diagnostics_clean_file() -> Result<()> {
     // Use regular test project for clean file testing
     let client = MCPTestClient::start_isolated().await?;
+    eprintln!("Started isolated client for clean file test");
     client.initialize_and_wait().await?;
+    eprintln!("Client initialized and ready");
+
+    // In CI, wait extra time to ensure rust-analyzer has fully settled
+    if std::env::var("CI").is_ok() {
+        eprintln!("CI environment detected, waiting extra 2s for rust-analyzer to fully settle");
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
 
     // Use a longer timeout for CI environments.
     let timeout_ms = if std::env::var("CI").is_ok() {
@@ -145,13 +153,29 @@ async fn test_file_diagnostics_clean_file() -> Result<()> {
     let content = response["content"][0]["text"].as_str().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
 
-    // Check summary for clean file (types.rs should have no errors)
+    // Check summary for clean file (lib.rs should have no errors)
     let summary = &parsed["summary"];
+
+    // Log the full diagnostic response for debugging
+    eprintln!("Full diagnostic response for src/lib.rs:");
+    eprintln!("{}", serde_json::to_string_pretty(&parsed).unwrap());
+
+    // If there are diagnostics, log them individually
+    if let Some(diags) = parsed["diagnostics"].as_array() {
+        if !diags.is_empty() {
+            eprintln!("Individual diagnostics found:");
+            for (i, diag) in diags.iter().enumerate() {
+                eprintln!("  Diagnostic {}: {:?}", i, diag);
+            }
+        }
+    }
+
     assert_eq!(
         summary["errors"].as_u64().unwrap_or(1),
         0,
-        "Clean file (types.rs) should have no errors. Summary: {:?}",
-        summary
+        "Clean file (src/lib.rs) should have no errors. Summary: {:?}, Full response: {}",
+        summary,
+        serde_json::to_string_pretty(&parsed).unwrap()
     );
 
     // Allow warnings (like unused imports or dead code warnings) but no errors

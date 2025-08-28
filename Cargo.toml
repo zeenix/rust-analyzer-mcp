@@ -1,6 +1,6 @@
 [workspace]
 members = [".", "test-support"]
-exclude = ["test-project"]
+exclude = ["test-project", "test-project-diagnostics"]
 
 [package]
 name = "rust-analyzer-mcp"
