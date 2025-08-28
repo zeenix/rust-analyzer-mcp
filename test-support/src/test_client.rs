@@ -17,7 +17,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::timeouts;
+use crate::{timeouts, IsolatedProject};
 
 /// MCP test client for integration testing - properly manages process lifecycle
 pub struct MCPTestClient {
@@ -26,11 +26,32 @@ pub struct MCPTestClient {
     stdout: Mutex<BufReader<tokio::process::ChildStdout>>,
     request_id: AtomicU64,
     shutdown: AtomicBool,
+    /// Optional isolated project that will be cleaned up when client is dropped.
+    _isolated_project: Option<IsolatedProject>,
 }
 
 impl MCPTestClient {
-    /// Start a new MCP server process
+    /// Start a new MCP server process with an isolated test project.
+    /// This creates a temporary copy of the test-project that will be cleaned up automatically.
+    pub async fn start_isolated() -> Result<Self> {
+        let isolated_project = IsolatedProject::new()?;
+        let workspace = isolated_project.path().to_path_buf();
+
+        let client = Self::start_internal(&workspace, Some(isolated_project)).await?;
+        Ok(client)
+    }
+
+    /// Start a new MCP server process with a provided workspace path.
+    /// Use this when you don't need isolation (e.g., for benchmarks or specific test setups).
     pub async fn start(workspace: &Path) -> Result<Self> {
+        Self::start_internal(workspace, None).await
+    }
+
+    /// Internal method to start the MCP server.
+    async fn start_internal(
+        workspace: &Path,
+        isolated_project: Option<IsolatedProject>,
+    ) -> Result<Self> {
         // Use the built binary directly instead of cargo run for speed and isolation
         let binary = if std::path::Path::new("target/release/rust-analyzer-mcp").exists() {
             "target/release/rust-analyzer-mcp"
@@ -38,7 +59,7 @@ impl MCPTestClient {
             "target/debug/rust-analyzer-mcp"
         } else {
             // Fall back to cargo run if binary not built
-            return Self::start_with_cargo(workspace).await;
+            return Self::start_with_cargo_internal(workspace, isolated_project).await;
         };
 
         let mut process = Command::new(binary)
@@ -57,11 +78,15 @@ impl MCPTestClient {
             stdout: Mutex::new(stdout),
             request_id: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
+            _isolated_project: isolated_project,
         })
     }
 
     /// Start using cargo run (fallback)
-    async fn start_with_cargo(workspace: &Path) -> Result<Self> {
+    async fn start_with_cargo_internal(
+        workspace: &Path,
+        isolated_project: Option<IsolatedProject>,
+    ) -> Result<Self> {
         let mut process = Command::new("cargo")
             .args(&["run", "--", workspace.to_str().unwrap()])
             .stdin(Stdio::piped())
@@ -78,6 +103,7 @@ impl MCPTestClient {
             stdout: Mutex::new(stdout),
             request_id: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
+            _isolated_project: isolated_project,
         })
     }
 
@@ -166,8 +192,9 @@ impl MCPTestClient {
         .await
     }
 
-    /// Initialize and wait for rust-analyzer to be ready
-    pub async fn initialize_and_wait(&self, _workspace: &Path) -> Result<()> {
+    /// Initialize and wait for rust-analyzer to be ready.
+    /// For isolated clients, uses the internal workspace path automatically.
+    pub async fn initialize_and_wait(&self) -> Result<()> {
         self.initialize().await?;
 
         // rust-analyzer returns null while indexing, so we need to poll.

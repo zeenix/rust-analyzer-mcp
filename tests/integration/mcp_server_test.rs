@@ -6,9 +6,7 @@ use test_support::{is_ci, timeouts, MCPTestClient};
 
 #[tokio::test]
 async fn test_server_initialization() -> Result<()> {
-    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
-
-    let client = MCPTestClient::start(&project_path).await?;
+    let client = MCPTestClient::start_isolated().await?;
     // Initialize the server
     let init_response = client.initialize().await?;
 
@@ -31,10 +29,8 @@ async fn test_server_initialization() -> Result<()> {
 
 #[tokio::test]
 async fn test_all_lsp_tools() -> Result<()> {
-    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
-
-    let client = MCPTestClient::start(&project_path).await?;
-    client.initialize_and_wait(&project_path).await?;
+    let client = MCPTestClient::start_isolated().await?;
+    client.initialize_and_wait().await?;
 
     // Test 1: Get symbols for main.rs
     test_symbols(&client).await?;
@@ -108,14 +104,13 @@ async fn test_all_lsp_tools() -> Result<()> {
 
 #[tokio::test]
 async fn test_workspace_change() -> Result<()> {
-    // Start with the test project
-    let first_project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
-    let client = MCPTestClient::start(&first_project).await?;
+    // Start with an isolated test project
+    let client = MCPTestClient::start_isolated().await?;
     client.initialize().await?;
 
-    // Change to another workspace (use the same for now)
-    let second_project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
-    let response = client.set_workspace(&second_project).await?;
+    // Create a second isolated project to switch to
+    let second_project = test_support::IsolatedProject::new()?;
+    let response = client.set_workspace(second_project.path()).await?;
 
     // Verify workspace change succeeded
     if let Some(content) = response.get("content") {
@@ -136,10 +131,8 @@ async fn test_workspace_change() -> Result<()> {
 
 #[tokio::test]
 async fn test_error_handling_invalid_files() -> Result<()> {
-    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
-
-    let client = MCPTestClient::start(&project_path).await?;
-    client.initialize_and_wait(&project_path).await?;
+    let client = MCPTestClient::start_isolated().await?;
+    client.initialize_and_wait().await?;
 
     // Test multiple invalid file paths
     let invalid_paths = vec!["non_existent.rs", "../../../etc/passwd"];
@@ -172,10 +165,8 @@ async fn test_error_handling_invalid_files() -> Result<()> {
 
 #[tokio::test]
 async fn test_error_handling_invalid_positions() -> Result<()> {
-    let project_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-project");
-
-    let client = MCPTestClient::start(&project_path).await?;
-    client.initialize_and_wait(&project_path).await?;
+    let client = MCPTestClient::start_isolated().await?;
+    client.initialize_and_wait().await?;
 
     // Test multiple invalid positions
     let invalid_positions = vec![
