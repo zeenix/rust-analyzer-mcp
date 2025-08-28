@@ -41,6 +41,16 @@ impl MCPTestClient {
         Ok(client)
     }
 
+    /// Start a new MCP server process with an isolated diagnostic test project.
+    /// This creates a temporary copy of test-project-diagnostics for testing diagnostics.
+    pub async fn start_isolated_diagnostics() -> Result<Self> {
+        let isolated_project = IsolatedProject::new_diagnostics()?;
+        let workspace = isolated_project.path().to_path_buf();
+
+        let client = Self::start_internal(&workspace, Some(isolated_project)).await?;
+        Ok(client)
+    }
+
     /// Start a new MCP server process with a provided workspace path.
     /// Use this when you don't need isolation (e.g., for benchmarks or specific test setups).
     pub async fn start(workspace: &Path) -> Result<Self> {
@@ -230,8 +240,9 @@ impl MCPTestClient {
     }
 
     async fn check_symbols_ready(&self) -> bool {
+        // Use lib.rs as it exists in all test projects
         let Ok(response) = self
-            .call_tool("rust_analyzer_symbols", json!({"file_path": "src/main.rs"}))
+            .call_tool("rust_analyzer_symbols", json!({"file_path": "src/lib.rs"}))
             .await
         else {
             return false;

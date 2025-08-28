@@ -13,20 +13,31 @@ pub struct IsolatedProject {
 impl IsolatedProject {
     /// Create a new isolated test project by copying the test-project to a temp directory.
     pub fn new() -> Result<Self> {
+        Self::new_from_source("test-project")
+    }
+
+    /// Create a new isolated diagnostic test project by copying test-project-diagnostics.
+    pub fn new_diagnostics() -> Result<Self> {
+        Self::new_from_source("test-project-diagnostics")
+    }
+
+    /// Create an isolated project from a specific source directory.
+    fn new_from_source(source_dir: &str) -> Result<Self> {
         let temp_dir = TempDir::new()?;
         let project_path = temp_dir.path().to_path_buf();
 
         // Get the source test-project path - handle both test-support and root manifest dirs.
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let source_path = if manifest_dir.ends_with("test-support") {
-            manifest_dir.parent().unwrap().join("test-project")
+            manifest_dir.parent().unwrap().join(source_dir)
         } else {
-            manifest_dir.join("test-project")
+            manifest_dir.join(source_dir)
         };
 
         if !source_path.exists() {
             return Err(anyhow::anyhow!(
-                "test-project not found at: {}",
+                "{} not found at: {}",
+                source_dir,
                 source_path.display()
             ));
         }

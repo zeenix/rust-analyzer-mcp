@@ -1,11 +1,6 @@
 pub mod types;
 pub mod utils;
 
-// Include modules for testing diagnostics
-// These are intentionally not behind cfg(test) so they're always analyzed
-mod diagnostics_test;
-mod simple_error;
-
 pub use types::Config;
 pub use utils::process;
 
@@ -33,9 +28,7 @@ impl Person {
         &self.name
     }
 
-    // Unused variable that could trigger a warning
     pub fn birthday(&mut self) {
-        let old_age = self.age;
         self.age += 1;
     }
 }
@@ -45,14 +38,13 @@ pub fn add(a: i32, b: i32) -> i32 {
     a + b
 }
 
-// Struct that could derive Debug, Clone, etc.
+#[derive(Debug, Clone)]
 pub struct Point {
-    x: f64,
-    y: f64,
+    pub x: f64,
+    pub y: f64,
 }
 
-// Function with unnecessary mut
-pub fn process_value(mut value: i32) -> i32 {
+pub fn process_value(value: i32) -> i32 {
     value * 2
 }
 
