@@ -34,20 +34,29 @@ This Rust implementation offers several advantages over alternative implementati
 
 ## Installation
 
-1. Clone or create the project:
+### From crates.io (Recommended)
+
+Install directly from crates.io:
+```bash
+cargo install rust-analyzer-mcp
+```
+
+The binary will be installed to your Cargo bin directory (usually `~/.cargo/bin/rust-analyzer-mcp`).
+
+### From Source
+
+1. Clone the repository:
    ```bash
-   mkdir rust-analyzer-mcp-server
-   cd rust-analyzer-mcp-server
+   git clone https://github.com/zeenix/rust-analyzer-mcp.git
+   cd rust-analyzer-mcp
    ```
 
-2. Save the Rust code as `src/main.rs` and the `Cargo.toml`
-
-3. Build the project:
+2. Build the project:
    ```bash
    cargo build --release
    ```
 
-4. The binary will be available at `target/release/rust-analyzer-mcp`
+3. The binary will be available at `target/release/rust-analyzer-mcp`
 
 ## Configuration
 
@@ -60,7 +69,7 @@ Add an MCP server configuration to one of these locations:
 {
   "mcpServers": {
     "rust-analyzer": {
-      "command": "/path/to/rust-analyzer-mcp/target/release/rust-analyzer-mcp"
+      "command": "rust-analyzer-mcp"
     }
   }
 }
@@ -71,14 +80,15 @@ Add an MCP server configuration to one of these locations:
 {
   "mcpServers": {
     "rust-analyzer": {
-      "command": "/path/to/rust-analyzer-mcp/target/release/rust-analyzer-mcp"
+      "command": "rust-analyzer-mcp"
     }
   }
 }
 ```
 
-**Note:** Replace `/path/to/rust-analyzer-mcp` with the actual path to this repository where you
-built the binary. You can also configure servers using Claude Code's CLI wizard too.
+**Note:** If you installed from crates.io, the command will be in your PATH. If you built from
+source, use the full path to the binary. You can also configure servers using Claude Code's CLI
+wizard too.
 
 ### Claude Desktop Configuration
 
@@ -88,14 +98,14 @@ Add this to your Claude Desktop configuration (`claude_desktop_config.json`):
 {
   "mcpServers": {
     "rust-analyzer": {
-      "command": "/path/to/rust-analyzer-mcp/target/release/rust-analyzer-mcp"
+      "command": "rust-analyzer-mcp"
     }
   }
 }
 ```
 
-**Note:** For Claude Desktop, you may want to specify a `cwd` parameter if you want to analyze a
-          specific project by default.
+**Note:** If installed from crates.io, the command will be in your PATH. For Claude Desktop, you
+may want to specify a `cwd` parameter if you want to analyze a specific project by default.
 
 ### Other MCP Clients
 
