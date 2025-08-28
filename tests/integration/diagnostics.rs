@@ -26,19 +26,36 @@ async fn test_file_diagnostics() -> Result<()> {
     let client = MCPTestClient::start(&project_path).await?;
     client.initialize_and_wait(&project_path).await?;
 
-    // Test getting diagnostics for the test file with errors
-    let response = client
-        .call_tool(
-            "rust_analyzer_diagnostics",
-            json!({
-                "file_path": "src/diagnostics_test.rs"
-            }),
-        )
-        .await?;
+    // Wait for diagnostics to be published - rust-analyzer sends these asynchronously.
+    let mut parsed = serde_json::Value::Null;
+    for attempt in 0..10 {
+        // Test getting diagnostics for the test file with errors
+        let response = client
+            .call_tool(
+                "rust_analyzer_diagnostics",
+                json!({
+                    "file_path": "src/diagnostics_test.rs"
+                }),
+            )
+            .await?;
 
-    assert_tool_response(&response);
-    let content = response["content"][0]["text"].as_str().unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_tool_response(&response);
+        let content = response["content"][0]["text"].as_str().unwrap();
+        parsed = serde_json::from_str(content).unwrap();
+
+        let diagnostics = parsed["diagnostics"].as_array().unwrap();
+        if !diagnostics.is_empty() {
+            break;
+        }
+
+        if attempt < 9 {
+            eprintln!(
+                "Attempt {}: No diagnostics yet, waiting for rust-analyzer...",
+                attempt + 1
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    }
 
     // Check that we have diagnostics
     assert!(parsed["diagnostics"].is_array());
@@ -109,15 +126,34 @@ async fn test_workspace_diagnostics() -> Result<()> {
     let client = MCPTestClient::start(&project_path).await?;
     client.initialize_and_wait(&project_path).await?;
 
-    // First, open a file with errors to ensure it's analyzed
-    let _ = client
-        .call_tool(
-            "rust_analyzer_diagnostics",
-            json!({
-                "file_path": "src/diagnostics_test.rs"
-            }),
-        )
-        .await?;
+    // First, open a file with errors to ensure it's analyzed.
+    // Wait for diagnostics to be available.
+    for attempt in 0..10 {
+        let response = client
+            .call_tool(
+                "rust_analyzer_diagnostics",
+                json!({
+                    "file_path": "src/diagnostics_test.rs"
+                }),
+            )
+            .await?;
+
+        let content = response["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+        let diagnostics = parsed["diagnostics"].as_array().unwrap();
+
+        if !diagnostics.is_empty() {
+            break;
+        }
+
+        if attempt < 9 {
+            eprintln!(
+                "Attempt {}: Waiting for initial diagnostics...",
+                attempt + 1
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    }
 
     // Now get workspace diagnostics
     let response = client
@@ -191,21 +227,38 @@ async fn test_diagnostics_severity_levels() -> Result<()> {
     let client = MCPTestClient::start(&project_path).await?;
     client.initialize_and_wait(&project_path).await?;
 
-    // Test file should have different severity levels
-    let response = client
-        .call_tool(
-            "rust_analyzer_diagnostics",
-            json!({
-                "file_path": "src/diagnostics_test.rs"
-            }),
-        )
-        .await?;
+    // Wait for diagnostics to be published - rust-analyzer sends these asynchronously.
+    // Retry a few times with delays to give rust-analyzer time to analyze.
+    let mut diagnostics = vec![];
+    for attempt in 0..10 {
+        // Test file should have different severity levels
+        let response = client
+            .call_tool(
+                "rust_analyzer_diagnostics",
+                json!({
+                    "file_path": "src/diagnostics_test.rs"
+                }),
+            )
+            .await?;
 
-    assert_tool_response(&response);
-    let content = response["content"][0]["text"].as_str().unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_tool_response(&response);
+        let content = response["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
 
-    let diagnostics = parsed["diagnostics"].as_array().unwrap();
+        diagnostics = parsed["diagnostics"].as_array().unwrap().clone();
+
+        if !diagnostics.is_empty() {
+            break;
+        }
+
+        if attempt < 9 {
+            eprintln!(
+                "Attempt {}: No diagnostics yet, waiting for rust-analyzer...",
+                attempt + 1
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    }
 
     // Debug: Print diagnostics to understand what we're getting
     eprintln!("Diagnostics count: {}", diagnostics.len());
@@ -226,7 +279,7 @@ async fn test_diagnostics_severity_levels() -> Result<()> {
     let mut has_error = false;
     let mut has_warning = false;
 
-    for diag in diagnostics {
+    for diag in &diagnostics {
         match diag["severity"].as_str() {
             Some("error") => has_error = true,
             Some("warning") => has_warning = true,
