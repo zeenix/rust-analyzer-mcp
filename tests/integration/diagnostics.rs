@@ -106,7 +106,16 @@ async fn test_file_diagnostics_clean_file() -> Result<()> {
 
     // In CI, wait extra time to ensure rust-analyzer has fully settled
     if std::env::var("CI").is_ok() {
-        eprintln!("CI environment detected, waiting extra 2s for rust-analyzer to fully settle");
+        eprintln!("CI environment detected, waiting extra 3s for rust-analyzer to fully index the project");
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        // Do a preliminary query to trigger indexing
+        eprintln!("Triggering rust-analyzer indexing with symbols query...");
+        let _ = client
+            .call_tool("rust_analyzer_symbols", json!({"file_path": "src/lib.rs"}))
+            .await;
+
+        // Wait a bit more after triggering
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
 

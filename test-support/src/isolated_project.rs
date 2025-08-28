@@ -78,6 +78,16 @@ impl IsolatedProject {
                     ));
                 }
             }
+
+            // Also verify Cargo.toml exists
+            let cargo_toml = project_path.join("Cargo.toml");
+            if !cargo_toml.exists() {
+                return Err(anyhow::anyhow!(
+                    "Cargo.toml missing in isolated project at {:?}",
+                    cargo_toml
+                ));
+            }
+            eprintln!("[IsolatedProject] Cargo.toml exists at {:?}", cargo_toml);
         }
 
         Ok(Self {
