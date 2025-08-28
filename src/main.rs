@@ -1442,7 +1442,7 @@ impl RustAnalyzerMCPServer {
                         "version": "0.1.0"
                     },
                     "capabilities": {
-                        "tools": Self::get_tools()
+                        "tools": {}
                     }
                 }),
             },
