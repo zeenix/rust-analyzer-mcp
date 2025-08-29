@@ -68,40 +68,84 @@ impl MCPTestClient {
         workspace: &Path,
         isolated_project: Option<IsolatedProject>,
     ) -> Result<Self> {
+        // Add a small random delay to avoid races when tests start in parallel
+        let delay_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 500) as u64;
+        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         // Use the built binary directly instead of cargo run for speed and isolation
-        let binary = if std::path::Path::new("target/release/rust-analyzer-mcp").exists() {
-            "target/release/rust-analyzer-mcp"
-        } else if std::path::Path::new("target/debug/rust-analyzer-mcp").exists() {
-            "target/debug/rust-analyzer-mcp"
+        // CARGO_MANIFEST_DIR points to the crate being tested (rust-analyzer-mcp)
+        // The binary is in rust-analyzer-mcp/target/, not in the parent directory
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        let project_root = std::path::Path::new(&manifest_dir);
+
+        let release_binary = project_root.join("target/release/rust-analyzer-mcp");
+        let debug_binary = project_root.join("target/debug/rust-analyzer-mcp");
+
+        let binary = if release_binary.exists() {
+            release_binary
+        } else if debug_binary.exists() {
+            debug_binary
         } else {
             // Fall back to cargo run if binary not built
             return Self::start_with_cargo_internal(workspace, isolated_project).await;
         };
 
+        // Generate unique IDs for this test instance
+        let unique_id = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp_dir = format!("/tmp/rust-analyzer-mcp-test-{}", unique_id);
+
+        // Create the temp directories
+        std::fs::create_dir_all(&temp_dir).ok();
+        std::fs::create_dir_all(format!("{}/cache", temp_dir)).ok();
+        std::fs::create_dir_all(format!("{}/target", temp_dir)).ok();
+
         // Set environment variables to improve isolation
-        let mut process = Command::new(binary)
+        let mut process = Command::new(&binary)
             .arg(workspace.to_str().unwrap())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             // Set a unique TMPDIR per test to avoid conflicts
-            .env(
-                "TMPDIR",
-                format!(
-                    "/tmp/rust-analyzer-mcp-test-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                ),
-            )
+            .env("TMPDIR", &temp_dir)
+            // Set rust-analyzer cache to a unique directory
+            .env("XDG_CACHE_HOME", format!("{}/cache", temp_dir))
             // Disable any global rust-analyzer config that might interfere
             .env("RUST_ANALYZER_CONFIG", "")
+            // Disable cargo target directory sharing
+            .env("CARGO_TARGET_DIR", format!("{}/target", temp_dir))
+            // Limit rust-analyzer threads to avoid parallel execution issues
+            .env("RUST_ANALYZER_NUM_THREADS", "2")
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
         let stdout = BufReader::new(process.stdout.take().unwrap());
+        let stderr = process.stderr.take().unwrap();
+
+        // Spawn a task to consume stderr and log any errors
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut stderr_reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while let Ok(n) = stderr_reader.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                if !line.trim().is_empty() {
+                    eprintln!("[rust-analyzer-mcp stderr] {}", line.trim());
+                }
+                line.clear();
+            }
+        });
 
         Ok(Self {
             process: Arc::new(Mutex::new(Some(process))),
@@ -113,33 +157,62 @@ impl MCPTestClient {
         })
     }
 
-    /// Start using cargo run (fallback)
+    /// Start using cargo run (fallback).
     async fn start_with_cargo_internal(
         workspace: &Path,
         isolated_project: Option<IsolatedProject>,
     ) -> Result<Self> {
+        // Generate unique IDs for this test instance
+        let unique_id = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp_dir = format!("/tmp/rust-analyzer-mcp-test-{}", unique_id);
+
+        // Create the temp directories
+        std::fs::create_dir_all(&temp_dir).ok();
+        std::fs::create_dir_all(format!("{}/cache", temp_dir)).ok();
+        std::fs::create_dir_all(format!("{}/target", temp_dir)).ok();
+
         let mut process = Command::new("cargo")
             .args(&["run", "--", workspace.to_str().unwrap()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             // Set environment variables to improve isolation
-            .env(
-                "TMPDIR",
-                format!(
-                    "/tmp/rust-analyzer-mcp-test-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                ),
-            )
+            .env("TMPDIR", &temp_dir)
+            // Set rust-analyzer cache to a unique directory
+            .env("XDG_CACHE_HOME", format!("{}/cache", temp_dir))
             .env("RUST_ANALYZER_CONFIG", "")
+            // Disable cargo target directory sharing
+            .env("CARGO_TARGET_DIR", format!("{}/target", temp_dir))
+            // Limit rust-analyzer threads to avoid parallel execution issues
+            .env("RUST_ANALYZER_NUM_THREADS", "2")
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
         let stdout = BufReader::new(process.stdout.take().unwrap());
+        let stderr = process.stderr.take().unwrap();
+
+        // Spawn a task to consume stderr and log any errors
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut stderr_reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while let Ok(n) = stderr_reader.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                if !line.trim().is_empty() {
+                    eprintln!("[rust-analyzer-mcp stderr] {}", line.trim());
+                }
+                line.clear();
+            }
+        });
 
         Ok(Self {
             process: Arc::new(Mutex::new(Some(process))),
@@ -492,16 +565,21 @@ impl Drop for MCPTestClient {
             return;
         }
 
-        // We must be in a Tokio context for this Drop to be called
-        // If we're not, the test framework has a bug
+        // Try to kill the process synchronously if possible
         if let Ok(handle) = Handle::try_current() {
-            // Schedule async cleanup
             let process = Arc::clone(&self.process);
+            // Spawn a task but use spawn_blocking for the kill to ensure it happens
             handle.spawn(async move {
                 if let Some(mut process) = process.lock().await.take() {
+                    // First try to kill
                     let _ = process.kill().await;
+                    // Then wait for it to actually exit
+                    let _ = process.wait().await;
                 }
             });
+
+            // Give the cleanup task a moment to run
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 }

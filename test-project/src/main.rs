@@ -5,6 +5,10 @@ fn main() {
     let calc = Calculator::new();
     let result = calc.add(2, 3);
     println!("Result: {}", result);
+    
+    let product = calc.multiply(2, 3);
+    println!("Product: {}", product);
+    println!("Calculator value: {}", calc.value());
 }
 
 fn greet(name: &str) -> String {
@@ -26,6 +30,10 @@ impl Calculator {
 
     fn multiply(&self, a: i32, b: i32) -> i32 {
         a * b
+    }
+    
+    fn value(&self) -> i32 {
+        self.value
     }
 }
 

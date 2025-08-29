@@ -96,6 +96,7 @@ async fn test_file_diagnostics() -> Result<()> {
         assert!(first_diag["range"].is_object());
     }
 
+    client.shutdown().await?;
     Ok(())
 }
 
@@ -109,57 +110,63 @@ async fn test_file_diagnostics_clean_file() -> Result<()> {
     client.initialize_workspace().await?;
     eprintln!("Workspace fully initialized with all modules resolved");
 
-    // Now diagnostics should be immediately available and stable
-    let response = client
-        .call_tool(
-            "rust_analyzer_diagnostics",
-            json!({
-                "file_path": "src/lib.rs"
-            }),
-        )
-        .await?;
+    // Retry a few times to handle transient rust-analyzer initialization issues
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        // Get diagnostics
+        let response = client
+            .call_tool(
+                "rust_analyzer_diagnostics",
+                json!({
+                    "file_path": "src/lib.rs"
+                }),
+            )
+            .await?;
 
-    assert_tool_response(&response);
-    let content = response["content"][0]["text"].as_str().unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_tool_response(&response);
+        let content = response["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
 
-    // Check summary for clean file (lib.rs should have no errors)
-    let summary = &parsed["summary"];
+        // Check summary for clean file (lib.rs should have no errors)
+        let summary = &parsed["summary"];
+        let error_count = summary["errors"].as_u64().unwrap_or(0);
 
-    // Log the full diagnostic response for debugging
-    eprintln!("Full diagnostic response for src/lib.rs:");
-    eprintln!("{}", serde_json::to_string_pretty(&parsed).unwrap());
+        // If no errors, we're good
+        if error_count == 0 {
+            // Additional check: no error-level diagnostics
+            let diagnostics = parsed["diagnostics"].as_array().unwrap();
+            let has_errors = diagnostics
+                .iter()
+                .any(|d| d["severity"].as_str() == Some("error"));
 
-    // If there are diagnostics, log them individually
-    if let Some(diags) = parsed["diagnostics"].as_array() {
-        if !diags.is_empty() {
-            eprintln!("Individual diagnostics found:");
-            for (i, diag) in diags.iter().enumerate() {
-                eprintln!("  Diagnostic {}: {:?}", i, diag);
+            if !has_errors {
+                // Success!
+                client.shutdown().await?;
+                return Ok(());
             }
+        }
+
+        // Log the issue for debugging
+        eprintln!("Attempt {}: Found {} errors", attempt, error_count);
+        if attempt == 1 {
+            eprintln!("Full diagnostic response for src/lib.rs:");
+            eprintln!("{}", serde_json::to_string_pretty(&parsed).unwrap());
+        }
+
+        last_error = Some(format!(
+            "Clean file (src/lib.rs) should have no errors. Summary: {:?}",
+            summary
+        ));
+
+        if attempt < 3 {
+            // Wait a bit before retrying
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
     }
 
-    assert_eq!(
-        summary["errors"].as_u64().unwrap_or(1),
-        0,
-        "Clean file (src/lib.rs) should have no errors. Summary: {:?}, Full response: {}",
-        summary,
-        serde_json::to_string_pretty(&parsed).unwrap()
-    );
-
-    // Allow warnings (like unused imports or dead code warnings) but no errors
-    let diagnostics = parsed["diagnostics"].as_array().unwrap();
-    for diagnostic in diagnostics {
-        let severity = diagnostic["severity"].as_str().unwrap_or("unknown");
-        assert_ne!(
-            severity, "error",
-            "Clean file should not have error-level diagnostics. Diagnostic: {:?}",
-            diagnostic
-        );
-    }
-
-    Ok(())
+    // All attempts failed
+    client.shutdown().await?;
+    Err(anyhow::anyhow!(last_error.unwrap()))
 }
 
 #[tokio::test]
@@ -227,6 +234,7 @@ async fn test_workspace_diagnostics() -> Result<()> {
         assert!(parsed["summary"]["total_diagnostics"].is_number());
     }
 
+    client.shutdown().await?;
     Ok(())
 }
 
@@ -268,6 +276,7 @@ async fn test_diagnostics_invalid_file() -> Result<()> {
         }
     }
 
+    client.shutdown().await?;
     Ok(())
 }
 

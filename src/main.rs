@@ -151,11 +151,33 @@ impl RustAnalyzerClient {
 
         info!("Using rust-analyzer at: {}", rust_analyzer_path.display());
 
-        let mut child = Command::new(rust_analyzer_path)
-            .current_dir(&self.workspace_root)
+        let mut cmd = Command::new(rust_analyzer_path);
+        cmd.current_dir(&self.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Limit rust-analyzer threads in tests to avoid parallel execution issues
+        if let Ok(num_threads) = std::env::var("RUST_ANALYZER_NUM_THREADS") {
+            info!("Limiting rust-analyzer to {} threads", num_threads);
+            cmd.arg("--num-threads").arg(&num_threads);
+        }
+
+        // Pass through isolation environment variables if they're set
+        if let Ok(cache_home) = std::env::var("XDG_CACHE_HOME") {
+            cmd.env("XDG_CACHE_HOME", cache_home);
+        }
+        if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+            cmd.env("CARGO_TARGET_DIR", target_dir);
+        }
+        if let Ok(tmpdir) = std::env::var("TMPDIR") {
+            cmd.env("TMPDIR", tmpdir);
+        }
+        if let Ok(num_threads) = std::env::var("RUST_ANALYZER_NUM_THREADS") {
+            cmd.env("RUST_ANALYZER_NUM_THREADS", num_threads);
+        }
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| anyhow!("Failed to start rust-analyzer: {}", e))?;
 
