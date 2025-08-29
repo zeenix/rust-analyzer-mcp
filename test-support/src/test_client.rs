@@ -37,6 +37,7 @@ impl MCPTestClient {
         let isolated_project = IsolatedProject::new()?;
         let workspace = isolated_project.path().to_path_buf();
         eprintln!("[start_isolated] Using workspace: {:?}", workspace);
+        eprintln!("[start_isolated] Process ID: {}", std::process::id());
 
         let client = Self::start_internal(&workspace, Some(isolated_project)).await?;
         Ok(client)
@@ -77,11 +78,26 @@ impl MCPTestClient {
             return Self::start_with_cargo_internal(workspace, isolated_project).await;
         };
 
+        // Set environment variables to improve isolation
         let mut process = Command::new(binary)
             .arg(workspace.to_str().unwrap())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            // Set a unique TMPDIR per test to avoid conflicts
+            .env(
+                "TMPDIR",
+                format!(
+                    "/tmp/rust-analyzer-mcp-test-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ),
+            )
+            // Disable any global rust-analyzer config that might interfere
+            .env("RUST_ANALYZER_CONFIG", "")
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
@@ -107,6 +123,19 @@ impl MCPTestClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            // Set environment variables to improve isolation
+            .env(
+                "TMPDIR",
+                format!(
+                    "/tmp/rust-analyzer-mcp-test-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ),
+            )
+            .env("RUST_ANALYZER_CONFIG", "")
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
