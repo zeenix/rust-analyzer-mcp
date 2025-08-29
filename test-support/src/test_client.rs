@@ -244,6 +244,19 @@ impl MCPTestClient {
         }
     }
 
+    /// Enhanced initialization that ensures the workspace is fully ready.
+    /// This includes verifying that all module imports are resolved and diagnostics are stable.
+    pub async fn initialize_workspace(&self) -> Result<()> {
+        let readiness = crate::WorkspaceReadiness::new(self);
+        readiness.ensure_ready().await
+    }
+
+    /// Enhanced initialization with custom critical files to verify.
+    pub async fn initialize_workspace_with_files(&self, files: Vec<String>) -> Result<()> {
+        let readiness = crate::WorkspaceReadiness::with_files(self, files);
+        readiness.ensure_ready().await
+    }
+
     async fn check_symbols_ready(&self) -> bool {
         // Use lib.rs as it exists in all test projects
         let Ok(response) = self
