@@ -21,7 +21,10 @@ fn assert_tool_response(response: &serde_json::Value) {
 #[tokio::test]
 async fn test_file_diagnostics() -> Result<()> {
     let client = MCPTestClient::start_isolated_diagnostics().await?;
-    client.initialize_and_wait().await?;
+    // Use enhanced initialization for diagnostics project
+    client
+        .initialize_workspace_with_files(vec!["src/errors.rs".to_string()])
+        .await?;
 
     // Wait for diagnostics to be published - rust-analyzer sends these asynchronously.
     // Use longer timeouts in CI environments.
@@ -101,64 +104,22 @@ async fn test_file_diagnostics_clean_file() -> Result<()> {
     // Use regular test project for clean file testing
     let client = MCPTestClient::start_isolated().await?;
     eprintln!("Started isolated client for clean file test");
-    client.initialize_and_wait().await?;
-    eprintln!("Client initialized and ready");
 
-    // In CI, wait extra time to ensure rust-analyzer has fully settled
-    if std::env::var("CI").is_ok() {
-        eprintln!("CI environment detected, waiting extra 3s for rust-analyzer to fully index the project");
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    // Use enhanced initialization that ensures modules are properly resolved
+    client.initialize_workspace().await?;
+    eprintln!("Workspace fully initialized with all modules resolved");
 
-        // Do a preliminary query to trigger indexing
-        eprintln!("Triggering rust-analyzer indexing with symbols query...");
-        let _ = client
-            .call_tool("rust_analyzer_symbols", json!({"file_path": "src/lib.rs"}))
-            .await;
+    // Now diagnostics should be immediately available and stable
+    let response = client
+        .call_tool(
+            "rust_analyzer_diagnostics",
+            json!({
+                "file_path": "src/lib.rs"
+            }),
+        )
+        .await?;
 
-        // Wait a bit more after triggering
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    }
-
-    // Use a longer timeout for CI environments.
-    let timeout_ms = if std::env::var("CI").is_ok() {
-        1000
-    } else {
-        500
-    };
-
-    // Wait for rust-analyzer to complete initial analysis.
-    // Even clean files may take time to be analyzed in CI environments.
-    let mut response = None;
-    for attempt in 0..15 {
-        let resp = client
-            .call_tool(
-                "rust_analyzer_diagnostics",
-                json!({
-                    "file_path": "src/lib.rs"
-                }),
-            )
-            .await?;
-
-        assert_tool_response(&resp);
-        let content = resp["content"][0]["text"].as_str().unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
-
-        // Check if analysis is complete (rust-analyzer returns consistent results).
-        if parsed["summary"].is_object() {
-            response = Some(resp);
-            break;
-        }
-
-        if attempt < 14 {
-            eprintln!(
-                "Attempt {}: Waiting for rust-analyzer to complete analysis of clean file...",
-                attempt + 1
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)).await;
-        }
-    }
-
-    let response = response.expect("rust-analyzer should complete analysis within timeout");
+    assert_tool_response(&response);
     let content = response["content"][0]["text"].as_str().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
 
@@ -204,7 +165,10 @@ async fn test_file_diagnostics_clean_file() -> Result<()> {
 #[tokio::test]
 async fn test_workspace_diagnostics() -> Result<()> {
     let client = MCPTestClient::start_isolated_diagnostics().await?;
-    client.initialize_and_wait().await?;
+    // Use enhanced initialization for diagnostics project
+    client
+        .initialize_workspace_with_files(vec!["src/errors.rs".to_string()])
+        .await?;
 
     // First, open a file with errors to ensure it's analyzed.
     // Wait for diagnostics to be available.
@@ -270,6 +234,7 @@ async fn test_workspace_diagnostics() -> Result<()> {
 async fn test_diagnostics_invalid_file() -> Result<()> {
     // Can use either project, using regular one
     let client = MCPTestClient::start_isolated().await?;
+    // Use basic initialization since we're testing invalid files
     client.initialize_and_wait().await?;
 
     // Test with non-existent file
@@ -309,7 +274,10 @@ async fn test_diagnostics_invalid_file() -> Result<()> {
 #[tokio::test]
 async fn test_diagnostics_severity_levels() -> Result<()> {
     let client = MCPTestClient::start_isolated_diagnostics().await?;
-    client.initialize_and_wait().await?;
+    // Use enhanced initialization for diagnostics project
+    client
+        .initialize_workspace_with_files(vec!["src/errors.rs".to_string()])
+        .await?;
 
     // Wait for diagnostics to be published - rust-analyzer sends these asynchronously.
     // Retry a few times with delays to give rust-analyzer time to analyze.

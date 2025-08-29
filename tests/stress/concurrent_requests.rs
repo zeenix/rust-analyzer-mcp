@@ -11,7 +11,7 @@ use test_support::{is_ci, timeouts, MCPTestClient};
 #[tokio::test]
 async fn test_concurrent_tool_calls() -> Result<()> {
     let client = Arc::new(MCPTestClient::start_isolated().await?);
-    client.initialize_and_wait().await?;
+    client.initialize_workspace().await?;
 
     // Create multiple concurrent requests
     let tasks = vec![
@@ -131,7 +131,7 @@ async fn test_sequential_throughput() -> Result<()> {
 #[tokio::test]
 async fn test_rapid_fire_requests() -> Result<()> {
     let client = Arc::new(MCPTestClient::start_isolated().await?);
-    client.initialize_and_wait().await?;
+    client.initialize_workspace().await?;
 
     // Send requests concurrently without delays
     let request_count = 10;
@@ -253,7 +253,7 @@ async fn test_error_recovery() -> Result<()> {
 #[tokio::test]
 async fn test_concurrent_mixed_requests() -> Result<()> {
     let client = Arc::new(MCPTestClient::start_isolated().await?);
-    client.initialize_and_wait().await?;
+    client.initialize_workspace().await?;
 
     // Test memory stability with a single iteration of concurrent requests
     // Run mixed request types concurrently

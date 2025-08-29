@@ -30,7 +30,7 @@ async fn test_server_initialization() -> Result<()> {
 #[tokio::test]
 async fn test_all_lsp_tools() -> Result<()> {
     let client = MCPTestClient::start_isolated().await?;
-    client.initialize_and_wait().await?;
+    client.initialize_workspace().await?;
 
     // Test 1: Get symbols for main.rs
     test_symbols(&client).await?;
