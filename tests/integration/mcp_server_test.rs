@@ -30,76 +30,83 @@ async fn test_server_initialization() -> Result<()> {
 #[tokio::test]
 async fn test_all_lsp_tools() -> Result<()> {
     let client = MCPTestClient::start_isolated().await?;
-    client.initialize_workspace().await?;
 
-    // Test 1: Get symbols for main.rs
-    test_symbols(&client).await?;
+    // Ensure shutdown is called even if test fails
+    let result = async {
+        client.initialize_workspace().await?;
 
-    // In CI, add extra delay to ensure rust-analyzer is fully ready for all operations
-    if is_ci() {
-        tokio::time::sleep(timeouts::ci_test_delay()).await;
+        // Test 1: Get symbols for main.rs
+        test_symbols(&client).await?;
+
+        // In CI, add extra delay to ensure rust-analyzer is fully ready for all operations
+        if is_ci() {
+            tokio::time::sleep(timeouts::ci_test_delay()).await;
+        }
+
+        // Test 2: Get definition - test "greet" function call on line 2 (0-indexed line 1)
+        let got_definition = test_definition(&client).await?;
+
+        // Test 3: Get references - test "greet" function definition on line 10 (0-indexed line 9)
+        let got_references = test_references(&client).await?;
+
+        // Test 4: Get hover information - test "Calculator" on line 5 (0-indexed line 4)
+        let got_hover = test_hover(&client).await?;
+
+        // Test 5: Get completions
+        test_completion(&client).await?;
+
+        // Test 6: Format document
+        let got_format = test_format(&client).await?;
+
+        // Test 7: Code actions
+        let got_code_actions = test_code_actions(&client).await?;
+
+        // Print summary
+        println!("LSP Tools Test Results:");
+        println!("  Symbols: ✓");
+        println!(
+            "  Definition: {}",
+            if got_definition {
+                "✓"
+            } else {
+                "⚠ (not ready)"
+            }
+        );
+        println!(
+            "  References: {}",
+            if got_references {
+                "✓"
+            } else {
+                "⚠ (not ready)"
+            }
+        );
+        println!("  Hover: {}", if got_hover { "✓" } else { "⚠ (not ready)" });
+        println!("  Completion: ✓");
+        println!(
+            "  Format: {}",
+            if got_format {
+                "✓"
+            } else {
+                "⚠ (invalid response)"
+            }
+        );
+        println!(
+            "  Code Actions: {}",
+            if got_code_actions {
+                "✓"
+            } else {
+                "⚠ (not ready)"
+            }
+        );
+
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
 
-    // Test 2: Get definition - test "greet" function call on line 2 (0-indexed line 1)
-    let got_definition = test_definition(&client).await?;
-
-    // Test 3: Get references - test "greet" function definition on line 10 (0-indexed line 9)
-    let got_references = test_references(&client).await?;
-
-    // Test 4: Get hover information - test "Calculator" on line 5 (0-indexed line 4)
-    let got_hover = test_hover(&client).await?;
-
-    // Test 5: Get completions
-    test_completion(&client).await?;
-
-    // Test 6: Format document
-    let got_format = test_format(&client).await?;
-
-    // Test 7: Code actions
-    let got_code_actions = test_code_actions(&client).await?;
-
-    // Print summary
-    println!("LSP Tools Test Results:");
-    println!("  Symbols: ✓");
-    println!(
-        "  Definition: {}",
-        if got_definition {
-            "✓"
-        } else {
-            "⚠ (not ready)"
-        }
-    );
-    println!(
-        "  References: {}",
-        if got_references {
-            "✓"
-        } else {
-            "⚠ (not ready)"
-        }
-    );
-    println!("  Hover: {}", if got_hover { "✓" } else { "⚠ (not ready)" });
-    println!("  Completion: ✓");
-    println!(
-        "  Format: {}",
-        if got_format {
-            "✓"
-        } else {
-            "⚠ (invalid response)"
-        }
-    );
-    println!(
-        "  Code Actions: {}",
-        if got_code_actions {
-            "✓"
-        } else {
-            "⚠ (not ready)"
-        }
-    );
-
-    // Cleanup before test ends to ensure it happens in runtime context
+    // Always cleanup, even on error
     client.shutdown().await?;
 
-    Ok(())
+    result
 }
 
 #[tokio::test]
