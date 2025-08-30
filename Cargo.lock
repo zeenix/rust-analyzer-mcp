@@ -1999,6 +1999,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
+ "once_cell",
  "serde_json",
  "tempfile",
  "tokio",
