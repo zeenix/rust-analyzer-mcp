@@ -40,6 +40,8 @@ struct SharedMCPServer {
     workspace_path: PathBuf,
     initialized: AtomicBool,
     client_count: Arc<AtomicU64>,
+    last_activity: Arc<Mutex<tokio::time::Instant>>,
+    shutdown_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl SharedMCPServer {
@@ -103,6 +105,8 @@ impl SharedMCPServer {
             workspace_path,
             initialized: AtomicBool::new(false),
             client_count: Arc::new(AtomicU64::new(0)),
+            last_activity: Arc::new(Mutex::new(tokio::time::Instant::now())),
+            shutdown_handle: Arc::new(Mutex::new(None)),
         });
 
         // Initialize the server once
@@ -114,8 +118,8 @@ impl SharedMCPServer {
             if test_file.exists() {
                 eprintln!("[SharedMCPServer] Polling for rust-analyzer readiness...");
                 let start = tokio::time::Instant::now();
-                let timeout = Duration::from_secs(10); // Reduced from 30s
-                let poll_interval = Duration::from_millis(200); // Reduced from 500ms
+                let timeout = Duration::from_secs(10);
+                let poll_interval = Duration::from_millis(200);
 
                 loop {
                     if start.elapsed() > timeout {
@@ -157,6 +161,9 @@ impl SharedMCPServer {
             }
 
             server.initialized.store(true, Ordering::SeqCst);
+
+            // Start the inactivity timer
+            server.start_inactivity_timer(project_type).await;
         }
 
         // Lock file will be automatically released when _lock_file is dropped
@@ -226,6 +233,9 @@ impl SharedMCPServer {
     }
 
     async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        // Update last activity
+        *self.last_activity.lock().await = tokio::time::Instant::now();
+
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
 
         let mut request = json!({
@@ -282,16 +292,77 @@ impl SharedMCPServer {
         eprintln!("[SharedMCPServer] Client removed, remaining: {}", count);
         count
     }
+
+    async fn start_inactivity_timer(&self, project_type: &str) {
+        // Cancel any existing timer
+        if let Some(handle) = self.shutdown_handle.lock().await.take() {
+            handle.abort();
+        }
+
+        let last_activity = Arc::clone(&self.last_activity);
+        let client_count = Arc::clone(&self.client_count);
+        let process = Arc::clone(&self.process);
+        let project_type = project_type.to_string();
+        let servers = SHARED_SERVERS.clone();
+
+        // Start new timer task
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                let last = *last_activity.lock().await;
+                let inactive_duration = tokio::time::Instant::now().duration_since(last);
+                let clients = client_count.load(Ordering::SeqCst);
+
+                eprintln!(
+                    "[SharedMCPServer] {} - clients: {}, inactive: {:.1}s",
+                    project_type,
+                    clients,
+                    inactive_duration.as_secs_f32()
+                );
+
+                // Shutdown if no clients and inactive for 15 seconds
+                if clients == 0 && inactive_duration > Duration::from_secs(15) {
+                    eprintln!(
+                        "[SharedMCPServer] {} - Shutting down due to inactivity",
+                        project_type
+                    );
+
+                    // Remove from global pool
+                    servers.write().await.remove(&project_type);
+
+                    // Kill the process
+                    if let Some(mut proc) = process.lock().await.take() {
+                        let _ = proc.kill().await;
+                        let _ = proc.wait().await;
+                    }
+
+                    // Clean up lock file
+                    let lock_path = LOCK_DIR.join(format!("{}.lock", project_type));
+                    let _ = fs::remove_file(lock_path);
+
+                    break;
+                }
+            }
+        });
+
+        *self.shutdown_handle.lock().await = Some(handle);
+    }
 }
 
 impl Drop for SharedMCPServer {
     fn drop(&mut self) {
         eprintln!("[SharedMCPServer] Dropping server instance");
+        // Cancel the timer if it exists
+        if let Ok(mut handle_guard) = self.shutdown_handle.try_lock() {
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
         // Kill the process explicitly
         if let Ok(mut process_guard) = self.process.try_lock() {
             if let Some(mut process) = process_guard.take() {
                 let _ = process.start_kill();
-                // Can't await in Drop, but start_kill sends SIGKILL
             }
         }
     }
@@ -392,32 +463,6 @@ impl Drop for SharedMCPClient {
             "[SharedMCPClient] Dropped client for {}, {} remaining",
             self.project_type, remaining
         );
-
-        if remaining == 0 {
-            // Remove from global pool so next test gets fresh instance
-            let project_type = self.project_type.clone();
-            let servers = SHARED_SERVERS.clone();
-
-            // Use blocking spawn to avoid runtime issues
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Handle::try_current();
-                if let Ok(handle) = rt {
-                    handle.block_on(async {
-                        let mut servers = servers.write().await;
-                        if let Some(server) = servers.get(&project_type) {
-                            if server.client_count.load(Ordering::SeqCst) == 0 {
-                                eprintln!("[SharedMCPClient] Removing server for {}", project_type);
-                                servers.remove(&project_type);
-                                // Server's Drop will kill the process
-                            }
-                        }
-                    });
-                }
-
-                // Clean up lock file
-                let lock_path = LOCK_DIR.join(format!("{}.lock", project_type));
-                let _ = fs::remove_file(lock_path);
-            });
-        }
+        // No cleanup needed - server will auto-shutdown after 15s of inactivity
     }
 }
