@@ -3,6 +3,9 @@ use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    fs::{self, File},
+    io::Write,
+    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -21,6 +24,13 @@ use tokio::{
 static SHARED_SERVERS: Lazy<Arc<RwLock<HashMap<String, Arc<SharedMCPServer>>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
+// Lock directory for atomic server creation
+static LOCK_DIR: Lazy<PathBuf> = Lazy::new(|| {
+    let dir = std::env::temp_dir().join("rust-analyzer-mcp-locks");
+    let _ = fs::create_dir_all(&dir);
+    dir
+});
+
 /// A shared MCP server instance that multiple tests can use.
 struct SharedMCPServer {
     process: Arc<Mutex<Option<Child>>>,
@@ -34,6 +44,10 @@ struct SharedMCPServer {
 
 impl SharedMCPServer {
     async fn new(workspace_path: PathBuf, project_type: &str) -> Result<Arc<Self>> {
+        // Use a lock file to ensure atomic creation
+        let lock_path = LOCK_DIR.join(format!("{}.lock", project_type));
+        let _lock_file = Self::acquire_lock(&lock_path)?;
+
         eprintln!(
             "[SharedMCPServer] Creating new server for {} at {:?}",
             project_type, workspace_path
@@ -94,10 +108,99 @@ impl SharedMCPServer {
         // Initialize the server once
         if !server.initialized.load(Ordering::SeqCst) {
             server.initialize().await?;
+
+            // Poll until rust-analyzer is ready by checking symbols
+            let test_file = server.workspace_path.join("src/lib.rs");
+            if test_file.exists() {
+                eprintln!("[SharedMCPServer] Polling for rust-analyzer readiness...");
+                let start = tokio::time::Instant::now();
+                let timeout = Duration::from_secs(10); // Reduced from 30s
+                let poll_interval = Duration::from_millis(200); // Reduced from 500ms
+
+                loop {
+                    if start.elapsed() > timeout {
+                        return Err(anyhow::anyhow!(
+                            "Timeout waiting for rust-analyzer to be ready"
+                        ));
+                    }
+
+                    let response = server
+                        .send_request(
+                            "tools/call",
+                            Some(json!({
+                                "name": "rust_analyzer_symbols",
+                                "arguments": {
+                                    "file_path": test_file.to_str().unwrap()
+                                }
+                            })),
+                        )
+                        .await?;
+
+                    // Check if we got a non-null response
+                    if let Some(content) = response.get("content") {
+                        if let Some(content_array) = content.as_array() {
+                            if !content_array.is_empty() {
+                                if let Some(first) = content_array.first() {
+                                    if let Some(text) = first.get("text") {
+                                        if text.as_str() != Some("null") {
+                                            eprintln!("[SharedMCPServer] rust-analyzer is ready!");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+
             server.initialized.store(true, Ordering::SeqCst);
         }
 
+        // Lock file will be automatically released when _lock_file is dropped
         Ok(server)
+    }
+
+    fn acquire_lock(lock_path: &Path) -> Result<File> {
+        use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+
+        // Try to create lock file with O_EXCL (fails if exists)
+        let mut retries = 50; // 5 seconds total
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(lock_path)
+            {
+                Ok(mut file) => {
+                    // Write PID to lock file
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(file);
+                }
+                Err(_) if retries > 0 => {
+                    // Check if lock file is stale (process doesn't exist)
+                    if let Ok(contents) = fs::read_to_string(lock_path) {
+                        if let Ok(pid) = contents.trim().parse::<u32>() {
+                            // Check if process exists using kill(0)
+                            unsafe {
+                                if libc::kill(pid as i32, 0) != 0 {
+                                    // Process doesn't exist, remove stale lock
+                                    let _ = fs::remove_file(lock_path);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    retries -= 1;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => return Err(anyhow::anyhow!("Failed to acquire lock: {}", e)),
+            }
+        }
     }
 
     async fn initialize(&self) -> Result<()> {
@@ -148,11 +251,19 @@ impl SharedMCPServer {
         let response_line = {
             let mut line = String::new();
             let mut stdout = self.stdout.lock().await;
-            stdout.read_line(&mut line).await?;
+            let bytes_read = stdout.read_line(&mut line).await?;
+            if bytes_read == 0 {
+                return Err(anyhow::anyhow!("Server process died unexpectedly"));
+            }
             line
         };
 
-        let response: Value = serde_json::from_str(&response_line)?;
+        if response_line.trim().is_empty() {
+            return Err(anyhow::anyhow!("Empty response from server"));
+        }
+
+        let response: Value = serde_json::from_str(&response_line)
+            .map_err(|e| anyhow::anyhow!("Failed to parse response '{}': {}", response_line, e))?;
 
         if let Some(error) = response.get("error") {
             return Err(anyhow::anyhow!("MCP error: {}", error));
@@ -176,7 +287,13 @@ impl SharedMCPServer {
 impl Drop for SharedMCPServer {
     fn drop(&mut self) {
         eprintln!("[SharedMCPServer] Dropping server instance");
-        // Process cleanup will be handled by tokio Child's Drop
+        // Kill the process explicitly
+        if let Ok(mut process_guard) = self.process.try_lock() {
+            if let Some(mut process) = process_guard.take() {
+                let _ = process.start_kill();
+                // Can't await in Drop, but start_kill sends SIGKILL
+            }
+        }
     }
 }
 
@@ -203,34 +320,39 @@ impl SharedMCPClient {
             _ => return Err(anyhow::anyhow!("Unknown project type: {}", project_type)),
         };
 
-        // Check if server already exists
-        let server = {
+        // Use double-checked locking pattern
+        {
             let servers = SHARED_SERVERS.read().await;
-            servers.get(project_type).cloned()
-        };
-
-        let server = match server {
-            Some(s) => {
+            if let Some(server) = servers.get(project_type) {
                 eprintln!(
                     "[SharedMCPClient] Reusing existing server for {}",
                     project_type
                 );
-                s
+                server.add_client();
+                return Ok(Self {
+                    server: server.clone(),
+                    project_type: project_type.to_string(),
+                });
             }
-            None => {
-                eprintln!("[SharedMCPClient] Creating new server for {}", project_type);
-                let mut servers = SHARED_SERVERS.write().await;
+        }
 
-                // Double-check in case another thread created it
-                if let Some(s) = servers.get(project_type) {
-                    s.clone()
-                } else {
-                    let new_server = SharedMCPServer::new(workspace_path, project_type).await?;
-                    servers.insert(project_type.to_string(), new_server.clone());
-                    new_server
-                }
-            }
-        };
+        // Need to create new server - take write lock
+        eprintln!("[SharedMCPClient] Creating new server for {}", project_type);
+        let mut servers = SHARED_SERVERS.write().await;
+
+        // Double-check after acquiring write lock
+        if let Some(server) = servers.get(project_type) {
+            server.add_client();
+            return Ok(Self {
+                server: server.clone(),
+                project_type: project_type.to_string(),
+            });
+        }
+
+        // Create new server (this will use filesystem lock for atomicity)
+        let new_server = SharedMCPServer::new(workspace_path, project_type).await?;
+        servers.insert(project_type.to_string(), new_server.clone());
+        let server = new_server;
 
         server.add_client();
 
@@ -256,45 +378,45 @@ impl SharedMCPClient {
         )
         .await
     }
+
+    /// Get the workspace path for this client.
+    pub fn workspace_path(&self) -> &Path {
+        &self.server.workspace_path
+    }
 }
 
 impl Drop for SharedMCPClient {
     fn drop(&mut self) {
         let remaining = self.server.remove_client();
+        eprintln!(
+            "[SharedMCPClient] Dropped client for {}, {} remaining",
+            self.project_type, remaining
+        );
 
-        // If this was the last client, remove the server from the pool
         if remaining == 0 {
-            eprintln!(
-                "[SharedMCPClient] Last client for {}, scheduling server removal",
-                self.project_type
-            );
-
+            // Remove from global pool so next test gets fresh instance
             let project_type = self.project_type.clone();
             let servers = SHARED_SERVERS.clone();
 
-            // Schedule cleanup in the background
-            tokio::spawn(async move {
-                // Give a small grace period in case another test starts immediately
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                let mut servers = servers.write().await;
-
-                // Check if server still has no clients and remove if so
-                let server_to_kill = servers
-                    .get(&project_type)
-                    .filter(|s| s.client_count.load(Ordering::SeqCst) == 0)
-                    .cloned();
-
-                if let Some(server) = server_to_kill {
-                    eprintln!("[SharedMCPClient] Removing server for {}", project_type);
-                    servers.remove(&project_type);
-
-                    // Kill the process after removing from map
-                    if let Some(mut process) = server.process.lock().await.take() {
-                        let _ = process.kill().await;
-                        let _ = process.wait().await;
-                    }
+            // Use blocking spawn to avoid runtime issues
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Handle::try_current();
+                if let Ok(handle) = rt {
+                    handle.block_on(async {
+                        let mut servers = servers.write().await;
+                        if let Some(server) = servers.get(&project_type) {
+                            if server.client_count.load(Ordering::SeqCst) == 0 {
+                                eprintln!("[SharedMCPClient] Removing server for {}", project_type);
+                                servers.remove(&project_type);
+                                // Server's Drop will kill the process
+                            }
+                        }
+                    });
                 }
+
+                // Clean up lock file
+                let lock_path = LOCK_DIR.join(format!("{}.lock", project_type));
+                let _ = fs::remove_file(lock_path);
             });
         }
     }

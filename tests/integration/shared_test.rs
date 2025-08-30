@@ -9,20 +9,22 @@ async fn test_shared_singleton() -> Result<()> {
     let client2 = SharedMCPClient::get_or_create("test-project").await?;
 
     // Both should work
+    let lib_path = client1.workspace_path().join("src/lib.rs");
     let response1 = client1
         .call_tool(
             "rust_analyzer_symbols",
             json!({
-                "file_path": "src/lib.rs"
+                "file_path": lib_path.to_str().unwrap()
             }),
         )
         .await?;
 
+    let main_path = client2.workspace_path().join("src/main.rs");
     let response2 = client2
         .call_tool(
             "rust_analyzer_symbols",
             json!({
-                "file_path": "src/main.rs"
+                "file_path": main_path.to_str().unwrap()
             }),
         )
         .await?;
@@ -44,12 +46,13 @@ async fn test_shared_concurrent() -> Result<()> {
     let tasks: Vec<_> = (0..5)
         .map(|i| async move {
             let client = SharedMCPClient::get_or_create("test-project").await?;
+            let lib_path = client.workspace_path().join("src/lib.rs");
 
             let response = client
                 .call_tool(
                     "rust_analyzer_symbols",
                     json!({
-                        "file_path": "src/lib.rs"
+                        "file_path": lib_path.to_str().unwrap()
                     }),
                 )
                 .await?;
