@@ -157,12 +157,6 @@ impl RustAnalyzerClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Limit rust-analyzer threads in tests to avoid parallel execution issues
-        if let Ok(num_threads) = std::env::var("RUST_ANALYZER_NUM_THREADS") {
-            info!("Limiting rust-analyzer to {} threads", num_threads);
-            cmd.arg("--num-threads").arg(&num_threads);
-        }
-
         // Pass through isolation environment variables if they're set
         if let Ok(cache_home) = std::env::var("XDG_CACHE_HOME") {
             cmd.env("XDG_CACHE_HOME", cache_home);
@@ -172,9 +166,6 @@ impl RustAnalyzerClient {
         }
         if let Ok(tmpdir) = std::env::var("TMPDIR") {
             cmd.env("TMPDIR", tmpdir);
-        }
-        if let Ok(num_threads) = std::env::var("RUST_ANALYZER_NUM_THREADS") {
-            cmd.env("RUST_ANALYZER_NUM_THREADS", num_threads);
         }
 
         let mut child = cmd
@@ -734,7 +725,9 @@ impl RustAnalyzerClient {
         }
 
         if let Some(mut process) = self.process.take() {
+            // Kill the process and wait for it to actually exit
             let _ = process.kill().await;
+            let _ = process.wait().await;
         }
 
         // Clear open documents and diagnostics

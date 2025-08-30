@@ -123,8 +123,6 @@ impl MCPTestClient {
             .env("RUST_ANALYZER_CONFIG", "")
             // Disable cargo target directory sharing
             .env("CARGO_TARGET_DIR", format!("{}/target", temp_dir))
-            // Limit rust-analyzer threads to avoid parallel execution issues
-            .env("RUST_ANALYZER_NUM_THREADS", "2")
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
@@ -190,8 +188,6 @@ impl MCPTestClient {
             .env("RUST_ANALYZER_CONFIG", "")
             // Disable cargo target directory sharing
             .env("CARGO_TARGET_DIR", format!("{}/target", temp_dir))
-            // Limit rust-analyzer threads to avoid parallel execution issues
-            .env("RUST_ANALYZER_NUM_THREADS", "2")
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
@@ -224,7 +220,7 @@ impl MCPTestClient {
         })
     }
 
-    /// Explicitly shut down the client and its process
+    /// Explicitly shut down the client and its process.
     pub async fn shutdown(&self) -> Result<()> {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             // Already shutdown
@@ -235,6 +231,8 @@ impl MCPTestClient {
         if let Some(mut process) = process_lock.take() {
             // Try graceful shutdown first
             let _ = process.kill().await;
+            // Wait for process to actually exit
+            let _ = process.wait().await;
         }
         Ok(())
     }
@@ -568,12 +566,12 @@ impl Drop for MCPTestClient {
         // Try to kill the process synchronously if possible
         if let Ok(handle) = Handle::try_current() {
             let process = Arc::clone(&self.process);
-            // Spawn a task but use spawn_blocking for the kill to ensure it happens
+            // Spawn a task to ensure cleanup happens
             handle.spawn(async move {
                 if let Some(mut process) = process.lock().await.take() {
-                    // First try to kill
+                    // Kill the process
                     let _ = process.kill().await;
-                    // Then wait for it to actually exit
+                    // Wait for it to actually exit to avoid zombies
                     let _ = process.wait().await;
                 }
             });
