@@ -377,8 +377,9 @@ pub struct SharedMCPClient {
 impl SharedMCPClient {
     /// Get or create a shared client for the test project.
     pub async fn get_or_create(project_type: &str) -> Result<Self> {
+        // Map project types to actual workspace paths
         let workspace_path = match project_type {
-            "test-project" => {
+            "test-project" | "test-project-singleton" | "test-project-concurrent" => {
                 let manifest_dir =
                     std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
                 Path::new(&manifest_dir).join("test-project")

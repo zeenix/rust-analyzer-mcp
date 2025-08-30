@@ -4,9 +4,9 @@ use test_support::SharedMCPClient;
 
 #[tokio::test]
 async fn test_shared_singleton() -> Result<()> {
-    // Create two clients for the same project
-    let client1 = SharedMCPClient::get_or_create("test-project").await?;
-    let client2 = SharedMCPClient::get_or_create("test-project").await?;
+    // Create two clients for the same project - use unique ID for this test
+    let client1 = SharedMCPClient::get_or_create("test-project-singleton").await?;
+    let client2 = SharedMCPClient::get_or_create("test-project-singleton").await?;
 
     // Both should work
     let lib_path = client1.workspace_path().join("src/lib.rs");
@@ -42,10 +42,10 @@ async fn test_shared_singleton() -> Result<()> {
 async fn test_shared_concurrent() -> Result<()> {
     use futures::future::join_all;
 
-    // Create multiple clients concurrently
+    // Create multiple clients concurrently - use unique ID for this test
     let tasks: Vec<_> = (0..5)
         .map(|i| async move {
-            let client = SharedMCPClient::get_or_create("test-project").await?;
+            let client = SharedMCPClient::get_or_create("test-project-concurrent").await?;
             let lib_path = client.workspace_path().join("src/lib.rs");
 
             let response = client
