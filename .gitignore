@@ -1,5 +1,5 @@
 # Rust build artifacts
-/target/
+**/target/
 /test-project/target/
 
 # IDE files
