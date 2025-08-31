@@ -55,41 +55,51 @@ impl IpcClient {
         // Server not running, start it
         eprintln!("Starting new MCP server for {}", project_type);
 
-        // Find the server binary
+        // Always build the server - cargo will handle locking and skip if already built
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let project_root = Path::new(&manifest_dir);
 
-        let release_binary = project_root.join("target/release/test-support-server");
-        let debug_binary = project_root.join("target/debug/test-support-server");
+        eprintln!("Ensuring test-support-server is built...");
 
-        let binary = if release_binary.exists() {
-            release_binary
-        } else if debug_binary.exists() {
-            debug_binary
+        // Determine build mode based on current profile
+        let (build_args, binary_path) = if cfg!(debug_assertions) {
+            (
+                vec![
+                    "build",
+                    "-p",
+                    "test-support",
+                    "--bin",
+                    "test-support-server",
+                ],
+                project_root.join("target/debug/test-support-server"),
+            )
         } else {
-            // Build the server if it doesn't exist
-            eprintln!("Building test-support-server...");
-            let output = Command::new("cargo")
-                .current_dir(project_root)
-                .args(&["build", "--bin", "test-support-server"])
-                .output()?;
-
-            if !output.status.success() {
-                return Err(anyhow::anyhow!(
-                    "Failed to build test-support-server: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-
-            // Try again
-            if debug_binary.exists() {
-                debug_binary
-            } else {
-                return Err(anyhow::anyhow!(
-                    "test-support-server binary not found after build"
-                ));
-            }
+            (
+                vec![
+                    "build",
+                    "--release",
+                    "-p",
+                    "test-support",
+                    "--bin",
+                    "test-support-server",
+                ],
+                project_root.join("target/release/test-support-server"),
+            )
         };
+
+        let output = Command::new("cargo")
+            .current_dir(project_root)
+            .args(&build_args)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "Failed to build test-support-server: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let binary = binary_path;
 
         // Start the server in background
         Command::new(&binary)
