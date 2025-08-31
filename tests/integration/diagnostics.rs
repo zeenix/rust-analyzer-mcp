@@ -100,22 +100,22 @@ async fn test_file_diagnostics() -> Result<()> {
 
 #[tokio::test]
 async fn test_file_diagnostics_clean_file() -> Result<()> {
-    // Use a separate instance to avoid interference with other tests
-    let mut client = IpcClient::get_or_create("test-project-singleton").await?;
+    // Use test-project-diagnostics which has a clean file
+    let mut client = IpcClient::get_or_create("test-project-diagnostics").await?;
     let workspace_path = client.workspace_path();
-    let _lib_path = workspace_path.join("src/lib.rs");
-    eprintln!("Using shared client for clean file test");
+    let clean_path = workspace_path.join("src/clean.rs");
+    eprintln!("Using clean.rs file for clean file test");
     eprintln!("Workspace fully initialized with all modules resolved");
 
     // Retry a few times to handle transient rust-analyzer initialization issues
     let mut last_error = None;
     for attempt in 1..=3 {
-        // Get diagnostics
+        // Get diagnostics - use absolute path
         let response = client
             .call_tool(
                 "rust_analyzer_diagnostics",
                 json!({
-                    "file_path": "src/lib.rs"
+                    "file_path": clean_path.to_str().unwrap()
                 }),
             )
             .await?;
@@ -150,12 +150,12 @@ async fn test_file_diagnostics_clean_file() -> Result<()> {
         // Log the issue for debugging
         eprintln!("Attempt {}: Found {} errors", attempt, error_count);
         if attempt == 1 {
-            eprintln!("Full diagnostic response for src/lib.rs:");
+            eprintln!("Full diagnostic response for src/clean.rs:");
             eprintln!("{}", serde_json::to_string_pretty(&parsed).unwrap());
         }
 
         last_error = Some(format!(
-            "Clean file (src/lib.rs) should have no errors. Summary: {:?}",
+            "Clean file (src/clean.rs) should have no errors. Summary: {:?}",
             summary
         ));
 
