@@ -114,6 +114,12 @@ The `test-project/` directory contains a minimal Rust project used for integrati
 - Format tool requires document to be opened first
 - Completion tool may return null during indexing
 
+## Git Commit Conventions
+
+Use gitmoji for commit messages. Refer to the official gimoji list at:
+- Interactive picker: https://zeenix.github.io/gimoji/
+- Raw database: https://zeenix.github.io/gimoji/emojis.json
+
 ## Testing Patterns
 
 ### Integration Tests
