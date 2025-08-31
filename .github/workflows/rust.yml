@@ -58,4 +58,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build and Test
         run: |
-          cargo test --release --all-features
+          cargo test --locked --release --all-features
