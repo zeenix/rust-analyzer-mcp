@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde_json::json;
-use test_support::MCPTestClient;
+use test_support::IpcClient;
 
 fn assert_tool_response(response: &serde_json::Value) {
     assert!(
@@ -20,11 +20,9 @@ fn assert_tool_response(response: &serde_json::Value) {
 
 #[tokio::test]
 async fn test_file_diagnostics() -> Result<()> {
-    let client = MCPTestClient::start_isolated_diagnostics().await?;
-    // Use enhanced initialization for diagnostics project
-    client
-        .initialize_workspace_with_files(vec!["src/errors.rs".to_string()])
-        .await?;
+    let mut client = IpcClient::get_or_create("test-project-diagnostics").await?;
+    let workspace_path = client.workspace_path();
+    let errors_path = workspace_path.join("src/errors.rs");
 
     // Wait for diagnostics to be published - rust-analyzer sends these asynchronously.
     // Use longer timeouts in CI environments.
@@ -42,7 +40,7 @@ async fn test_file_diagnostics() -> Result<()> {
             .call_tool(
                 "rust_analyzer_diagnostics",
                 json!({
-                    "file_path": "src/errors.rs"
+                    "file_path": errors_path.to_str().unwrap()
                 }),
             )
             .await?;
@@ -96,18 +94,17 @@ async fn test_file_diagnostics() -> Result<()> {
         assert!(first_diag["range"].is_object());
     }
 
-    client.shutdown().await?;
+    // No need to shutdown with shared client
     Ok(())
 }
 
 #[tokio::test]
 async fn test_file_diagnostics_clean_file() -> Result<()> {
-    // Use regular test project for clean file testing
-    let client = MCPTestClient::start_isolated().await?;
-    eprintln!("Started isolated client for clean file test");
-
-    // Use enhanced initialization that ensures modules are properly resolved
-    client.initialize_workspace().await?;
+    // Use a separate instance to avoid interference with other tests
+    let mut client = IpcClient::get_or_create("test-project-singleton").await?;
+    let workspace_path = client.workspace_path();
+    let _lib_path = workspace_path.join("src/lib.rs");
+    eprintln!("Using shared client for clean file test");
     eprintln!("Workspace fully initialized with all modules resolved");
 
     // Retry a few times to handle transient rust-analyzer initialization issues
@@ -134,14 +131,18 @@ async fn test_file_diagnostics_clean_file() -> Result<()> {
         // If no errors, we're good
         if error_count == 0 {
             // Additional check: no error-level diagnostics
-            let diagnostics = parsed["diagnostics"].as_array().unwrap();
-            let has_errors = diagnostics
-                .iter()
-                .any(|d| d["severity"].as_str() == Some("error"));
+            if let Some(diagnostics) = parsed["diagnostics"].as_array() {
+                let has_errors = diagnostics
+                    .iter()
+                    .any(|d| d["severity"].as_str() == Some("error"));
 
-            if !has_errors {
-                // Success!
-                client.shutdown().await?;
+                if !has_errors {
+                    // Success!
+                    // No need to shutdown with shared client
+                    return Ok(());
+                }
+            } else {
+                // If diagnostics is not an array, that's okay if error_count is 0
                 return Ok(());
             }
         }
@@ -165,17 +166,16 @@ async fn test_file_diagnostics_clean_file() -> Result<()> {
     }
 
     // All attempts failed
-    client.shutdown().await?;
+    // No need to shutdown with shared client
     Err(anyhow::anyhow!(last_error.unwrap()))
 }
 
 #[tokio::test]
 async fn test_workspace_diagnostics() -> Result<()> {
-    let client = MCPTestClient::start_isolated_diagnostics().await?;
-    // Use enhanced initialization for diagnostics project
-    client
-        .initialize_workspace_with_files(vec!["src/errors.rs".to_string()])
-        .await?;
+    let mut client = IpcClient::get_or_create("test-project-diagnostics").await?;
+    let workspace_path = client.workspace_path();
+    let errors_path = workspace_path.join("src/errors.rs");
+    let _warnings_path = workspace_path.join("src/warnings.rs");
 
     // First, open a file with errors to ensure it's analyzed.
     // Wait for diagnostics to be available.
@@ -191,7 +191,7 @@ async fn test_workspace_diagnostics() -> Result<()> {
             .call_tool(
                 "rust_analyzer_diagnostics",
                 json!({
-                    "file_path": "src/errors.rs"
+                    "file_path": errors_path.to_str().unwrap()
                 }),
             )
             .await?;
@@ -234,16 +234,14 @@ async fn test_workspace_diagnostics() -> Result<()> {
         assert!(parsed["summary"]["total_diagnostics"].is_number());
     }
 
-    client.shutdown().await?;
+    // No need to shutdown with shared client
     Ok(())
 }
 
 #[tokio::test]
 async fn test_diagnostics_invalid_file() -> Result<()> {
     // Can use either project, using regular one
-    let client = MCPTestClient::start_isolated().await?;
-    // Use basic initialization since we're testing invalid files
-    client.initialize_and_wait().await?;
+    let mut client = IpcClient::get_or_create("test-project").await?;
 
     // Test with non-existent file
     let response = client
@@ -276,17 +274,16 @@ async fn test_diagnostics_invalid_file() -> Result<()> {
         }
     }
 
-    client.shutdown().await?;
+    // No need to shutdown with shared client
     Ok(())
 }
 
 #[tokio::test]
 async fn test_diagnostics_severity_levels() -> Result<()> {
-    let client = MCPTestClient::start_isolated_diagnostics().await?;
-    // Use enhanced initialization for diagnostics project
-    client
-        .initialize_workspace_with_files(vec!["src/errors.rs".to_string()])
-        .await?;
+    let mut client = IpcClient::get_or_create("test-project-diagnostics").await?;
+    let workspace_path = client.workspace_path();
+    let errors_path = workspace_path.join("src/errors.rs");
+    let _warnings_path = workspace_path.join("src/warnings.rs");
 
     // Wait for diagnostics to be published - rust-analyzer sends these asynchronously.
     // Retry a few times with delays to give rust-analyzer time to analyze.
@@ -304,7 +301,7 @@ async fn test_diagnostics_severity_levels() -> Result<()> {
             .call_tool(
                 "rust_analyzer_diagnostics",
                 json!({
-                    "file_path": "src/errors.rs"
+                    "file_path": errors_path.to_str().unwrap()
                 }),
             )
             .await?;

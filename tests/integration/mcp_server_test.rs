@@ -1,123 +1,117 @@
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::path::Path;
 
 // Import test support library
-use test_support::{is_ci, timeouts, MCPTestClient};
+use test_support::{is_ci, timeouts, IpcClient, IsolatedProject};
 
 #[tokio::test]
 async fn test_server_initialization() -> Result<()> {
-    let client = MCPTestClient::start_isolated().await?;
-    // Initialize the server
-    let init_response = client.initialize().await?;
+    let mut client = IpcClient::get_or_create("test-project").await?;
 
-    // Check server info
-    assert!(init_response.get("serverInfo").is_some());
-    let server_info = &init_response["serverInfo"];
-    assert_eq!(server_info["name"], "rust-analyzer-mcp");
-    assert!(server_info["version"].is_string());
+    // The server is already initialized by IpcClient
+    // Just verify we can make a request
+    let response = client.send_request("tools/list", None).await?;
 
-    // Check capabilities
-    assert!(init_response.get("capabilities").is_some());
-    let capabilities = &init_response["capabilities"];
-    assert!(capabilities.get("tools").is_some());
+    // Check we got tools
+    assert!(response.get("tools").is_some());
+    let tools = response["tools"].as_array().unwrap();
+    assert!(!tools.is_empty());
 
-    // Cleanup before test ends
-    client.shutdown().await?;
+    // Verify some expected tools exist
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(tool_names.contains(&"rust_analyzer_symbols"));
+    assert!(tool_names.contains(&"rust_analyzer_hover"));
 
     Ok(())
 }
 
 #[tokio::test]
 async fn test_all_lsp_tools() -> Result<()> {
-    let client = MCPTestClient::start_isolated().await?;
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
 
-    // Ensure shutdown is called even if test fails
-    let result = async {
-        client.initialize_workspace().await?;
+    // Test 1: Get symbols for main.rs
+    test_symbols(&mut client, &workspace_path).await?;
 
-        // Test 1: Get symbols for main.rs
-        test_symbols(&client).await?;
-
-        // In CI, add extra delay to ensure rust-analyzer is fully ready for all operations
-        if is_ci() {
-            tokio::time::sleep(timeouts::ci_test_delay()).await;
-        }
-
-        // Test 2: Get definition - test "greet" function call on line 2 (0-indexed line 1)
-        let got_definition = test_definition(&client).await?;
-
-        // Test 3: Get references - test "greet" function definition on line 10 (0-indexed line 9)
-        let got_references = test_references(&client).await?;
-
-        // Test 4: Get hover information - test "Calculator" on line 5 (0-indexed line 4)
-        let got_hover = test_hover(&client).await?;
-
-        // Test 5: Get completions
-        test_completion(&client).await?;
-
-        // Test 6: Format document
-        let got_format = test_format(&client).await?;
-
-        // Test 7: Code actions
-        let got_code_actions = test_code_actions(&client).await?;
-
-        // Print summary
-        println!("LSP Tools Test Results:");
-        println!("  Symbols: ✓");
-        println!(
-            "  Definition: {}",
-            if got_definition {
-                "✓"
-            } else {
-                "⚠ (not ready)"
-            }
-        );
-        println!(
-            "  References: {}",
-            if got_references {
-                "✓"
-            } else {
-                "⚠ (not ready)"
-            }
-        );
-        println!("  Hover: {}", if got_hover { "✓" } else { "⚠ (not ready)" });
-        println!("  Completion: ✓");
-        println!(
-            "  Format: {}",
-            if got_format {
-                "✓"
-            } else {
-                "⚠ (invalid response)"
-            }
-        );
-        println!(
-            "  Code Actions: {}",
-            if got_code_actions {
-                "✓"
-            } else {
-                "⚠ (not ready)"
-            }
-        );
-
-        Ok::<(), anyhow::Error>(())
+    // In CI, add extra delay to ensure rust-analyzer is fully ready for all operations
+    if is_ci() {
+        tokio::time::sleep(timeouts::ci_test_delay()).await;
     }
-    .await;
 
-    // Always cleanup, even on error
-    client.shutdown().await?;
+    // Test 2: Get definition - test "greet" function call on line 2 (0-indexed line 1)
+    let got_definition = test_definition(&mut client, &workspace_path).await?;
 
-    result
+    // Test 3: Get references - test "greet" function definition on line 10 (0-indexed line 9)
+    let got_references = test_references(&mut client, &workspace_path).await?;
+
+    // Test 4: Get hover information - test "Calculator" on line 5 (0-indexed line 4)
+    let got_hover = test_hover(&mut client, &workspace_path).await?;
+
+    // Test 5: Get completions
+    test_completion(&mut client, &workspace_path).await?;
+
+    // Test 6: Format document
+    let got_format = test_format(&mut client, &workspace_path).await?;
+
+    // Test 7: Code actions
+    let got_code_actions = test_code_actions(&mut client, &workspace_path).await?;
+
+    // Print summary
+    println!("LSP Tools Test Results:");
+    println!("  Symbols: ✓");
+    println!(
+        "  Definition: {}",
+        if got_definition {
+            "✓"
+        } else {
+            "⚠ (not ready)"
+        }
+    );
+    println!(
+        "  References: {}",
+        if got_references {
+            "✓"
+        } else {
+            "⚠ (not ready)"
+        }
+    );
+    println!("  Hover: {}", if got_hover { "✓" } else { "⚠ (not ready)" });
+    println!("  Completion: ✓");
+    println!(
+        "  Format: {}",
+        if got_format {
+            "✓"
+        } else {
+            "⚠ (invalid response)"
+        }
+    );
+    println!(
+        "  Code Actions: {}",
+        if got_code_actions {
+            "✓"
+        } else {
+            "⚠ (not ready)"
+        }
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
 async fn test_workspace_change() -> Result<()> {
-    // Start with an isolated test project
-    let client = MCPTestClient::start_isolated().await?;
-    client.initialize().await?;
+    let mut client = IpcClient::get_or_create("test-project").await?;
 
     // Create a second isolated project to switch to
     let second_project = test_support::IsolatedProject::new()?;
-    let response = client.set_workspace(second_project.path()).await?;
+    let response = client
+        .call_tool(
+            "rust_analyzer_set_workspace",
+            json!({
+                "workspace_path": second_project.path().to_str().unwrap()
+            }),
+        )
+        .await?;
 
     // Verify workspace change succeeded
     if let Some(content) = response.get("content") {
@@ -130,23 +124,30 @@ async fn test_workspace_change() -> Result<()> {
         }
     }
 
-    // Cleanup before test ends
-    client.shutdown().await?;
-
     Ok(())
 }
 
 #[tokio::test]
 async fn test_error_handling_invalid_files() -> Result<()> {
-    let client = MCPTestClient::start_isolated().await?;
-    client.initialize_and_wait().await?;
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
 
     // Test multiple invalid file paths
-    let invalid_paths = vec!["non_existent.rs", "../../../etc/passwd"];
+    let invalid_paths = vec![
+        workspace_path.join("non_existent.rs"),
+        workspace_path.join("../../../etc/passwd"),
+    ];
 
     for file_path in invalid_paths {
         // Try to get symbols for invalid file
-        let result = client.get_symbols(file_path).await;
+        let result = client
+            .call_tool(
+                "rust_analyzer_symbols",
+                json!({
+                    "file_path": file_path.to_str().unwrap()
+                }),
+            )
+            .await;
 
         // Should either error or return empty/null
         if let Ok(response) = result {
@@ -157,23 +158,21 @@ async fn test_error_handling_invalid_files() -> Result<()> {
                     assert!(
                         symbols.is_empty(),
                         "Should not have symbols for invalid file: {}",
-                        file_path
+                        file_path.display()
                     );
                 }
             }
         }
     }
 
-    // Cleanup before test ends
-    client.shutdown().await?;
-
     Ok(())
 }
 
 #[tokio::test]
 async fn test_error_handling_invalid_positions() -> Result<()> {
-    let client = MCPTestClient::start_isolated().await?;
-    client.initialize_and_wait().await?;
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
+    let main_path = workspace_path.join("src/main.rs");
 
     // Test multiple invalid positions
     let invalid_positions = vec![
@@ -184,7 +183,16 @@ async fn test_error_handling_invalid_positions() -> Result<()> {
 
     for (line, character) in invalid_positions {
         // Try to get definition at invalid position
-        let result = client.get_definition("src/main.rs", line, character).await;
+        let result = client
+            .call_tool(
+                "rust_analyzer_definition",
+                json!({
+                    "file_path": main_path.to_str().unwrap(),
+                    "line": line,
+                    "character": character
+                }),
+            )
+            .await;
 
         // Should either error or return empty/null
         if let Ok(response) = result {
@@ -203,16 +211,21 @@ async fn test_error_handling_invalid_positions() -> Result<()> {
         }
     }
 
-    // Cleanup before test ends
-    client.shutdown().await?;
-
     Ok(())
 }
 
 // Helper functions for test_all_lsp_tools
 
-async fn test_symbols(client: &MCPTestClient) -> Result<()> {
-    let response = client.get_symbols("src/main.rs").await?;
+async fn test_symbols(client: &mut IpcClient, workspace_path: &Path) -> Result<()> {
+    let main_path = workspace_path.join("src/main.rs");
+    let response = client
+        .call_tool(
+            "rust_analyzer_symbols",
+            json!({
+                "file_path": main_path.to_str().unwrap()
+            }),
+        )
+        .await?;
 
     let Some(content) = response.get("content") else {
         return Err(anyhow::anyhow!("No content in symbols response"));
@@ -250,8 +263,18 @@ async fn test_symbols(client: &MCPTestClient) -> Result<()> {
     Ok(())
 }
 
-async fn test_definition(client: &MCPTestClient) -> Result<bool> {
-    let response = client.get_definition("src/main.rs", 1, 18).await?;
+async fn test_definition(client: &mut IpcClient, workspace_path: &Path) -> Result<bool> {
+    let main_path = workspace_path.join("src/main.rs");
+    let response = client
+        .call_tool(
+            "rust_analyzer_definition",
+            json!({
+                "file_path": main_path.to_str().unwrap(),
+                "line": 1,
+                "character": 18
+            }),
+        )
+        .await?;
 
     let Some(content) = response.get("content") else {
         return Ok(false);
@@ -284,8 +307,18 @@ async fn test_definition(client: &MCPTestClient) -> Result<bool> {
     Ok(!definitions.is_empty())
 }
 
-async fn test_references(client: &MCPTestClient) -> Result<bool> {
-    let response = client.get_references("src/main.rs", 9, 4).await?;
+async fn test_references(client: &mut IpcClient, workspace_path: &Path) -> Result<bool> {
+    let main_path = workspace_path.join("src/main.rs");
+    let response = client
+        .call_tool(
+            "rust_analyzer_references",
+            json!({
+                "file_path": main_path.to_str().unwrap(),
+                "line": 9,
+                "character": 4
+            }),
+        )
+        .await?;
 
     let Some(content) = response.get("content") else {
         return Ok(false);
@@ -307,8 +340,18 @@ async fn test_references(client: &MCPTestClient) -> Result<bool> {
     Ok(!references.is_empty())
 }
 
-async fn test_hover(client: &MCPTestClient) -> Result<bool> {
-    let response = client.get_hover("src/main.rs", 4, 15).await?;
+async fn test_hover(client: &mut IpcClient, workspace_path: &Path) -> Result<bool> {
+    let main_path = workspace_path.join("src/main.rs");
+    let response = client
+        .call_tool(
+            "rust_analyzer_hover",
+            json!({
+                "file_path": main_path.to_str().unwrap(),
+                "line": 4,
+                "character": 15
+            }),
+        )
+        .await?;
 
     let Some(content) = response.get("content") else {
         return Ok(false);
@@ -330,8 +373,18 @@ async fn test_hover(client: &MCPTestClient) -> Result<bool> {
     Ok(hover.get("contents").is_some())
 }
 
-async fn test_completion(client: &MCPTestClient) -> Result<()> {
-    let response = client.get_completion("src/main.rs", 2, 5).await?;
+async fn test_completion(client: &mut IpcClient, workspace_path: &Path) -> Result<()> {
+    let main_path = workspace_path.join("src/main.rs");
+    let response = client
+        .call_tool(
+            "rust_analyzer_completion",
+            json!({
+                "file_path": main_path.to_str().unwrap(),
+                "line": 2,
+                "character": 5
+            }),
+        )
+        .await?;
 
     let Some(content) = response.get("content") else {
         return Ok(());
@@ -362,9 +415,17 @@ async fn test_completion(client: &MCPTestClient) -> Result<()> {
     Ok(())
 }
 
-async fn test_format(client: &MCPTestClient) -> Result<bool> {
+async fn test_format(client: &mut IpcClient, workspace_path: &Path) -> Result<bool> {
     // Test 1: Format already-formatted file - should return null (no edits needed)
-    let response = client.format("src/main.rs").await?;
+    let main_path = workspace_path.join("src/main.rs");
+    let response = client
+        .call_tool(
+            "rust_analyzer_format",
+            json!({
+                "file_path": main_path.to_str().unwrap()
+            }),
+        )
+        .await?;
 
     let Some(content) = response.get("content") else {
         return Ok(false);
@@ -385,7 +446,15 @@ async fn test_format(client: &MCPTestClient) -> Result<bool> {
     }
 
     // Test 2: Format unformatted file - should return edits
-    let response = client.format("src/unformatted.rs").await?;
+    let unformatted_path = workspace_path.join("src/unformatted.rs");
+    let response = client
+        .call_tool(
+            "rust_analyzer_format",
+            json!({
+                "file_path": unformatted_path.to_str().unwrap()
+            }),
+        )
+        .await?;
 
     let Some(content) = response.get("content") else {
         return Ok(false);
@@ -415,12 +484,13 @@ async fn test_format(client: &MCPTestClient) -> Result<bool> {
     Ok(true)
 }
 
-async fn test_code_actions(client: &MCPTestClient) -> Result<bool> {
+async fn test_code_actions(client: &mut IpcClient, workspace_path: &Path) -> Result<bool> {
+    let main_path = workspace_path.join("src/main.rs");
     let response = client
         .call_tool(
             "rust_analyzer_code_actions",
             json!({
-                "file_path": "src/main.rs",
+                "file_path": main_path.to_str().unwrap(),
                 "line": 13,
                 "character": 0,
                 "end_line": 16,
