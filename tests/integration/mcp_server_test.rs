@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 // Import test support library
-use test_support::{is_ci, timeouts, IpcClient, IsolatedProject};
+use test_support::{is_ci, timeouts, IpcClient};
 
 #[tokio::test]
 async fn test_server_initialization() -> Result<()> {
