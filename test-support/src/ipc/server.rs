@@ -229,18 +229,34 @@ fn wait_for_ready(
 
         let response: Value = serde_json::from_str(&line)?;
 
-        if let Some(result) = response.get("result") {
-            if let Some(content) = result.get("content") {
-                if let Some(array) = content.as_array() {
-                    if !array.is_empty() {
-                        if let Some(text) = array[0].get("text") {
-                            if text.as_str() != Some("null") {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+        // Check if we have a valid response with non-null content.
+        let Some(result) = response.get("result") else {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+
+        let Some(content) = result.get("content") else {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+
+        let Some(array) = content.as_array() else {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+
+        if array.is_empty() {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+
+        let Some(text) = array[0].get("text") else {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+
+        if text.as_str() != Some("null") {
+            break;
         }
 
         thread::sleep(Duration::from_millis(200));
