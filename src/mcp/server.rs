@@ -3,7 +3,7 @@ use log::{debug, error, info};
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     sync::Mutex,
 };
 
@@ -79,12 +79,20 @@ impl RustAnalyzerMCPServer {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        info!("Starting rust-analyzer MCP server");
-
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
-        let mut writer = BufWriter::new(stdout);
+        self.run_with_streams(stdin, stdout).await
+    }
+
+    pub async fn run_with_streams<R, W>(&mut self, reader: R, writer: W) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        info!("Starting rust-analyzer MCP server");
+
+        let mut reader = BufReader::new(reader);
+        let mut writer = BufWriter::new(writer);
 
         // Handle shutdown signals.
         let running = Arc::new(Mutex::new(true));
