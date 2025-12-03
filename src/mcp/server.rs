@@ -126,11 +126,15 @@ impl RustAnalyzerMCPServer {
             };
 
             debug!("Received request: {}", request.method);
-            let response = self.handle_request(request).await;
-            let response_json = serde_json::to_string(&response)?;
-            writer.write_all(response_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+
+            // requests without an id are notifications and must not receive a response!
+            if request.id.is_some() {
+                let response = self.handle_request(request).await;
+                let response_json = serde_json::to_string(&response)?;
+                writer.write_all(response_json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+            }
         }
 
         // Cleanup.
@@ -143,6 +147,7 @@ impl RustAnalyzerMCPServer {
     }
 
     async fn handle_request(&mut self, request: MCPRequest) -> MCPResponse {
+        log::debug!("{request:#?}");
         match request.method.as_str() {
             "initialize" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
