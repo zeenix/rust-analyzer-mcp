@@ -126,6 +126,7 @@ impl RustAnalyzerMCPServer {
             };
 
             debug!("Received request: {}", request.method);
+            log::debug!("{request:#?}");
 
             // requests without an id are notifications and must not receive a response!
             if request.id.is_some() {
@@ -147,7 +148,6 @@ impl RustAnalyzerMCPServer {
     }
 
     async fn handle_request(&mut self, request: MCPRequest) -> MCPResponse {
-        log::debug!("{request:#?}");
         match request.method.as_str() {
             "initialize" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
