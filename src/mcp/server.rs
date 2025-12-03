@@ -126,11 +126,16 @@ impl RustAnalyzerMCPServer {
             };
 
             debug!("Received request: {}", request.method);
-            let response = self.handle_request(request).await;
-            let response_json = serde_json::to_string(&response)?;
-            writer.write_all(response_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+            log::debug!("{request:#?}");
+
+            // requests without an id are notifications and must not receive a response!
+            if request.id.is_some() {
+                let response = self.handle_request(request).await;
+                let response_json = serde_json::to_string(&response)?;
+                writer.write_all(response_json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+            }
         }
 
         // Cleanup.
