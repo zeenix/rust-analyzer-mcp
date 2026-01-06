@@ -58,12 +58,13 @@ pub fn get_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rust_analyzer_symbols".to_string(),
-            description: "Get document symbols (functions, structs, etc.) for a Rust file"
+            description: "Get document symbols (functions, structs, etc.) for a Rust file. With include_hover=true, also fetches type signatures and documentation for each symbol."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Path to the Rust file" }
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "include_hover": { "type": "boolean", "description": "Include hover info (type signatures, docs) for each symbol. Default: false", "default": false }
                 },
                 "required": ["file_path"]
             }),
@@ -123,6 +124,56 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_workspace_symbols".to_string(),
+            description: "Search for symbols (functions, structs, traits, etc.) across the entire workspace by name".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Symbol name or pattern to search for" }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_implementations".to_string(),
+            description: "Find all implementations of a trait or all places where a type implements traits".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_incoming_calls".to_string(),
+            description: "Find all functions that call the function at the specified position (what calls this?)".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_outgoing_calls".to_string(),
+            description: "Find all functions called by the function at the specified position (what does this call?)".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
             }),
         },
     ]

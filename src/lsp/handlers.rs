@@ -156,6 +156,62 @@ impl RustAnalyzerClient {
         self.send_request("textDocument/codeAction", Some(params))
             .await
     }
+
+    /// Search for symbols across the entire workspace.
+    pub async fn workspace_symbols(&mut self, query: &str) -> Result<Value> {
+        let params = json!({
+            "query": query
+        });
+
+        self.send_request("workspace/symbol", Some(params)).await
+    }
+
+    /// Find implementations of a trait or type at a specific position.
+    pub async fn implementations(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        self.send_request("textDocument/implementation", Some(params))
+            .await
+    }
+
+    /// Prepare call hierarchy item at a specific position.
+    pub async fn prepare_call_hierarchy(
+        &mut self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        self.send_request("textDocument/prepareCallHierarchy", Some(params))
+            .await
+    }
+
+    /// Get incoming calls (what calls this function).
+    pub async fn incoming_calls(&mut self, item: Value) -> Result<Value> {
+        let params = json!({
+            "item": item
+        });
+
+        self.send_request("callHierarchy/incomingCalls", Some(params))
+            .await
+    }
+
+    /// Get outgoing calls (what this function calls).
+    pub async fn outgoing_calls(&mut self, item: Value) -> Result<Value> {
+        let params = json!({
+            "item": item
+        });
+
+        self.send_request("callHierarchy/outgoingCalls", Some(params))
+            .await
+    }
 }
 
 fn filter_diagnostics_in_range(diagnostics: &Value, start_line: u32, end_line: u32) -> Value {
