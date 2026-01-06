@@ -61,6 +61,10 @@ pub async fn handle_tool_call(
         "rust_analyzer_set_workspace" => handle_set_workspace(server, args).await,
         "rust_analyzer_diagnostics" => handle_diagnostics(server, args).await,
         "rust_analyzer_workspace_diagnostics" => handle_workspace_diagnostics(server, args).await,
+        "rust_analyzer_workspace_symbols" => handle_workspace_symbols(server, args).await,
+        "rust_analyzer_implementations" => handle_implementations(server, args).await,
+        "rust_analyzer_incoming_calls" => handle_incoming_calls(server, args).await,
+        "rust_analyzer_outgoing_calls" => handle_outgoing_calls(server, args).await,
         _ => Err(anyhow!("Unknown tool: {}", tool_name)),
     }
 }
@@ -147,6 +151,7 @@ async fn handle_completion(server: &mut RustAnalyzerMCPServer, args: Value) -> R
 
 async fn handle_symbols(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
     let file_path = ToolParams::extract_file_path(&args)?;
+    let include_hover = args["include_hover"].as_bool().unwrap_or(false);
 
     debug!("Getting symbols for file: {}", file_path);
     let uri = server.open_document_if_needed(&file_path).await?;
@@ -159,12 +164,109 @@ async fn handle_symbols(server: &mut RustAnalyzerMCPServer, args: Value) -> Resu
     let result = client.document_symbols(&uri).await?;
     debug!("Document symbols result: {:?}", result);
 
+    if !include_hover {
+        return Ok(ToolResult {
+            content: vec![ContentItem {
+                content_type: "text".to_string(),
+                text: serde_json::to_string_pretty(&result)?,
+            }],
+        });
+    }
+
+    // Enhance symbols with hover info
+    let enhanced = enhance_symbols_with_hover(client, &uri, result).await;
+
     Ok(ToolResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
-            text: serde_json::to_string_pretty(&result)?,
+            text: serde_json::to_string_pretty(&enhanced)?,
         }],
     })
+}
+
+/// Recursively enhance symbols with hover information.
+async fn enhance_symbols_with_hover(
+    client: &mut crate::lsp::RustAnalyzerClient,
+    uri: &str,
+    symbols: Value,
+) -> Value {
+    match symbols {
+        Value::Array(arr) => {
+            let mut enhanced = Vec::with_capacity(arr.len());
+            for sym in arr {
+                enhanced.push(Box::pin(enhance_single_symbol(client, uri, sym)).await);
+            }
+            Value::Array(enhanced)
+        }
+        other => other,
+    }
+}
+
+async fn enhance_single_symbol(
+    client: &mut crate::lsp::RustAnalyzerClient,
+    uri: &str,
+    mut symbol: Value,
+) -> Value {
+    // Get position from selectionRange (DocumentSymbol), range (DocumentSymbol), 
+    // or location.range (SymbolInformation)
+    let (line, character) = if let Some(sel_range) = symbol.get("selectionRange") {
+        let line = sel_range["start"]["line"].as_u64().unwrap_or(0) as u32;
+        let char = sel_range["start"]["character"].as_u64().unwrap_or(0) as u32;
+        (line, char)
+    } else if let Some(range) = symbol.get("range") {
+        let line = range["start"]["line"].as_u64().unwrap_or(0) as u32;
+        let char = range["start"]["character"].as_u64().unwrap_or(0) as u32;
+        (line, char)
+    } else if let Some(location) = symbol.get("location") {
+        // SymbolInformation format
+        let range = &location["range"];
+        let line = range["start"]["line"].as_u64().unwrap_or(0) as u32;
+        let char = range["start"]["character"].as_u64().unwrap_or(0) as u32;
+        (line, char)
+    } else {
+        return symbol;
+    };
+
+    // Fetch hover info - scan forward to find the symbol name
+    // The range start is often on keywords like 'pub', 'fn', etc.
+    // Try positions at intervals until we get meaningful hover info
+    let mut found_hover = false;
+    for offset in (0..24).step_by(4) {
+        if found_hover {
+            break;
+        }
+        if let Ok(hover) = client.hover(uri, line, character + offset).await {
+            if !hover.is_null() {
+                // Extract just the markdown content for cleaner output
+                if let Some(contents) = hover.get("contents") {
+                    if let Some(value) = contents.get("value") {
+                        // Skip if it's just keyword documentation (pub, fn, mod, etc.)
+                        let text = value.as_str().unwrap_or("");
+                        if !text.contains("Make an item visible") 
+                            && !text.contains("A function or function pointer")
+                            && !text.contains("Organize code into")
+                        {
+                            symbol["hover"] = value.clone();
+                            found_hover = true;
+                        }
+                    } else {
+                        symbol["hover"] = contents.clone();
+                        found_hover = true;
+                    }
+                } else {
+                    symbol["hover"] = hover;
+                    found_hover = true;
+                }
+            }
+        }
+    }
+
+    // Recursively enhance children
+    if let Some(children) = symbol.get("children").cloned() {
+        symbol["children"] = Box::pin(enhance_symbols_with_hover(client, uri, children)).await;
+    }
+
+    symbol
 }
 
 async fn handle_format(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
@@ -253,38 +355,18 @@ async fn handle_diagnostics(server: &mut RustAnalyzerMCPServer, args: Value) -> 
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    // Poll for diagnostics - rust-analyzer needs time to run cargo check.
-    // For files with expected errors (like diagnostics_test.rs), poll longer.
-    let should_poll = file_path.contains("diagnostics_test") || file_path.contains("simple_error");
-
     let Some(client) = &mut server.client else {
         return Err(anyhow!("Client not initialized"));
     };
 
-    let mut result = json!([]);
-    if should_poll {
-        let start = std::time::Instant::now();
-        let timeout = tokio::time::Duration::from_secs(8); // Less than test timeout.
-        let poll_interval = tokio::time::Duration::from_millis(500);
-
-        while start.elapsed() < timeout {
-            result = client.diagnostics(&uri).await?;
-            let Some(diag_array) = result.as_array() else {
-                tokio::time::sleep(poll_interval).await;
-                continue;
-            };
-
-            if !diag_array.is_empty() {
-                // We got diagnostics, stop polling.
-                break;
-            }
-            tokio::time::sleep(poll_interval).await;
-        }
+    // First try to get diagnostics from notification-based cache.
+    // If not available, wait for notifications with timeout.
+    let result = if let Some(diags) = client.wait_for_diagnostics(&uri).await {
+        json!(diags)
     } else {
-        // For clean files, just wait a bit and check once.
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        result = client.diagnostics(&uri).await?;
-    }
+        // Fallback to direct query.
+        client.diagnostics(&uri).await?
+    };
 
     let diagnostics = format_diagnostics(&file_path, &result);
 
@@ -313,6 +395,145 @@ async fn handle_workspace_diagnostics(
         content: vec![ContentItem {
             content_type: "text".to_string(),
             text: serde_json::to_string_pretty(&formatted)?,
+        }],
+    })
+}
+
+async fn handle_workspace_symbols(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let Some(query) = args["query"].as_str() else {
+        return Err(anyhow!("Missing query"));
+    };
+
+    server.ensure_client_started().await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    let result = client.workspace_symbols(query).await?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_implementations(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    let result = client.implementations(&uri, line, character).await?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_incoming_calls(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    // First, prepare the call hierarchy item
+    let items = client.prepare_call_hierarchy(&uri, line, character).await?;
+    
+    let Some(items_array) = items.as_array() else {
+        return Ok(ToolResult {
+            content: vec![ContentItem {
+                content_type: "text".to_string(),
+                text: "No call hierarchy item found at this position".to_string(),
+            }],
+        });
+    };
+
+    if items_array.is_empty() {
+        return Ok(ToolResult {
+            content: vec![ContentItem {
+                content_type: "text".to_string(),
+                text: "No call hierarchy item found at this position".to_string(),
+            }],
+        });
+    }
+
+    // Get incoming calls for the first item
+    let item = items_array[0].clone();
+    let result = client.incoming_calls(item).await?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_outgoing_calls(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    // First, prepare the call hierarchy item
+    let items = client.prepare_call_hierarchy(&uri, line, character).await?;
+    
+    let Some(items_array) = items.as_array() else {
+        return Ok(ToolResult {
+            content: vec![ContentItem {
+                content_type: "text".to_string(),
+                text: "No call hierarchy item found at this position".to_string(),
+            }],
+        });
+    };
+
+    if items_array.is_empty() {
+        return Ok(ToolResult {
+            content: vec![ContentItem {
+                content_type: "text".to_string(),
+                text: "No call hierarchy item found at this position".to_string(),
+            }],
+        });
+    }
+
+    // Get outgoing calls for the first item
+    let item = items_array[0].clone();
+    let result = client.outgoing_calls(item).await?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
         }],
     })
 }
