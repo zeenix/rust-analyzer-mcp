@@ -27,6 +27,45 @@ async fn test_server_initialization() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_ping() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    // Test basic ping - should return empty object
+    let response = client.send_request("ping", None).await?;
+    assert_eq!(
+        response,
+        json!({}),
+        "Ping should return empty object per MCP spec"
+    );
+
+    // Test multiple pings to verify idempotency
+    for i in 0..5 {
+        let response = client.send_request("ping", None).await?;
+        assert_eq!(
+            response,
+            json!({}),
+            "Ping #{} should return empty object",
+            i + 1
+        );
+    }
+
+    // Test rapid-fire pings to verify throughput
+    for _ in 0..10 {
+        let response = client.send_request("ping", None).await?;
+        assert_eq!(response, json!({}), "Rapid ping should return empty object");
+    }
+
+    // Verify server is still responsive after pings
+    let response = client.send_request("tools/list", None).await?;
+    assert!(
+        response.get("tools").is_some(),
+        "Server should remain responsive after pings"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_all_lsp_tools() -> Result<()> {
     let mut client = IpcClient::get_or_create("test-project").await?;
     let workspace_path = client.workspace_path().to_path_buf();

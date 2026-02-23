@@ -48,7 +48,10 @@ pub async fn handle_tool_call(
     tool_name: &str,
     args: Value,
 ) -> Result<ToolResult> {
-    server.ensure_client_started().await?;
+    // set_workspace manages the client lifecycle itself, so skip eager client start.
+    if tool_name != "rust_analyzer_set_workspace" {
+        server.ensure_client_started().await?;
+    }
 
     match tool_name {
         "rust_analyzer_hover" => handle_hover(server, args).await,

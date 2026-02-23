@@ -38,6 +38,11 @@ impl IpcClient {
             _ => return Err(anyhow::anyhow!("Unknown project type: {}", project_type)),
         };
 
+        // Canonicalize the workspace path to ensure it's absolute
+        let workspace_path = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.clone());
+
         let sock_path = socket_path(project_type);
 
         // Try to connect to existing server

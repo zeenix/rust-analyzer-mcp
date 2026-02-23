@@ -158,6 +158,11 @@ impl RustAnalyzerMCPServer {
                     }
                 }),
             },
+            "ping" => MCPResponse::Success {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: json!({}),
+            },
             "tools/list" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,

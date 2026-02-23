@@ -5,6 +5,217 @@ use std::time::{Duration, Instant};
 
 use test_support::{is_ci, timeouts, IpcClient};
 
+// ============================================================================
+// Ping Stress Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_ping_rapid_fire() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    let iterations = if is_ci() { 100 } else { 500 };
+    let start = Instant::now();
+
+    for _ in 0..iterations {
+        let response = client.send_request("ping", None).await?;
+        assert_eq!(response, json!({}), "Ping should return empty object");
+    }
+
+    let elapsed = start.elapsed();
+    let rate = iterations as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "Ping rapid-fire: {} pings in {:?} ({:.1} pings/s)",
+        iterations, elapsed, rate
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ping_concurrent() -> Result<()> {
+    let concurrency = if is_ci() { 10 } else { 50 };
+    let start = Instant::now();
+
+    let futures = (0..concurrency).map(|_| async {
+        let mut client = IpcClient::get_or_create("test-project").await?;
+        client.send_request("ping", None).await
+    });
+
+    let results = join_all(futures).await;
+
+    let elapsed = start.elapsed();
+    eprintln!(
+        "Ping concurrent: {} concurrent pings in {:?}",
+        concurrency, elapsed
+    );
+
+    // Verify all succeeded with correct response
+    for result in results {
+        let response = result?;
+        assert_eq!(response, json!({}), "Ping should return empty object");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ping_interleaved_with_tools() -> Result<()> {
+    let temp_client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = temp_client.workspace_path().to_path_buf();
+    drop(temp_client);
+
+    let main_path = workspace_path.join("src/main.rs");
+    let main_path_str = main_path.to_str().unwrap();
+
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let iterations = if is_ci() { 20 } else { 50 };
+
+    for i in 0..iterations {
+        // Alternate between ping and actual tool calls
+        if i % 3 == 0 {
+            let response = client.send_request("ping", None).await?;
+            assert_eq!(response, json!({}));
+        } else if i % 3 == 1 {
+            let response = client
+                .call_tool("rust_analyzer_symbols", json!({"file_path": main_path_str}))
+                .await?;
+            assert!(response.get("content").is_some());
+        } else {
+            let response = client.send_request("tools/list", None).await?;
+            assert!(response.get("tools").is_some());
+        }
+    }
+
+    eprintln!("Ping interleaved test completed {} iterations", iterations);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ping_mixed_concurrent_workload() -> Result<()> {
+    let temp_client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = temp_client.workspace_path().to_path_buf();
+    drop(temp_client);
+
+    let main_path = workspace_path.join("src/main.rs");
+    let main_path_str = main_path.to_str().unwrap();
+
+    let concurrency = if is_ci() { 15 } else { 30 };
+
+    let futures = (0..concurrency).map(|i| {
+        let main_path_str = main_path_str.to_string();
+        async move {
+            let mut client = IpcClient::get_or_create("test-project").await?;
+
+            // Mix pings with tool calls
+            match i % 5 {
+                0 | 1 => client.send_request("ping", None).await,
+                2 => client
+                    .call_tool("rust_analyzer_symbols", json!({"file_path": main_path_str}))
+                    .await
+                    .map(|_| json!({})),
+                3 => client
+                    .send_request("tools/list", None)
+                    .await
+                    .map(|_| json!({})),
+                _ => client
+                    .call_tool(
+                        "rust_analyzer_hover",
+                        json!({"file_path": main_path_str, "line": 1, "character": 10}),
+                    )
+                    .await
+                    .map(|_| json!({})),
+            }
+        }
+    });
+
+    let results = join_all(futures).await;
+
+    // Count successes
+    let mut success_count = 0;
+    for result in results {
+        result?;
+        success_count += 1;
+    }
+
+    eprintln!(
+        "Ping mixed workload: {}/{} requests succeeded",
+        success_count, concurrency
+    );
+    assert_eq!(success_count, concurrency);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ping_burst_pattern() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    let bursts = if is_ci() { 5 } else { 10 };
+    let pings_per_burst = if is_ci() { 20 } else { 50 };
+
+    for burst in 0..bursts {
+        let start = Instant::now();
+
+        // Send burst of pings
+        for _ in 0..pings_per_burst {
+            let response = client.send_request("ping", None).await?;
+            assert_eq!(response, json!({}));
+        }
+
+        let elapsed = start.elapsed();
+        eprintln!(
+            "Burst {}: {} pings in {:?}",
+            burst + 1,
+            pings_per_burst,
+            elapsed
+        );
+
+        // Small pause between bursts
+        if burst < bursts - 1 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    eprintln!(
+        "Ping burst test completed: {} bursts of {} pings",
+        bursts, pings_per_burst
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ping_connection_stability() -> Result<()> {
+    // Test that ping doesn't leak resources or connections
+    let iterations = if is_ci() { 50 } else { 100 };
+
+    for i in 0..iterations {
+        let mut client = IpcClient::get_or_create("test-project").await?;
+
+        // Do a few pings per connection
+        for _ in 0..5 {
+            let response = client.send_request("ping", None).await?;
+            assert_eq!(response, json!({}));
+        }
+
+        // Drop connection
+        drop(client);
+
+        if i % 25 == 0 {
+            eprintln!("Ping connection stability: {} iterations", i);
+        }
+    }
+
+    eprintln!(
+        "Ping connection stability test completed {} iterations",
+        iterations
+    );
+    Ok(())
+}
+
+// ============================================================================
+// Original Stress Tests
+// ============================================================================
+
 #[tokio::test]
 async fn test_concurrent_tool_calls() -> Result<()> {
     // Get workspace path to use absolute paths
