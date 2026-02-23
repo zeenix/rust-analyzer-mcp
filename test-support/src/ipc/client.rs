@@ -38,9 +38,58 @@ impl IpcClient {
             _ => return Err(anyhow::anyhow!("Unknown project type: {}", project_type)),
         };
 
+        // Canonicalize the workspace path to ensure it's absolute
+        let workspace_path = workspace_path
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_path.clone());
+
         let sock_path = socket_path(project_type);
 
-        // Try to connect to existing server
+        // Fast path: try connecting before acquiring the lock.
+        if let Ok(stream) = UnixStream::connect(&sock_path) {
+            eprintln!("Connected to existing MCP server for {}", project_type);
+            let reader = BufReader::new(stream.try_clone()?);
+            return Ok(Self {
+                stream,
+                reader,
+                request_id: AtomicU64::new(1),
+                workspace_path,
+            });
+        }
+
+        // Server not running. Serialize the check+spawn with a per-project
+        // exclusive lockfile to prevent concurrent tests from each racing to
+        // spawn their own server instance against the same socket path.
+        // We use O_CREAT|O_EXCL (via OpenOptions::create_new) as an atomic
+        // test-and-set: only one process succeeds; the others spin-wait.
+        let lock_path = socket_path(project_type).with_extension("lock");
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_guard) => break, // We hold the lock.
+                Err(_) => {
+                    // Another process holds the lock; wait for it to finish
+                    // starting the server, then try connecting.
+                    thread::sleep(Duration::from_millis(100));
+                    if let Ok(stream) = UnixStream::connect(&sock_path) {
+                        eprintln!("Connected to existing MCP server for {}", project_type);
+                        let reader = BufReader::new(stream.try_clone()?);
+                        return Ok(Self {
+                            stream,
+                            reader,
+                            request_id: AtomicU64::new(1),
+                            workspace_path,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Re-check after acquiring the lock: another process may have started
+        // the server while we were waiting.
         if let Ok(stream) = UnixStream::connect(&sock_path) {
             eprintln!("Connected to existing MCP server for {}", project_type);
             let reader = BufReader::new(stream.try_clone()?);
@@ -117,6 +166,9 @@ impl IpcClient {
         loop {
             if let Ok(stream) = UnixStream::connect(&sock_path) {
                 eprintln!("Connected to new MCP server for {}", project_type);
+                // Release the lock now that the socket is up so any other
+                // processes waiting in the spin-loop above can connect.
+                let _ = std::fs::remove_file(&lock_path);
                 let reader = BufReader::new(stream.try_clone()?);
                 return Ok(Self {
                     stream,
@@ -128,6 +180,7 @@ impl IpcClient {
 
             attempts += 1;
             if attempts > 50 {
+                let _ = std::fs::remove_file(&lock_path);
                 return Err(anyhow::anyhow!(
                     "Failed to connect to MCP server after starting"
                 ));

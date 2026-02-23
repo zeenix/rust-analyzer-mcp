@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use log::info;
+use log::{info, warn};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -356,6 +356,20 @@ impl RustAnalyzerClient {
         self.diagnostics.lock().await.clear();
         self.initialized = false;
         Ok(())
+    }
+}
+
+impl Drop for RustAnalyzerClient {
+    fn drop(&mut self) {
+        if let Some(ref mut process) = self.process {
+            info!("Killing child rust-analyzer process on drop");
+            if let Err(e) = process.start_kill() {
+                warn!("Failed to kill rust-analyzer process on drop: {}", e);
+            }
+            // Best-effort reap to avoid zombies. If the process hasn't exited yet,
+            // the brief zombie will be reaped by init/launchd when we exit shortly after.
+            let _ = process.try_wait();
+        }
     }
 }
 

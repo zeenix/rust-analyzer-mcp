@@ -86,15 +86,35 @@ impl RustAnalyzerMCPServer {
         let mut reader = BufReader::new(stdin);
         let mut writer = BufWriter::new(stdout);
 
-        // Handle shutdown signals.
+        // Handle shutdown signals. SIGINT and SIGTERM are handled in separate
+        // tasks intentionally. Using tokio::select! to combine them in a single
+        // task causes the losing future to be dropped/cancelled, which can leave
+        // tokio's internal signal handler state inconsistent. This manifests as
+        // the MCP process exiting unexpectedly when run as a child process (e.g.
+        // by the test-support-server), causing broken pipe errors in tests.
+        // Two independent tasks avoid any cross-signal interference.
         let running = Arc::new(Mutex::new(true));
         let running_clone = Arc::clone(&running);
 
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            info!("Received shutdown signal");
+            info!("Received SIGINT");
             *running_clone.lock().await = false;
         });
+
+        // Also handle SIGTERM (sent by process managers and editors like Windsurf).
+        #[cfg(unix)]
+        {
+            let running_clone2 = Arc::clone(&running);
+            tokio::spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+                sigterm.recv().await;
+                info!("Received SIGTERM");
+                *running_clone2.lock().await = false;
+            });
+        }
 
         loop {
             // Check if we should stop.
@@ -157,6 +177,11 @@ impl RustAnalyzerMCPServer {
                         "tools": {}
                     }
                 }),
+            },
+            "ping" => MCPResponse::Success {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: json!({}),
             },
             "tools/list" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
