@@ -126,6 +126,13 @@ impl RustAnalyzerMCPServer {
             };
 
             debug!("Received request: {}", request.method);
+
+            // Notifications do not have `id` and must not receive a JSON-RPC response.
+            if request.id.is_none() {
+                debug!("Ignoring notification without id: {}", request.method);
+                continue;
+            }
+
             let response = self.handle_request(request).await;
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
