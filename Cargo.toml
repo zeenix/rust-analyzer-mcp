@@ -26,6 +26,10 @@ env_logger = "0.10"
 log = "0.4"
 futures = "0.3"
 which = "6.0"
+url = "2.5"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
 
 [dev-dependencies]
 # Test support library
