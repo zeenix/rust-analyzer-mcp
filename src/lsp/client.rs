@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Result};
-use log::info;
+use log::{info, warn};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
-    process::Stdio,
+    fs,
+    path::{Path, PathBuf},
+    process::{Command as StdCommand, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -15,9 +16,33 @@ use tokio::{
 };
 
 use crate::{
-    config::{DOCUMENT_OPEN_DELAY_MILLIS, LSP_REQUEST_TIMEOUT_SECS},
+    config::{lsp_request_timeout_secs, DOCUMENT_OPEN_DELAY_MILLIS, RUST_ANALYZER_PATH_ENV},
     protocol::lsp::LSPRequest,
 };
+use url::Url;
+
+fn to_file_uri(path: &Path) -> Result<String> {
+    #[cfg(windows)]
+    let normalized = {
+        let path_str = path.to_string_lossy();
+        if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+            PathBuf::from(stripped)
+        } else {
+            path.to_path_buf()
+        }
+    };
+    #[cfg(not(windows))]
+    let normalized = path.to_path_buf();
+
+    Url::from_file_path(&normalized)
+        .map_err(|_| {
+            anyhow!(
+                "Failed to convert path to file URI: {}",
+                normalized.display()
+            )
+        })
+        .map(|u| u.to_string())
+}
 
 pub struct RustAnalyzerClient {
     pub(super) process: Option<Child>,
@@ -73,6 +98,36 @@ impl RustAnalyzerClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        #[cfg(windows)]
+        {
+            // Windows 下某些 MCP 客户端会裁剪 HOME/USERPROFILE，导致 rust-analyzer 初始化卡死。
+            let profile_for_child = std::env::var("USERPROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(resolve_windows_user_profile_from_registry);
+
+            if std::env::var("USERPROFILE").is_err() {
+                if let Some(profile) = &profile_for_child {
+                    cmd.env("USERPROFILE", profile);
+                }
+            }
+            if std::env::var("HOME").is_err() {
+                if let Some(profile) = &profile_for_child {
+                    cmd.env("HOME", profile);
+                }
+            }
+            if std::env::var("CARGO_HOME").is_err() {
+                if let Some(cargo_home) = collect_registry_cargo_homes().into_iter().next() {
+                    cmd.env("CARGO_HOME", cargo_home);
+                }
+            }
+            if std::env::var("RUSTUP_HOME").is_err() {
+                if let Some(rustup_home) = collect_registry_rustup_homes().into_iter().next() {
+                    cmd.env("RUSTUP_HOME", rustup_home);
+                }
+            }
+        }
 
         // Pass through isolation environment variables if they're set.
         if let Ok(cache_home) = std::env::var("XDG_CACHE_HOME") {
@@ -185,28 +240,73 @@ impl RustAnalyzerClient {
 
         info!("Sending LSP request: {} with params: {:?}", method, params);
 
-        let Some(stdin) = &mut self.stdin else {
-            return Err(anyhow!("No stdin available"));
-        };
-
-        stdin.write_all(message.as_bytes()).await?;
-        stdin.flush().await?;
-
         // Set up response channel.
         let (tx, rx) = oneshot::channel();
+        // 先注册 pending，再写请求，避免极快响应导致竞态丢包。
         self.pending_requests.lock().await.insert(id, tx);
 
+        if let Some(stdin) = &mut self.stdin {
+            if let Err(e) = stdin.write_all(message.as_bytes()).await {
+                // 写失败时同步清理 pending，避免后续请求被污染。
+                self.pending_requests.lock().await.remove(&id);
+                return Err(anyhow!(
+                    "Failed to write LSP request '{}' (id={}): {}",
+                    method,
+                    id,
+                    e
+                ));
+            }
+            if let Err(e) = stdin.flush().await {
+                self.pending_requests.lock().await.remove(&id);
+                return Err(anyhow!(
+                    "Failed to flush LSP request '{}' (id={}): {}",
+                    method,
+                    id,
+                    e
+                ));
+            }
+        } else {
+            self.pending_requests.lock().await.remove(&id);
+            return Err(anyhow!("No stdin available"));
+        }
         // Wait for response with timeout.
-        tokio::time::timeout(Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS), rx)
-            .await
-            .map_err(|_| anyhow!("Request timeout"))?
-            .map_err(|_| anyhow!("Request cancelled"))
+        match tokio::time::timeout(Duration::from_secs(lsp_request_timeout_secs()), rx).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => {
+                self.pending_requests.lock().await.remove(&id);
+                Err(anyhow!(
+                    "LSP request '{}' (id={}) cancelled before response",
+                    method,
+                    id
+                ))
+            }
+            Err(_) => {
+                self.pending_requests.lock().await.remove(&id);
+                let process_status = if let Some(process) = &mut self.process {
+                    match process.try_wait() {
+                        Ok(Some(status)) => format!("rust-analyzer exited: {}", status),
+                        Ok(None) => "rust-analyzer still running".to_string(),
+                        Err(e) => format!("rust-analyzer status unavailable: {}", e),
+                    }
+                } else {
+                    "rust-analyzer process missing".to_string()
+                };
+                Err(anyhow!(
+                    "LSP request '{}' (id={}) timed out after {}s ({})",
+                    method,
+                    id,
+                    lsp_request_timeout_secs(),
+                    process_status
+                ))
+            }
+        }
     }
 
     async fn initialize(&mut self) -> Result<()> {
+        let root_uri = to_file_uri(&self.workspace_root)?;
         let init_params = json!({
             "processId": std::process::id(),
-            "rootUri": format!("file://{}", self.workspace_root.display()),
+            "rootUri": root_uri,
             "initializationOptions": {
                 "cargo": {
                     "buildScripts": {
@@ -280,11 +380,6 @@ impl RustAnalyzerClient {
         self.send_request("initialize", Some(init_params)).await?;
         self.send_notification("initialized", Some(json!({})))
             .await?;
-
-        // Request workspace reload to trigger cargo check.
-        self.send_request("rust-analyzer/reloadWorkspace", None)
-            .await
-            .ok();
 
         Ok(())
     }
@@ -360,20 +455,288 @@ impl RustAnalyzerClient {
 }
 
 fn find_rust_analyzer() -> Result<PathBuf> {
-    which::which("rust-analyzer").or_else(|_| {
-        // Try common installation locations if not in PATH.
-        let home = std::env::var("HOME").unwrap_or_else(|_| String::from("~"));
-        let cargo_bin = PathBuf::from(home).join(".cargo/bin/rust-analyzer");
-        if cargo_bin.exists() {
-            Ok(cargo_bin)
-        } else {
-            which::which("rust-analyzer")
+    if let Ok(path) = std::env::var(RUST_ANALYZER_PATH_ENV) {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Ok(candidate);
         }
-    })
-    .map_err(|e| {
-        anyhow!(
-            "Failed to find rust-analyzer in PATH or ~/.cargo/bin: {}. Please ensure rust-analyzer is installed.",
-            e
-        )
-    })
+        warn!(
+            "{} is set but points to a missing path: {}",
+            RUST_ANALYZER_PATH_ENV,
+            candidate.display()
+        );
+    }
+
+    if let Ok(found) = which::which("rust-analyzer") {
+        return Ok(found);
+    }
+
+    let candidates = collect_rust_analyzer_candidates();
+    for candidate in &candidates {
+        if candidate.is_file() {
+            info!(
+                "Found rust-analyzer via fallback path: {}",
+                candidate.display()
+            );
+            return Ok(candidate.to_path_buf());
+        }
+    }
+
+    if let Some(via_rustup) = resolve_rust_analyzer_via_rustup() {
+        info!(
+            "Found rust-analyzer via rustup resolution: {}",
+            via_rustup.display()
+        );
+        return Ok(via_rustup);
+    }
+
+    let searched_preview = candidates
+        .iter()
+        .take(8)
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Err(anyhow!(
+        "Failed to find rust-analyzer. Checked PATH, {}, registry-backed candidates, and rustup. Sample searched paths: [{}]. Please set {} explicitly.",
+        RUST_ANALYZER_PATH_ENV,
+        searched_preview,
+        RUST_ANALYZER_PATH_ENV
+    ))
+}
+
+fn collect_rust_analyzer_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    #[cfg(windows)]
+    let executable_name = "rust-analyzer.exe";
+    #[cfg(not(windows))]
+    let executable_name = "rust-analyzer";
+
+    let mut home_roots: Vec<PathBuf> = Vec::new();
+
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
+        push_unique_path(&mut home_roots, PathBuf::from(cargo_home));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        push_unique_path(&mut home_roots, PathBuf::from(home).join(".cargo"));
+    }
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        push_unique_path(&mut home_roots, PathBuf::from(&user_profile).join(".cargo"));
+    }
+    if let (Ok(home_drive), Ok(home_path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH"))
+    {
+        push_unique_path(
+            &mut home_roots,
+            PathBuf::from(format!("{}{}", home_drive, home_path)).join(".cargo"),
+        );
+    }
+    #[cfg(windows)]
+    {
+        for cargo_home in collect_registry_cargo_homes() {
+            push_unique_path(&mut home_roots, cargo_home);
+        }
+    }
+
+    for cargo_home in home_roots {
+        push_unique_path(
+            &mut candidates,
+            cargo_home.join("bin").join(executable_name),
+        );
+    }
+
+    let mut rustup_homes: Vec<PathBuf> = Vec::new();
+    if let Ok(rustup_home) = std::env::var("RUSTUP_HOME") {
+        push_unique_path(&mut rustup_homes, PathBuf::from(rustup_home));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        push_unique_path(&mut rustup_homes, PathBuf::from(home).join(".rustup"));
+    }
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        push_unique_path(
+            &mut rustup_homes,
+            PathBuf::from(user_profile).join(".rustup"),
+        );
+    }
+    if let (Ok(home_drive), Ok(home_path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH"))
+    {
+        push_unique_path(
+            &mut rustup_homes,
+            PathBuf::from(format!("{}{}", home_drive, home_path)).join(".rustup"),
+        );
+    }
+    #[cfg(windows)]
+    {
+        for rustup_home in collect_registry_rustup_homes() {
+            push_unique_path(&mut rustup_homes, rustup_home);
+        }
+    }
+
+    for rustup_home in rustup_homes {
+        let toolchains_dir = rustup_home.join("toolchains");
+        let Ok(entries) = fs::read_dir(&toolchains_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            push_unique_path(
+                &mut candidates,
+                entry.path().join("bin").join(executable_name),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        push_unique_path(
+            &mut candidates,
+            PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("Rust Analyzer")
+                .join(executable_name),
+        );
+    }
+
+    candidates
+}
+
+fn push_unique_path(target: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !target.iter().any(|existing| existing == &candidate) {
+        target.push(candidate);
+    }
+}
+
+fn resolve_rust_analyzer_via_rustup() -> Option<PathBuf> {
+    for rustup_binary in collect_rustup_binary_candidates() {
+        if !rustup_binary.is_file() {
+            continue;
+        }
+
+        let output = StdCommand::new(&rustup_binary)
+            .args(["which", "rust-analyzer"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            continue;
+        }
+
+        let output_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if output_path.is_empty() {
+            continue;
+        }
+
+        let resolved_path = PathBuf::from(output_path);
+        if resolved_path.is_file() {
+            return Some(resolved_path);
+        }
+    }
+    None
+}
+
+fn collect_rustup_binary_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    #[cfg(windows)]
+    let rustup_name = "rustup.exe";
+    #[cfg(not(windows))]
+    let rustup_name = "rustup";
+
+    if let Ok(found) = which::which("rustup") {
+        push_unique_path(&mut candidates, found);
+    }
+
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
+        push_unique_path(
+            &mut candidates,
+            PathBuf::from(cargo_home).join("bin").join(rustup_name),
+        );
+    }
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        push_unique_path(
+            &mut candidates,
+            PathBuf::from(user_profile)
+                .join(".cargo")
+                .join("bin")
+                .join(rustup_name),
+        );
+    }
+    if let (Ok(home_drive), Ok(home_path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH"))
+    {
+        push_unique_path(
+            &mut candidates,
+            PathBuf::from(format!("{}{}", home_drive, home_path))
+                .join(".cargo")
+                .join("bin")
+                .join(rustup_name),
+        );
+    }
+    #[cfg(windows)]
+    {
+        for cargo_home in collect_registry_cargo_homes() {
+            push_unique_path(&mut candidates, cargo_home.join("bin").join(rustup_name));
+        }
+    }
+
+    candidates
+}
+
+#[cfg(windows)]
+fn collect_registry_cargo_homes() -> Vec<PathBuf> {
+    collect_registry_homes("CARGO_HOME", ".cargo")
+}
+
+#[cfg(windows)]
+fn collect_registry_rustup_homes() -> Vec<PathBuf> {
+    collect_registry_homes("RUSTUP_HOME", ".rustup")
+}
+
+#[cfg(windows)]
+fn collect_registry_homes(key: &str, fallback_suffix: &str) -> Vec<PathBuf> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let mut homes: Vec<PathBuf> = Vec::new();
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+    if let Ok(env_key) = hkcu.open_subkey("Environment") {
+        if let Ok(value) = env_key.get_value::<String, _>(key) {
+            push_unique_path(&mut homes, PathBuf::from(value));
+        }
+    }
+
+    if let Ok(volatile_key) = hkcu.open_subkey("Volatile Environment") {
+        if let Ok(user_profile) = volatile_key.get_value::<String, _>("USERPROFILE") {
+            push_unique_path(
+                &mut homes,
+                PathBuf::from(user_profile).join(fallback_suffix),
+            );
+        }
+    }
+
+    homes
+}
+
+#[cfg(windows)]
+fn resolve_windows_user_profile_from_registry() -> Option<String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+    if let Ok(volatile_key) = hkcu.open_subkey("Volatile Environment") {
+        if let Ok(profile) = volatile_key.get_value::<String, _>("USERPROFILE") {
+            if !profile.trim().is_empty() {
+                return Some(profile);
+            }
+        }
+    }
+
+    if let Ok(env_key) = hkcu.open_subkey("Environment") {
+        if let Ok(profile) = env_key.get_value::<String, _>("USERPROFILE") {
+            if !profile.trim().is_empty() {
+                return Some(profile);
+            }
+        }
+    }
+
+    None
 }

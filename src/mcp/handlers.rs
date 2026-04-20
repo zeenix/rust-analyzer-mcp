@@ -48,7 +48,12 @@ pub async fn handle_tool_call(
     tool_name: &str,
     args: Value,
 ) -> Result<ToolResult> {
-    server.ensure_client_started().await?;
+    // `set_workspace` should be able to switch root before the first RA startup.
+    // Otherwise the initial startup may happen in an unrelated large cwd and timeout.
+    if tool_name != "rust_analyzer_set_workspace" {
+        server.adjust_workspace_from_file_arg(&args);
+        server.ensure_client_started().await?;
+    }
 
     match tool_name {
         "rust_analyzer_hover" => handle_hover(server, args).await,
@@ -237,13 +242,13 @@ async fn handle_set_workspace(
         }
     });
 
-    // Start the new client automatically.
-    server.ensure_client_started().await?;
-
     Ok(ToolResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
-            text: format!("Workspace set to: {}", server.workspace_root.display()),
+            text: format!(
+                "Workspace set to: {} (rust-analyzer client will start lazily on next tool call)",
+                server.workspace_root.display()
+            ),
         }],
     })
 }
