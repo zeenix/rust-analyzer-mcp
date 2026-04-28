@@ -418,6 +418,64 @@ async fn test_phase2_truncation_and_pagination() -> Result<()> {
     Ok(())
 }
 
+/// Phase 3.1 — MCP-Resources: list + read für `workspace://files`.
+///
+/// Verifiziert, dass der Server die Capability anbietet, dass `resources/list`
+/// die Files-Resource zurückgibt, und dass `resources/read` einen sortierten
+/// File-Tree mit `Cargo.toml` und `src/` für das test-project liefert.
+#[tokio::test]
+async fn test_phase3_resources() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    // 1. resources/list — must include workspace://files.
+    let list_resp = client.send_request("resources/list", None).await?;
+    let resources = list_resp["resources"].as_array().expect("resources array");
+    let uris: Vec<&str> = resources.iter().filter_map(|r| r["uri"].as_str()).collect();
+    assert!(
+        uris.contains(&"workspace://files"),
+        "expected workspace://files in resources/list, got {uris:?}"
+    );
+
+    // 2. resources/read for workspace://files — yields a JSON file-tree.
+    let read_resp = client
+        .send_request(
+            "resources/read",
+            Some(json!({ "uri": "workspace://files" })),
+        )
+        .await?;
+    let contents = read_resp["contents"].as_array().expect("contents array");
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0]["mimeType"], "application/json");
+
+    let tree_text = contents[0]["text"].as_str().expect("text payload");
+    let tree: Value = serde_json::from_str(tree_text)?;
+    assert!(tree["root"].as_str().is_some());
+    assert_eq!(tree["tree"]["type"], "dir");
+    assert!(tree["stats"]["entries"].as_u64().unwrap() > 0);
+
+    // test-project has Cargo.toml and src/ at the root.
+    let children = tree["tree"]["children"].as_array().expect("root children");
+    let names: Vec<&str> = children.iter().filter_map(|c| c["name"].as_str()).collect();
+    assert!(
+        names.contains(&"Cargo.toml"),
+        "expected Cargo.toml at root, got {names:?}"
+    );
+    assert!(
+        names.contains(&"src"),
+        "expected src/ at root, got {names:?}"
+    );
+    // target/ must be skipped even if cargo built earlier.
+    assert!(!names.contains(&"target"), "target/ should be ignored");
+
+    // 3. Unknown URI → error.
+    let resp = client
+        .send_request("resources/read", Some(json!({ "uri": "workspace://nope" })))
+        .await;
+    assert!(resp.is_err(), "unknown resource should error, got {resp:?}");
+
+    Ok(())
+}
+
 fn extract_tool_text(response: &Value) -> Result<String> {
     let content = response
         .get("content")

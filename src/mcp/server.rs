@@ -289,6 +289,69 @@ impl RustAnalyzerMCPServer {
         Ok(())
     }
 
+    async fn handle_resources_read(self: &Arc<Self>, request: MCPRequest) -> MCPResponse {
+        let Some(params) = request.params else {
+            return MCPResponse::Error {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                error: MCPError {
+                    code: -32602,
+                    message: "Invalid params".to_string(),
+                    data: None,
+                },
+            };
+        };
+        let Some(uri) = params["uri"].as_str().map(|s| s.to_string()) else {
+            return MCPResponse::Error {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                error: MCPError {
+                    code: -32602,
+                    message: "Missing uri".to_string(),
+                    data: None,
+                },
+            };
+        };
+
+        let workspace_root = self.workspace_root.read().await.clone();
+
+        // Filesystem walk is sync; offload to a blocking thread so we don't
+        // stall the request reader on a large workspace.
+        let read = tokio::task::spawn_blocking(move || {
+            super::resources::read_resource(&workspace_root, &uri)
+        })
+        .await;
+
+        match read {
+            Ok(Ok(value)) => MCPResponse::Success {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: value,
+            },
+            Ok(Err(e)) => MCPResponse::Error {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                error: MCPError {
+                    code: -32602,
+                    message: e.to_string(),
+                    data: None,
+                },
+            },
+            Err(e) => {
+                error!("resources/read join error: {}", e);
+                MCPResponse::Error {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    error: MCPError {
+                        code: -32603,
+                        message: format!("Internal error: {e}"),
+                        data: None,
+                    },
+                }
+            }
+        }
+    }
+
     async fn handle_cancellation(self: Arc<Self>, params: Option<&Value>) {
         let Some(params) = params else {
             debug!("notifications/cancelled without params, ignoring");
@@ -368,7 +431,8 @@ impl RustAnalyzerMCPServer {
                         "version": "0.1.0"
                     },
                     "capabilities": {
-                        "tools": {}
+                        "tools": {},
+                        "resources": {}
                     }
                 }),
             },
@@ -377,6 +441,12 @@ impl RustAnalyzerMCPServer {
                 id: request.id,
                 result: super::tools::tools_list_result().clone(),
             },
+            "resources/list" => MCPResponse::Success {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: super::resources::list_resources(),
+            },
+            "resources/read" => self.handle_resources_read(request).await,
             "tools/call" => {
                 let Some(params) = request.params else {
                     return MCPResponse::Error {
