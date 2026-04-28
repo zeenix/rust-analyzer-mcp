@@ -334,6 +334,47 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "rust_analyzer_syntax_tree".to_string(),
+            description: "Render rust-analyzer's parsed syntax tree for a Rust file as a printed string. Without a range, returns the whole-file tree; passing all four range coords (line/character/end_line/end_character) narrows to the subtree covering that range. Useful for debugging parser behavior, macro expansion shape, attribute placement.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Optional range-start line (0-based). Provide all four range coords or none." },
+                    "character": { "type": "number", "description": "Optional range-start character (0-based)." },
+                    "end_line": { "type": "number", "description": "Optional range-end line (0-based)." },
+                    "end_character": { "type": "number", "description": "Optional range-end character (0-based)." }
+                },
+                "required": ["file_path"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_view_hir".to_string(),
+            description: "Return rust-analyzer's HIR (high-level IR) for the function or item at the given position, as a debug-printed string. Position must be inside a function body for non-null output.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_view_mir".to_string(),
+            description: "Return rust-analyzer's MIR (mid-level IR) for the function at the given position, as a debug-printed string. Position must be inside a function body for non-null output.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
             name: "rust_analyzer_add_workspace".to_string(),
             description: "Register an additional rust-analyzer workspace. Each workspace runs its own rust-analyzer subprocess and is addressed by an opaque `workspace_id`. The first registered workspace stays the default — every tool call without a `workspace_id` resolves there. Returns `{ workspace_id, root }`.".to_string(),
             input_schema: json!({

@@ -309,6 +309,58 @@ impl RustAnalyzerClient {
         )
     }
 
+    /// rust-analyzer/syntaxTree — returns the parser's view of the source as
+    /// a printed syntax tree. With `range = None`, the whole file is rendered;
+    /// with `Some((start_line, start_char, end_line, end_char))`, only the
+    /// subtree covering that range. Output is a free-form string.
+    pub async fn syntax_tree(
+        &self,
+        uri: &str,
+        range: Option<(u32, u32, u32, u32)>,
+    ) -> Result<Value> {
+        let params = match range {
+            Some((sl, sc, el, ec)) => json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": sl, "character": sc },
+                    "end":   { "line": el, "character": ec }
+                }
+            }),
+            // Field omitted (not null) so rust-analyzer treats it as
+            // "whole-file syntax tree".
+            None => json!({ "textDocument": { "uri": uri } }),
+        };
+
+        lookup_to_null(
+            self.send_request("rust-analyzer/syntaxTree", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn view_hir(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("rust-analyzer/viewHir", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn view_mir(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("rust-analyzer/viewMir", Some(params))
+                .await,
+        )
+    }
+
     pub async fn open_docs(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri },

@@ -50,6 +50,26 @@ impl ToolParams {
         Ok((line, character, end_line as u32, end_character as u32))
     }
 
+    /// Range coords are all-or-nothing: every coord set or none set. Partial
+    /// ranges (e.g. only `line`) are a tool-call error so the LLM can't
+    /// silently send an under-specified range and get back the whole-file
+    /// fallback.
+    fn extract_optional_range(args: &Value) -> Result<Option<(u32, u32, u32, u32)>> {
+        let coords = ["line", "character", "end_line", "end_character"];
+        let present: Vec<bool> = coords.iter().map(|k| args.get(*k).is_some()).collect();
+        let any = present.iter().any(|p| *p);
+        let all = present.iter().all(|p| *p);
+        if !any {
+            return Ok(None);
+        }
+        if !all {
+            return Err(anyhow!(
+                "Range is all-or-nothing: provide line, character, end_line, end_character together — or omit all four for a whole-file query"
+            ));
+        }
+        Ok(Some(Self::extract_range(args)?))
+    }
+
     fn extract_verbose(args: &Value) -> bool {
         args.get("verbose")
             .and_then(|v| v.as_bool())
@@ -241,6 +261,27 @@ pub async fn handle_tool_call(
             let (line, ch) = ToolParams::extract_position(&args)?;
             with_doc(server, &args, move |c, uri| async move {
                 c.open_docs(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_syntax_tree" => {
+            let range = ToolParams::extract_optional_range(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.syntax_tree(&uri, range).await
+            })
+            .await
+        }
+        "rust_analyzer_view_hir" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.view_hir(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_view_mir" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.view_mir(&uri, line, ch).await
             })
             .await
         }

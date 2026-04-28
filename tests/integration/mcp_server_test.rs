@@ -293,6 +293,76 @@ async fn test_phase1_tools() -> Result<()> {
     Ok(())
 }
 
+/// Phase 1.3 — Compiler-debug optionals: syntax_tree (whole file + range
+/// variant), view_hir, view_mir. Each may legitimately return null while the
+/// indexer hasn't fully primed; we just assert the shape doesn't error and
+/// that the partial-range guard fires.
+#[tokio::test]
+async fn test_phase1_3_compiler_optionals() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
+    let main_path = workspace_path.join("src/main.rs");
+    let main_str = main_path.to_str().unwrap();
+
+    // syntax_tree — whole file (no range coords). Returns a printed tree string
+    // (or null while indexing).
+    let response = client
+        .call_tool(
+            "rust_analyzer_syntax_tree",
+            json!({ "file_path": main_str }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    // syntax_tree — narrowed range over a few lines. All four coords present.
+    let response = client
+        .call_tool(
+            "rust_analyzer_syntax_tree",
+            json!({
+                "file_path": main_str,
+                "line": 0,
+                "character": 0,
+                "end_line": 5,
+                "end_character": 0
+            }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    // syntax_tree — partial range (line only) is a tool-call error: the
+    // server must refuse rather than silently fall back to whole-file.
+    let partial = client
+        .call_tool(
+            "rust_analyzer_syntax_tree",
+            json!({ "file_path": main_str, "line": 0 }),
+        )
+        .await;
+    assert!(
+        partial.is_err(),
+        "partial range must error, got {partial:?}"
+    );
+
+    // view_hir — inside `greet` body (line 11, char 8: at "{ format!(...)". String or null.
+    let response = client
+        .call_tool(
+            "rust_analyzer_view_hir",
+            json!({ "file_path": main_str, "line": 11, "character": 8 }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    // view_mir — same position. String or null.
+    let response = client
+        .call_tool(
+            "rust_analyzer_view_mir",
+            json!({ "file_path": main_str, "line": 11, "character": 8 }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    Ok(())
+}
+
 /// Phase 2 — Result-Truncation und Pagination.
 ///
 /// Wir prüfen die Output-Shape (verbose=true vs Default) und das
