@@ -166,16 +166,30 @@ impl RustAnalyzerMCPServer {
 
         let client = self.ensure_client_started().await?;
 
-        // Skip disk read entirely if rust-analyzer already has this document open.
-        if client.is_open(&uri).await {
+        // Cheapest path: open and mtime hasn't moved → skip disk entirely.
+        let mtime = tokio::fs::metadata(&absolute_path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
+
+        if client.is_open_and_fresh(&uri, mtime).await {
             return Ok(uri);
         }
 
         let content = tokio::fs::read_to_string(&absolute_path)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path, e))?;
+            .map_err(|e| anyhow!("Failed to read file {}: {}", file_path, e))?;
 
-        client.open_document(&uri, &content).await?;
+        if client.is_open(&uri).await {
+            // Already open but the file moved on disk — sync via didChange.
+            // update_document only emits a notification when the content hash
+            // actually differs.
+            client.update_document(&uri, &content, mtime).await?;
+        } else {
+            client
+                .open_document_with_mtime(&uri, &content, mtime)
+                .await?;
+        }
         Ok(uri)
     }
 

@@ -139,9 +139,10 @@ impl RustAnalyzerClient {
             Err(_) => {
                 // Fallback: return diagnostics for all open documents.
                 let mut all_diagnostics = json!({});
-                let open_docs = self.open_documents.lock().await.clone();
+                let open_uris: Vec<String> =
+                    self.open_documents.lock().await.keys().cloned().collect();
 
-                for doc_uri in open_docs.iter() {
+                for doc_uri in &open_uris {
                     if let Ok(diag) = self.diagnostics(doc_uri).await {
                         all_diagnostics[doc_uri] = diag;
                     }

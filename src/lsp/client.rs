@@ -1,14 +1,15 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
     path::PathBuf,
     process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{
     io::{AsyncWriteExt, BufWriter},
@@ -26,6 +27,18 @@ use crate::{
     protocol::lsp::LSPRequest,
 };
 
+/// Tracks state of a document opened in rust-analyzer so we can avoid
+/// redundant disk reads and emit `didChange` only when content actually
+/// differs.
+#[derive(Debug, Clone)]
+pub(super) struct OpenDocState {
+    pub(super) version: i32,
+    /// File mtime at the time we last (re-)synced. Lets us skip even hashing
+    /// when the file hasn't been touched.
+    pub(super) mtime: Option<SystemTime>,
+    pub(super) content_hash: u64,
+}
+
 /// Shared state for an LSP client. All methods take `&self` so the client can be wrapped in
 /// `Arc<RustAnalyzerClient>` and reused concurrently across spawned MCP request handlers.
 pub struct RustAnalyzerClient {
@@ -35,7 +48,7 @@ pub struct RustAnalyzerClient {
     pub(super) stdin: SharedStdin,
     pub(super) pending_requests: PendingRequests,
     pub(super) initialized: AtomicBool,
-    pub(super) open_documents: Mutex<HashSet<String>>,
+    pub(super) open_documents: Mutex<HashMap<String, OpenDocState>>,
     pub(super) diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     pub(super) progress: ProgressMap,
     /// Set by the monitor task when rust-analyzer's process has exited. The MCP
@@ -63,7 +76,7 @@ impl RustAnalyzerClient {
             stdin: Arc::new(Mutex::new(None)),
             pending_requests: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             initialized: AtomicBool::new(false),
-            open_documents: Mutex::new(HashSet::new()),
+            open_documents: Mutex::new(HashMap::new()),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             progress: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             process_died: Arc::new(AtomicBool::new(false)),
@@ -396,15 +409,85 @@ impl RustAnalyzerClient {
     }
 
     pub async fn is_open(&self, uri: &str) -> bool {
-        self.open_documents.lock().await.contains(uri)
+        self.open_documents.lock().await.contains_key(uri)
+    }
+
+    /// Cheap freshness check: returns true if the document is open *and* the
+    /// caller's mtime matches what we have on file. Lets the server skip even
+    /// reading the file from disk when nothing has changed.
+    pub async fn is_open_and_fresh(&self, uri: &str, mtime: Option<SystemTime>) -> bool {
+        match self.open_documents.lock().await.get(uri) {
+            Some(state) => match (state.mtime, mtime) {
+                (Some(stored), Some(observed)) => stored == observed,
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Sync `content` to rust-analyzer if it differs from what we last sent.
+    /// Sends `textDocument/didChange` (full-text variant) when the content
+    /// hash changes, otherwise just refreshes the recorded mtime so future
+    /// freshness checks short-circuit. Caller must already have established
+    /// that the document is open.
+    pub async fn update_document(
+        &self,
+        uri: &str,
+        content: &str,
+        mtime: Option<SystemTime>,
+    ) -> Result<()> {
+        let new_hash = hash_content(content);
+
+        let mut open_docs = self.open_documents.lock().await;
+        let Some(state) = open_docs.get_mut(uri) else {
+            // Lost open state somehow — fall back to opening fresh.
+            drop(open_docs);
+            return self.open_document(uri, content).await;
+        };
+
+        if state.content_hash == new_hash {
+            // No textual change; just record the new mtime so we can skip the
+            // disk read next time.
+            state.mtime = mtime;
+            return Ok(());
+        }
+
+        let new_version = state.version.saturating_add(1);
+        state.version = new_version;
+        state.content_hash = new_hash;
+        state.mtime = mtime;
+        drop(open_docs);
+
+        // Old diagnostics are now stale for this content.
+        self.diagnostics.lock().await.remove(uri);
+
+        info!("Updating document {} to version {}", uri, new_version);
+        let params = json!({
+            "textDocument": { "uri": uri, "version": new_version },
+            "contentChanges": [ { "text": content } ]
+        });
+        self.send_notification("textDocument/didChange", Some(params))
+            .await?;
+        Ok(())
     }
 
     pub async fn open_document(&self, uri: &str, content: &str) -> Result<()> {
+        self.open_document_with_mtime(uri, content, None).await
+    }
+
+    /// Variant of `open_document` that records the file's mtime so subsequent
+    /// freshness checks can short-circuit before reading from disk.
+    pub async fn open_document_with_mtime(
+        &self,
+        uri: &str,
+        content: &str,
+        mtime: Option<SystemTime>,
+    ) -> Result<()> {
         // Hold the open_documents lock across the didOpen send so check-then-insert is atomic
         // per-URI. Concurrent callers for the same URI either bail out early ("already open")
         // or wait their turn here.
         let mut open_docs = self.open_documents.lock().await;
-        if open_docs.contains(uri) {
+        if open_docs.contains_key(uri) {
             info!("Document already open: {}", uri);
             return Ok(());
         }
@@ -424,7 +507,14 @@ impl RustAnalyzerClient {
         self.send_notification("textDocument/didOpen", Some(params))
             .await?;
 
-        open_docs.insert(uri.to_string());
+        open_docs.insert(
+            uri.to_string(),
+            OpenDocState {
+                version: 1,
+                mtime,
+                content_hash: hash_content(content),
+            },
+        );
         drop(open_docs);
 
         // Send didSave to trigger cargo check.
@@ -471,6 +561,12 @@ impl RustAnalyzerClient {
         self.diagnostics.lock().await.clear();
         Ok(())
     }
+}
+
+fn hash_content(content: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn find_rust_analyzer() -> Result<PathBuf> {
