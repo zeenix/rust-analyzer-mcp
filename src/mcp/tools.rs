@@ -394,6 +394,18 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
             position_schema(),
         ),
         tool(
+            "rust_analyzer_move_file",
+            "Move a file or directory inside the workspace, fixing up `mod`-declarations and `use`-imports along the way. Sequence: rust-analyzer computes the WorkspaceEdit via workspace/willRenameFiles, the server applies that edit on disk, then physically renames the file. Returns { moved: { from, to }, edits: { files_changed: [{ uri, edits_applied }], total_edits } }. Both paths are relative to the workspace root unless absolute; both must stay inside the workspace. Fails if the destination already exists.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Source path (relative to workspace root or absolute)." },
+                    "to": { "type": "string", "description": "Destination path (relative to workspace root or absolute). Parent directories are created if missing." }
+                },
+                "required": ["from", "to"]
+            }),
+        ),
+        tool(
             "rust_analyzer_add_workspace",
             "Register an additional rust-analyzer workspace. Each workspace runs its own rust-analyzer subprocess and is addressed by an opaque `workspace_id`. The first registered workspace stays the default — every tool call without a `workspace_id` resolves there. Returns `{ workspace_id, root }`.",
             json!({

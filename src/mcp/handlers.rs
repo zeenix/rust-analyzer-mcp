@@ -21,6 +21,7 @@ use super::{
         WORKSPACE_DIAGNOSTICS_DEFAULT_LIMIT, WORKSPACE_SYMBOL_DEFAULT_LIMIT,
     },
     workspace::WorkspaceEntry,
+    workspace_edit::apply_workspace_edit,
 };
 
 /// Tool-argument extractors. Each one validates a single named argument and
@@ -339,6 +340,7 @@ pub async fn handle_tool_call(
         "rust_analyzer_type_hierarchy" => handle_type_hierarchy(server, args).await,
         "rust_analyzer_impact" => handle_impact(server, args).await,
         "rust_analyzer_get_type_by_name" => handle_get_type_by_name(server, args).await,
+        "rust_analyzer_move_file" => handle_move_file(server, args).await,
         "rust_analyzer_add_workspace" => handle_add_workspace(server, args).await,
         "rust_analyzer_remove_workspace" => handle_remove_workspace(server, args).await,
         "rust_analyzer_list_workspaces" => handle_list_workspaces(server, args).await,
@@ -577,6 +579,107 @@ async fn primary_detail(
 /// second argument wins, so the workspace root is harmless filler).
 fn uri_to_path_for_open(uri: &str) -> Option<String> {
     uri.strip_prefix("file://").map(str::to_string)
+}
+
+/// Move a file or directory inside the workspace, fixing up `mod`-decls and
+/// `use`-imports along the way. Sequence: (1) ask rust-analyzer for the
+/// `WorkspaceEdit` via `workspace/willRenameFiles`, (2) apply that edit on
+/// disk, (3) physically rename the file, (4) drop the old URI from
+/// rust-analyzer's open-doc state and any modified files so the next tool
+/// call sees fresh content.
+async fn handle_move_file(server: &Arc<RustAnalyzerMCPServer>, args: Value) -> Result<ToolResult> {
+    let from = args["from"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Missing from"))?
+        .to_string();
+    let to = args["to"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Missing to"))?
+        .to_string();
+    if from.is_empty() || to.is_empty() {
+        return Err(anyhow!("from and to must be non-empty"));
+    }
+
+    let ws = server.resolve_workspace(&args).await?;
+    let workspace_root = ws.root_clone();
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.clone());
+
+    let from_abs = resolve_under_workspace(&workspace_root, &from);
+    let to_abs = resolve_under_workspace(&workspace_root, &to);
+
+    if !from_abs.exists() {
+        return Err(anyhow!("Source path does not exist: {}", from));
+    }
+    if to_abs.exists() {
+        return Err(anyhow!("Destination already exists: {}", to));
+    }
+
+    // Both endpoints must stay inside the workspace; we never want
+    // willRenameFiles or the physical mv to escape.
+    let from_canon = from_abs.canonicalize().unwrap_or_else(|_| from_abs.clone());
+    if !from_canon.starts_with(&canonical_root) {
+        return Err(anyhow!("Source must be inside the workspace: {}", from));
+    }
+    // For `to_abs` we can't canonicalize (doesn't exist yet); compare its parent.
+    let to_parent = to_abs
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| to_abs.clone());
+    let to_parent_canon = to_parent
+        .canonicalize()
+        .unwrap_or_else(|_| to_parent.clone());
+    if !to_parent_canon.starts_with(&canonical_root) {
+        return Err(anyhow!("Destination must be inside the workspace: {}", to));
+    }
+
+    let from_uri = format!("file://{}", from_canon.display());
+    let to_uri = format!("file://{}", to_abs.display());
+
+    // Ensure rust-analyzer is up so it can compute the edit. We don't need to
+    // didOpen the moving file — willRenameFiles is workspace-level.
+    let client = ws.ensure_client_started().await?;
+    let edit = client.will_rename_files(&from_uri, &to_uri).await?;
+
+    let report = if edit.is_null() {
+        super::workspace_edit::ApplyReport::default()
+    } else {
+        apply_workspace_edit(&edit, &canonical_root)?
+    };
+
+    if let Some(parent) = to_abs.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("Failed to create destination dir: {}", e))?;
+    }
+    std::fs::rename(&from_canon, &to_abs)
+        .map_err(|e| anyhow!("Failed to rename {} → {}: {}", from, to, e))?;
+
+    // Refresh rust-analyzer's view: drop the old URI plus every modified URI
+    // so the next tool call reloads fresh content from disk.
+    let _ = client.close_document(&from_uri).await;
+    for entry in &report.files {
+        let _ = client.close_document(&entry.uri).await;
+    }
+
+    wrap(json!({
+        "moved": { "from": from, "to": to },
+        "edits": {
+            "files_changed": report.files,
+            "total_edits": report.total_edits,
+        }
+    }))
+}
+
+/// Resolve a tool-supplied path against the workspace root. Absolute paths are
+/// kept; relative paths are joined to `workspace_root`.
+fn resolve_under_workspace(workspace_root: &Path, p: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(p);
+    if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    }
 }
 
 /// Composite that estimates the blast radius of changing a symbol. Fans out

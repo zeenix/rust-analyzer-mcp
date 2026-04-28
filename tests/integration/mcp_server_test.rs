@@ -1325,6 +1325,137 @@ async fn test_phase3_multi_workspace_resources() -> Result<()> {
     Ok(())
 }
 
+/// ANALYSIS §5.1 — `move_file` does the willRenameFiles → apply → physical
+/// rename dance in one shot. Verifies that `pub mod utils;` in lib.rs gets
+/// rewritten to point at the new module name and that the source file moves
+/// to its new location.
+#[tokio::test]
+async fn test_move_file_renames_module() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    let project = test_support::IsolatedProject::new()?;
+    let add_resp = client
+        .call_tool(
+            "rust_analyzer_add_workspace",
+            json!({ "path": project.path().to_str().unwrap() }),
+        )
+        .await?;
+    let added: Value = serde_json::from_str(&extract_tool_text(&add_resp)?)?;
+    let ws_id = added["workspace_id"]
+        .as_str()
+        .expect("workspace_id present")
+        .to_string();
+
+    // Warm up: opening lib.rs in the new workspace blocks until rust-analyzer
+    // has finished priming its symbol cache, so the willRenameFiles edits will
+    // actually be populated rather than empty.
+    let lib_path = project.file_path("src/lib.rs");
+    let _ = client
+        .call_tool(
+            "rust_analyzer_symbols",
+            json!({
+                "file_path": lib_path.to_str().unwrap(),
+                "workspace_id": ws_id,
+            }),
+        )
+        .await?;
+
+    let move_resp = client
+        .call_tool(
+            "rust_analyzer_move_file",
+            json!({
+                "from": "src/utils.rs",
+                "to": "src/helpers.rs",
+                "workspace_id": ws_id,
+            }),
+        )
+        .await?;
+    let moved: Value = serde_json::from_str(&extract_tool_text(&move_resp)?)?;
+    assert_eq!(moved["moved"]["from"], "src/utils.rs");
+    assert_eq!(moved["moved"]["to"], "src/helpers.rs");
+    assert!(moved["edits"]["files_changed"].is_array());
+    assert!(moved["edits"]["total_edits"].is_u64());
+
+    // Physical move happened.
+    assert!(
+        project.file_path("src/helpers.rs").exists(),
+        "destination should exist after move"
+    );
+    assert!(
+        !project.file_path("src/utils.rs").exists(),
+        "source should be gone after move"
+    );
+
+    // lib.rs imports updated. rust-analyzer's willRenameFiles rewrites
+    // `pub mod utils;` to `pub mod helpers;` and the `pub use utils::process;`
+    // re-export to follow.
+    let lib = std::fs::read_to_string(project.file_path("src/lib.rs"))?;
+    assert!(
+        lib.contains("pub mod helpers"),
+        "lib.rs should declare the new module name; got: {lib}"
+    );
+    assert!(
+        !lib.contains("pub mod utils"),
+        "lib.rs should no longer declare the old module name; got: {lib}"
+    );
+
+    // Cleanup so the shared daemon isn't left with extra workspaces.
+    client
+        .call_tool(
+            "rust_analyzer_remove_workspace",
+            json!({ "workspace_id": ws_id }),
+        )
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_move_file_rejects_existing_destination() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    let project = test_support::IsolatedProject::new()?;
+    let add_resp = client
+        .call_tool(
+            "rust_analyzer_add_workspace",
+            json!({ "path": project.path().to_str().unwrap() }),
+        )
+        .await?;
+    let added: Value = serde_json::from_str(&extract_tool_text(&add_resp)?)?;
+    let ws_id = added["workspace_id"].as_str().unwrap().to_string();
+
+    // Both files already exist — moving onto an existing path must fail
+    // before any disk mutation.
+    let result = client
+        .call_tool(
+            "rust_analyzer_move_file",
+            json!({
+                "from": "src/utils.rs",
+                "to": "src/types.rs",
+                "workspace_id": ws_id,
+            }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "move onto existing destination should fail, got {result:?}"
+    );
+
+    assert!(
+        project.file_path("src/utils.rs").exists(),
+        "source must still exist after rejected move"
+    );
+
+    client
+        .call_tool(
+            "rust_analyzer_remove_workspace",
+            json!({ "workspace_id": ws_id }),
+        )
+        .await?;
+
+    Ok(())
+}
+
 fn extract_tool_text(response: &Value) -> Result<String> {
     let content = response
         .get("content")

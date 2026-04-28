@@ -415,6 +415,9 @@ impl RustAnalyzerClient {
                     },
                     "symbol": {
                         "dynamicRegistration": false
+                    },
+                    "fileOperations": {
+                        "willRename": true
                     }
                 },
                 "window": {
@@ -607,6 +610,23 @@ impl RustAnalyzerClient {
             )
             .await;
 
+        Ok(())
+    }
+
+    /// Send `textDocument/didClose` and forget the document. No-op if the
+    /// URI was not open. Used after a file move so rust-analyzer drops its
+    /// stale view of the old path.
+    pub async fn close_document(&self, uri: &str) -> Result<()> {
+        let removed = self.open_documents.lock().await.remove(uri).is_some();
+        if !removed {
+            return Ok(());
+        }
+        self.diagnostics.lock().await.remove(uri);
+        let params = json!({
+            "textDocument": { "uri": uri }
+        });
+        self.send_notification("textDocument/didClose", Some(params))
+            .await?;
         Ok(())
     }
 

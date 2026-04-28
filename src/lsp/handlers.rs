@@ -180,6 +180,20 @@ impl RustAnalyzerClient {
         rename_lookup_to_null(self.send_request("textDocument/rename", Some(params)).await)
     }
 
+    /// `workspace/willRenameFiles` — ask rust-analyzer to compute the
+    /// `WorkspaceEdit` (mod-decl/import fixes) that should accompany a file
+    /// rename. The actual physical rename is the caller's responsibility.
+    /// Returns the edit, or `null` if rust-analyzer has no changes to suggest.
+    pub async fn will_rename_files(&self, old_uri: &str, new_uri: &str) -> Result<Value> {
+        let params = json!({
+            "files": [{ "oldUri": old_uri, "newUri": new_uri }]
+        });
+        lookup_to_null(
+            self.send_request("workspace/willRenameFiles", Some(params))
+                .await,
+        )
+    }
+
     pub async fn prepare_rename(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri },
