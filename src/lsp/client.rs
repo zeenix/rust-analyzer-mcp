@@ -350,6 +350,12 @@ impl RustAnalyzerClient {
                     "definition": {
                         "linkSupport": true
                     },
+                    "typeDefinition": {
+                        "linkSupport": true
+                    },
+                    "implementation": {
+                        "linkSupport": true
+                    },
                     "references": {},
                     "documentSymbol": {},
                     "codeAction": {

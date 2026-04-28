@@ -216,6 +216,83 @@ async fn test_new_lsp_tools() -> Result<()> {
     Ok(())
 }
 
+/// Phase 1 tools: typeDefinition, implementation, expandMacro, parentModule,
+/// runnables, relatedTests, openDocs. We don't pin specific responses (some
+/// of these depend on rust-analyzer's indexing state being fully ready);
+/// instead we assert that each tool returns *something* — either a meaningful
+/// payload or null — without raising an MCP error.
+#[tokio::test]
+async fn test_phase1_tools() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
+    let main_path = workspace_path.join("src/main.rs");
+    let main_str = main_path.to_str().unwrap();
+
+    // typeDefinition — on `calc` (line 5, char 8 == binding name) or wherever
+    // is in scope. Either a Location/Location[] or null.
+    let response = client
+        .call_tool(
+            "rust_analyzer_type_definition",
+            json!({ "file_path": main_str, "line": 5, "character": 8 }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    // implementation — on `Calculator` struct identifier (line 17, char 7).
+    let response = client
+        .call_tool(
+            "rust_analyzer_implementation",
+            json!({ "file_path": main_str, "line": 17, "character": 7 }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    // expand_macro — on the `println!` invocation (line 2, char 4).
+    let response = client
+        .call_tool(
+            "rust_analyzer_expand_macro",
+            json!({ "file_path": main_str, "line": 2, "character": 4 }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    // parent_module — anywhere in the file (line 0, char 0).
+    let response = client
+        .call_tool(
+            "rust_analyzer_parent_module",
+            json!({ "file_path": main_str, "line": 0, "character": 0 }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    // runnables — the whole file. With no position we should get every
+    // runnable in main.rs (the `tests` module has at least two #[test]s).
+    let response = client
+        .call_tool("rust_analyzer_runnables", json!({ "file_path": main_str }))
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    // related_tests — on `greet` (line 14, char 3).
+    let response = client
+        .call_tool(
+            "rust_analyzer_related_tests",
+            json!({ "file_path": main_str, "line": 14, "character": 3 }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    // open_docs — on `Calculator` (line 17, char 7). Returns docs URLs or null.
+    let response = client
+        .call_tool(
+            "rust_analyzer_open_docs",
+            json!({ "file_path": main_str, "line": 17, "character": 7 }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?;
+
+    Ok(())
+}
+
 fn extract_tool_text(response: &Value) -> Result<String> {
     let content = response
         .get("content")

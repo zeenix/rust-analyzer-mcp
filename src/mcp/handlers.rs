@@ -160,6 +160,55 @@ pub async fn handle_tool_call(
         "rust_analyzer_set_workspace" => handle_set_workspace(server, args).await,
         "rust_analyzer_diagnostics" => handle_diagnostics(server, args).await,
         "rust_analyzer_workspace_diagnostics" => handle_workspace_diagnostics(server, args).await,
+        "rust_analyzer_type_definition" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.type_definition(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_implementation" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.implementation(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_expand_macro" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.expand_macro(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_parent_module" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.parent_module(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_runnables" => {
+            let position = ToolParams::extract_position(&args).ok();
+            with_doc(server, &args, move |c, uri| async move {
+                c.runnables(&uri, position).await
+            })
+            .await
+        }
+        "rust_analyzer_related_tests" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.related_tests(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_open_docs" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.open_docs(&uri, line, ch).await
+            })
+            .await
+        }
         _ => Err(anyhow!("Unknown tool: {}", tool_name)),
     }
 }

@@ -229,6 +229,98 @@ impl RustAnalyzerClient {
         lookup_to_null(self.send_request("workspace/symbol", Some(params)).await)
     }
 
+    pub async fn type_definition(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("textDocument/typeDefinition", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn implementation(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("textDocument/implementation", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn expand_macro(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("rust-analyzer/expandMacro", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn parent_module(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("experimental/parentModule", Some(params))
+                .await,
+        )
+    }
+
+    /// experimental/runnables — list testable / runnable items in a file.
+    /// `position` is optional: when `None`, every runnable in the file is
+    /// returned; when `Some`, only runnables whose range covers the position.
+    pub async fn runnables(&self, uri: &str, position: Option<(u32, u32)>) -> Result<Value> {
+        let params = match position {
+            Some((line, character)) => json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }),
+            // Field omitted (not null) so rust-analyzer treats it as
+            // "all runnables in file" rather than "no position given".
+            None => json!({ "textDocument": { "uri": uri } }),
+        };
+
+        lookup_to_null(
+            self.send_request("experimental/runnables", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn related_tests(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("rust-analyzer/relatedTests", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn open_docs(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("experimental/externalDocs", Some(params))
+                .await,
+        )
+    }
+
     pub async fn code_actions(
         &self,
         uri: &str,

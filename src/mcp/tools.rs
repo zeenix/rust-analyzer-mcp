@@ -198,5 +198,96 @@ fn build_tools() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
         },
+        ToolDefinition {
+            name: "rust_analyzer_type_definition".to_string(),
+            description: "Go to the type definition of a symbol (e.g. for a binding `let x: Foo = ...`, jumps to `Foo`).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_implementation".to_string(),
+            description: "Find implementations of a trait, or the trait/struct items at a given position. Returns the locations of `impl` blocks.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_expand_macro".to_string(),
+            description: "Expand the macro invocation at the given position and return the resulting source. Useful for understanding `derive`, `format!`, custom proc-macros, etc.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_parent_module".to_string(),
+            description: "Locate the parent module(s) of the file or module item at a given position. Returns one or more `Location`s pointing to the `mod foo;` declarations.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_runnables".to_string(),
+            description: "List the runnable items (tests, benchmarks, binaries, doctests) in a file. Provide `line`/`character` to limit the result to runnables at that position.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Optional line number (0-based) to limit runnables to a specific position" },
+                    "character": { "type": "number", "description": "Optional character position (0-based)" }
+                },
+                "required": ["file_path"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_related_tests".to_string(),
+            description: "Find tests related to the function or item at the given position — typically the tests that exercise that code.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_open_docs".to_string(),
+            description: "Resolve the documentation URL (typically docs.rs) for the symbol at the given position. Returns local and/or web URLs, or null if no docs are known.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
     ]
 }
