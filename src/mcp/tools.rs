@@ -222,12 +222,12 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
         ),
         tool(
             "rust_analyzer_diagnostics",
-            "Get compiler diagnostics (errors, warnings, hints) for a Rust file. Each diagnostic carries the LSP fields plus rust-analyzer extensions: `data.rendered` (the cargo-formatted error block with ASCII pointers — read this first when fixing a bug), `codeDescription.href` (link to the error-index doc page), and `tags` (LSP DiagnosticTag, e.g. [1] for unused code). Fields are null when upstream omits them.",
+            "Get compiler diagnostics (errors, warnings, hints) for a Rust file. Each diagnostic carries the LSP fields plus rust-analyzer extensions: `data.rendered` (the cargo-formatted error block with ASCII pointers — read this first when fixing a bug), `codeDescription.href` (link to the error-index doc page), and `tags` (LSP DiagnosticTag, e.g. [1] for unused code). Fields are null when upstream omits them. The diagnostics reflect rust-analyzer's view of the file; if the file was edited outside rust-analyzer (e.g. via the Edit tool or git checkout) the response may be stale — open the file via any positional tool first (a `symbols` call is cheapest), or run `cargo check` for ground truth.",
             file_only_schema(),
         ),
         tool(
             "rust_analyzer_workspace_diagnostics",
-            "Get all compiler diagnostics across the entire workspace. Files are paginated (default 50 files per page); the response includes { workspace, files, summary, pagination: { total_files, returned_files, next_cursor? } }. Use cursor for next page, limit to override, or verbose=true for all files (capped at 1000). The `summary` totals always cover the whole workspace, not just the page.",
+            "Get all compiler diagnostics across the entire workspace. Files are paginated (default 50 files per page); the response includes { workspace, files, summary, pagination: { total_files, returned_files, next_cursor? } }. Use cursor for next page, limit to override, or verbose=true for all files (capped at 1000). The `summary` totals always cover the whole workspace, not just the page. Reflects rust-analyzer's in-memory state — files edited outside rust-analyzer (Edit tool, git operations, format-on-save in another editor) may not be re-analysed until they're explicitly opened. If a `cargo check` finds errors that don't surface here, that mismatch is the cause; treat `cargo check` as the ground truth after any external edit.",
             json!({
                 "type": "object",
                 "properties": {
