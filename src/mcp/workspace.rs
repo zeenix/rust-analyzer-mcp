@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Result};
+use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -13,6 +14,12 @@ use crate::{
     lsp::RustAnalyzerClient,
     util::canonicalize_path,
 };
+
+/// `cargo metadata` is run once per `WorkspaceEntry` and reused for up to
+/// `METADATA_TTL`. The cache is also keyed on the mtimes of `Cargo.toml` and
+/// `Cargo.lock` so an edit-and-rerun loop sees fresh data immediately, not
+/// after the TTL expires.
+const METADATA_TTL: Duration = Duration::from_secs(30);
 
 /// One isolated rust-analyzer workspace. Owns its own subprocess (lazy), its
 /// own restart-rate-limit window, and its own root path. Multiple entries live
@@ -28,6 +35,14 @@ pub(super) struct WorkspaceEntry {
     /// Timestamps of recent automatic restarts, oldest first. Used to back off
     /// when rust-analyzer keeps crashing (see `MAX_RESTART_COUNT`).
     restart_history: parking_lot::Mutex<VecDeque<Instant>>,
+    metadata_cache: parking_lot::Mutex<Option<CachedMetadata>>,
+}
+
+struct CachedMetadata {
+    stored_at: Instant,
+    cargo_toml_mtime: Option<SystemTime>,
+    cargo_lock_mtime: Option<SystemTime>,
+    value: Value,
 }
 
 impl WorkspaceEntry {
@@ -37,6 +52,7 @@ impl WorkspaceEntry {
             root: parking_lot::RwLock::new(canonicalize_path(root)),
             client: RwLock::new(None),
             restart_history: parking_lot::Mutex::new(VecDeque::new()),
+            metadata_cache: parking_lot::Mutex::new(None),
         }
     }
 
@@ -153,6 +169,7 @@ impl WorkspaceEntry {
             let _ = c.shutdown().await;
         }
         *self.root.write() = canonicalize_path(new_root);
+        self.invalidate_metadata_cache();
     }
 
     /// Tear down the client (if running). Used when removing a workspace from
@@ -161,6 +178,44 @@ impl WorkspaceEntry {
         if let Some(c) = self.client.write().await.take() {
             let _ = c.shutdown().await;
         }
+        self.invalidate_metadata_cache();
+    }
+
+    /// Cached `cargo metadata --no-deps`. Returns the JSON returned by cargo on
+    /// success; `None` if cargo failed (e.g. the workspace root is not a Cargo
+    /// project). Cache is invalidated by TTL or by an mtime change on
+    /// `Cargo.toml`/`Cargo.lock`. Synchronous because callers run inside
+    /// `spawn_blocking`.
+    pub fn cargo_metadata(&self) -> Option<Value> {
+        let root = self.root.read().clone();
+        let cargo_toml_mtime = mtime_of(&root.join("Cargo.toml"));
+        let cargo_lock_mtime = mtime_of(&root.join("Cargo.lock"));
+
+        {
+            let guard = self.metadata_cache.lock();
+            if let Some(c) = guard.as_ref() {
+                if c.stored_at.elapsed() < METADATA_TTL
+                    && c.cargo_toml_mtime == cargo_toml_mtime
+                    && c.cargo_lock_mtime == cargo_lock_mtime
+                {
+                    return Some(c.value.clone());
+                }
+            }
+        }
+
+        let value = run_cargo_metadata(&root)?;
+        let mut guard = self.metadata_cache.lock();
+        *guard = Some(CachedMetadata {
+            stored_at: Instant::now(),
+            cargo_toml_mtime,
+            cargo_lock_mtime,
+            value: value.clone(),
+        });
+        Some(value)
+    }
+
+    pub fn invalidate_metadata_cache(&self) {
+        *self.metadata_cache.lock() = None;
     }
 
     /// Records a restart attempt; errors out if too many crashes happened
@@ -185,6 +240,22 @@ impl WorkspaceEntry {
         hist.push_back(now);
         Ok(())
     }
+}
+
+fn mtime_of(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+pub(super) fn run_cargo_metadata(workspace_root: &Path) -> Option<Value> {
+    let output = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(workspace_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Owns every `WorkspaceEntry` for the server. The first inserted entry is the
@@ -238,5 +309,94 @@ impl WorkspaceRegistry {
             .iter()
             .filter_map(|id| self.by_id.get(id).cloned())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_cargo_toml(root: &Path, name: &str) {
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+    }
+
+    fn make_workspace(dir: &TempDir, name: &str) -> WorkspaceEntry {
+        write_cargo_toml(dir.path(), name);
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "// empty\n").unwrap();
+        WorkspaceEntry::new("ws-test".to_string(), dir.path().to_path_buf())
+    }
+
+    #[test]
+    fn metadata_cache_populates_on_first_call_and_clears_on_invalidate() {
+        let dir = TempDir::new().unwrap();
+        let entry = make_workspace(&dir, "demo");
+
+        assert!(
+            entry.metadata_cache.lock().is_none(),
+            "cache empty before first call"
+        );
+
+        let first = entry.cargo_metadata().expect("cargo metadata succeeds");
+        assert_eq!(first["packages"][0]["name"], "demo");
+        assert!(
+            entry.metadata_cache.lock().is_some(),
+            "cache populated after first call"
+        );
+
+        entry.invalidate_metadata_cache();
+        assert!(
+            entry.metadata_cache.lock().is_none(),
+            "cache empty after manual invalidate"
+        );
+
+        let second = entry
+            .cargo_metadata()
+            .expect("cargo metadata succeeds again");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn metadata_cache_invalidates_on_cargo_toml_mtime_change() {
+        let dir = TempDir::new().unwrap();
+        let entry = make_workspace(&dir, "demo");
+
+        let first = entry.cargo_metadata().expect("first metadata");
+        assert_eq!(first["packages"][0]["name"], "demo");
+
+        // Bump mtime by writing a new Cargo.toml after a small sleep so the
+        // filesystem timestamp definitely changes.
+        std::thread::sleep(Duration::from_millis(20));
+        write_cargo_toml(dir.path(), "demo2");
+
+        let second = entry.cargo_metadata().expect("second metadata");
+        assert_eq!(
+            second["packages"][0]["name"], "demo2",
+            "cache must drop the stale metadata after mtime change"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_root_invalidates_metadata_cache() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let entry = make_workspace(&dir_a, "alpha");
+        write_cargo_toml(dir_b.path(), "beta");
+        fs::create_dir_all(dir_b.path().join("src")).unwrap();
+        fs::write(dir_b.path().join("src/lib.rs"), "// empty\n").unwrap();
+
+        let first = entry.cargo_metadata().expect("alpha metadata");
+        assert_eq!(first["packages"][0]["name"], "alpha");
+
+        entry.replace_root(dir_b.path().to_path_buf()).await;
+
+        let second = entry.cargo_metadata().expect("beta metadata");
+        assert_eq!(second["packages"][0]["name"], "beta");
     }
 }

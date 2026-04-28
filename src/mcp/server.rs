@@ -201,33 +201,35 @@ impl RustAnalyzerMCPServer {
     }
 
     async fn handle_resources_list(self: &Arc<Self>, request: MCPRequest) -> MCPResponse {
-        // Snapshot every workspace's id + root, then run cargo metadata + the
-        // file-tree advert for each one off-thread. Default workspace
-        // additionally gets unprefixed aliases (`workspace://files`, etc.) for
-        // backward compatibility with single-workspace clients.
+        // Snapshot every workspace, then run cargo metadata + the file-tree
+        // advert for each one off-thread. Default workspace additionally gets
+        // unprefixed aliases (`workspace://files`, etc.) for backward
+        // compatibility with single-workspace clients.
         let entries = self.workspaces.read().await.list();
-        let snapshots: Vec<(String, PathBuf, bool)> = entries
-            .iter()
+        let snapshots: Vec<(Arc<WorkspaceEntry>, bool)> = entries
+            .into_iter()
             .enumerate()
-            .map(|(i, e)| (e.id().to_string(), e.root_clone(), i == 0))
+            .map(|(i, e)| (e, i == 0))
             .collect();
 
         let listed = tokio::task::spawn_blocking(move || {
             let mut all = Vec::new();
-            for (id, root, is_default) in snapshots {
-                let raw = super::resources::list_resources(&root);
+            for (entry, is_default) in snapshots {
+                let id = entry.id().to_string();
+                let root = entry.root_clone();
+                let raw = super::resources::list_resources(&root, &|| entry.cargo_metadata());
                 let Some(resources) = raw["resources"].as_array() else {
                     continue;
                 };
                 for resource in resources {
                     let original = resource["uri"].as_str().unwrap_or("").to_string();
                     let prefixed = prefix_workspace_uri(&original, &id);
-                    let mut entry = resource.clone();
-                    entry["uri"] = json!(prefixed);
-                    if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
-                        entry["name"] = json!(format!("[{id}] {name}"));
+                    let mut item = resource.clone();
+                    item["uri"] = json!(prefixed);
+                    if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                        item["name"] = json!(format!("[{id}] {name}"));
                     }
-                    all.push(entry);
+                    all.push(item);
 
                     if is_default {
                         // Backward-compat alias on the default workspace.
@@ -268,7 +270,7 @@ impl RustAnalyzerMCPServer {
             let registry = self.workspaces.read().await;
             resolve_resource_uri(&uri, &registry)
         };
-        let (workspace_root, read_uri) = match resolved {
+        let (entry, read_uri) = match resolved {
             Some(pair) => pair,
             None => {
                 return MCPResponse::error(
@@ -278,12 +280,13 @@ impl RustAnalyzerMCPServer {
                 );
             }
         };
+        let workspace_root = entry.root_clone();
 
         // Filesystem walk is sync; offload to a blocking thread so we don't
         // stall the request reader on a large workspace.
         let uri_changed = read_uri != uri;
         let read = tokio::task::spawn_blocking(move || {
-            super::resources::read_resource(&workspace_root, &read_uri)
+            super::resources::read_resource(&workspace_root, &read_uri, &|| entry.cargo_metadata())
         })
         .await;
 
@@ -468,21 +471,24 @@ fn prefix_workspace_uri(uri: &str, id: &str) -> String {
 /// "normalized" form that `resources::read_resource` understands (without the
 /// id segment). Returns `None` if the registry is empty.
 ///
-/// - `workspace://<id>/<rest>` → look up `<id>` in the registry; if it exists, return `(root,
+/// - `workspace://<id>/<rest>` → look up `<id>` in the registry; if it exists, return `(entry,
 ///   "workspace://<rest>")`.
 /// - Any other `workspace://...` URI (including legacy unprefixed paths like
 ///   `workspace://crate/foo/Cargo.toml`) → falls through to the default workspace, URI passed
 ///   through unchanged.
-fn resolve_resource_uri(uri: &str, registry: &WorkspaceRegistry) -> Option<(PathBuf, String)> {
+fn resolve_resource_uri(
+    uri: &str,
+    registry: &WorkspaceRegistry,
+) -> Option<(Arc<WorkspaceEntry>, String)> {
     if let Some(rest) = uri.strip_prefix("workspace://") {
         if let Some((maybe_id, suffix)) = rest.split_once('/') {
             if let Some(ws) = registry.get(maybe_id) {
-                return Some((ws.root_clone(), format!("workspace://{suffix}")));
+                return Some((ws, format!("workspace://{suffix}")));
             }
         }
     }
     let default = registry.default()?;
-    Some((default.root_clone(), uri.to_string()))
+    Some((default, uri.to_string()))
 }
 
 /// Canonicalises a JSON-RPC request id (string, number, or null) into a stable

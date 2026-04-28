@@ -28,7 +28,7 @@ const IGNORED_DIRS: &[&str] = &[
     ".direnv",
 ];
 
-pub fn list_resources(workspace_root: &Path) -> Value {
+pub fn list_resources(_workspace_root: &Path, fetch_metadata: &dyn Fn() -> Option<Value>) -> Value {
     let mut resources = vec![json!({
         "uri": FILES_URI,
         "name": "Workspace files",
@@ -36,7 +36,7 @@ pub fn list_resources(workspace_root: &Path) -> Value {
         "mimeType": "application/json",
     })];
 
-    if let Some(metadata) = cargo_metadata(workspace_root) {
+    if let Some(metadata) = fetch_metadata() {
         resources.push(json!({
             "uri": CRATES_URI,
             "name": "Workspace crates",
@@ -62,7 +62,11 @@ pub fn list_resources(workspace_root: &Path) -> Value {
     json!({ "resources": resources })
 }
 
-pub fn read_resource(workspace_root: &Path, uri: &str) -> Result<Value> {
+pub fn read_resource(
+    workspace_root: &Path,
+    uri: &str,
+    fetch_metadata: &dyn Fn() -> Option<Value>,
+) -> Result<Value> {
     if uri == FILES_URI {
         let tree = build_file_tree(workspace_root);
         return Ok(json!({
@@ -75,7 +79,7 @@ pub fn read_resource(workspace_root: &Path, uri: &str) -> Result<Value> {
     }
 
     if uri == CRATES_URI {
-        let metadata = cargo_metadata(workspace_root).ok_or_else(|| {
+        let metadata = fetch_metadata().ok_or_else(|| {
             anyhow!("cargo metadata failed (workspace root is not a Cargo workspace?)")
         })?;
         let summary = reshape_metadata(&metadata);
@@ -95,8 +99,7 @@ pub fn read_resource(workspace_root: &Path, uri: &str) -> Result<Value> {
         // Look up the crate's manifest path via cargo metadata so we never
         // dereference a caller-supplied path component — guards against
         // path-traversal via crafted crate names.
-        let metadata =
-            cargo_metadata(workspace_root).ok_or_else(|| anyhow!("cargo metadata failed"))?;
+        let metadata = fetch_metadata().ok_or_else(|| anyhow!("cargo metadata failed"))?;
         let manifest_path = find_manifest_for_crate(&metadata, name)
             .ok_or_else(|| anyhow!("Unknown crate: {name}"))?;
         let content = std::fs::read_to_string(&manifest_path)
@@ -111,18 +114,6 @@ pub fn read_resource(workspace_root: &Path, uri: &str) -> Result<Value> {
     }
 
     Err(anyhow!("Unknown resource: {uri}"))
-}
-
-fn cargo_metadata(workspace_root: &Path) -> Option<Value> {
-    let output = std::process::Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
-        .current_dir(workspace_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Collapse the full `cargo metadata` output into a smaller summary suited
@@ -296,15 +287,21 @@ fn walk(path: &Path, depth: usize, count: &mut usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::workspace::run_cargo_metadata;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Test helper: real `cargo metadata` provider, no caching.
+    fn fetch(root: &Path) -> impl Fn() -> Option<Value> + '_ {
+        move || run_cargo_metadata(root)
+    }
 
     #[test]
     fn list_advertises_files_resource_in_non_cargo_dir() {
         // A plain temp dir is not a Cargo workspace, so cargo metadata fails
         // and only the static file-tree resource is advertised.
         let dir = TempDir::new().unwrap();
-        let v = list_resources(dir.path());
+        let v = list_resources(dir.path(), &fetch(dir.path()));
         let arr = v["resources"].as_array().unwrap();
         let uris: Vec<&str> = arr.iter().filter_map(|r| r["uri"].as_str()).collect();
         assert!(uris.contains(&FILES_URI));
@@ -322,7 +319,7 @@ mod tests {
         fs::create_dir(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "// empty\n").unwrap();
 
-        let v = list_resources(dir.path());
+        let v = list_resources(dir.path(), &fetch(dir.path()));
         let arr = v["resources"].as_array().unwrap();
         let uris: Vec<&str> = arr.iter().filter_map(|r| r["uri"].as_str()).collect();
         assert!(uris.contains(&FILES_URI));
@@ -341,7 +338,7 @@ mod tests {
         fs::create_dir(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "// empty\n").unwrap();
 
-        let v = read_resource(dir.path(), CRATES_URI).unwrap();
+        let v = read_resource(dir.path(), CRATES_URI, &fetch(dir.path())).unwrap();
         let text = v["contents"][0]["text"].as_str().unwrap();
         let body: Value = serde_json::from_str(text).unwrap();
         let pkgs = body["packages"].as_array().unwrap();
@@ -362,7 +359,12 @@ mod tests {
         fs::create_dir(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "// empty\n").unwrap();
 
-        let v = read_resource(dir.path(), "workspace://crate/demo/Cargo.toml").unwrap();
+        let v = read_resource(
+            dir.path(),
+            "workspace://crate/demo/Cargo.toml",
+            &fetch(dir.path()),
+        )
+        .unwrap();
         assert_eq!(v["contents"][0]["mimeType"], "application/toml");
         assert_eq!(v["contents"][0]["text"], manifest);
     }
@@ -378,8 +380,12 @@ mod tests {
         fs::create_dir(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "// empty\n").unwrap();
 
-        let err =
-            read_resource(dir.path(), "workspace://crate/nonexistent/Cargo.toml").unwrap_err();
+        let err = read_resource(
+            dir.path(),
+            "workspace://crate/nonexistent/Cargo.toml",
+            &fetch(dir.path()),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("Unknown crate"));
     }
 
@@ -399,6 +405,7 @@ mod tests {
         let err = read_resource(
             dir.path(),
             "workspace://crate/..%2F..%2Fetc%2Fpasswd/Cargo.toml",
+            &fetch(dir.path()),
         )
         .unwrap_err();
         assert!(err.to_string().contains("Unknown crate"));
@@ -407,7 +414,7 @@ mod tests {
     #[test]
     fn read_unknown_uri_errors() {
         let dir = TempDir::new().unwrap();
-        let err = read_resource(dir.path(), "workspace://nope").unwrap_err();
+        let err = read_resource(dir.path(), "workspace://nope", &fetch(dir.path())).unwrap_err();
         assert!(err.to_string().contains("Unknown resource"));
     }
 
@@ -418,7 +425,7 @@ mod tests {
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         fs::write(dir.path().join("src/lib.rs"), "fn x() {}").unwrap();
 
-        let v = read_resource(dir.path(), FILES_URI).unwrap();
+        let v = read_resource(dir.path(), FILES_URI, &fetch(dir.path())).unwrap();
         let text = v["contents"][0]["text"].as_str().unwrap();
         let tree: Value = serde_json::from_str(text).unwrap();
 
@@ -454,7 +461,7 @@ mod tests {
         fs::write(dir.path().join(".git/HEAD"), "x").unwrap();
         fs::write(dir.path().join("keep.txt"), "x").unwrap();
 
-        let v = read_resource(dir.path(), FILES_URI).unwrap();
+        let v = read_resource(dir.path(), FILES_URI, &fetch(dir.path())).unwrap();
         let text = v["contents"][0]["text"].as_str().unwrap();
         let tree: Value = serde_json::from_str(text).unwrap();
 
@@ -480,7 +487,7 @@ mod tests {
         }
         fs::write(p.join("deep.txt"), "x").unwrap();
 
-        let v = read_resource(dir.path(), FILES_URI).unwrap();
+        let v = read_resource(dir.path(), FILES_URI, &fetch(dir.path())).unwrap();
         let text = v["contents"][0]["text"].as_str().unwrap();
         let tree: Value = serde_json::from_str(text).unwrap();
 
@@ -503,7 +510,8 @@ mod tests {
 
     #[test]
     fn nonexistent_root_yields_unknown() {
-        let v = read_resource(Path::new("/this/does/not/exist/xyz123"), FILES_URI).unwrap();
+        let root = Path::new("/this/does/not/exist/xyz123");
+        let v = read_resource(root, FILES_URI, &fetch(root)).unwrap();
         let text = v["contents"][0]["text"].as_str().unwrap();
         let tree: Value = serde_json::from_str(text).unwrap();
         assert_eq!(tree["tree"]["type"], "unknown");
