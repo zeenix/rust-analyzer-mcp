@@ -21,8 +21,9 @@ use super::{
     },
     truncate::{
         dedup_workspace_symbols, paginate_workspace_diagnostics, paginate_workspace_symbol,
-        parse_cursor, resolve_limit, truncate_completion, truncate_hover, COMPLETION_DEFAULT_LIMIT,
-        HOVER_MAX_BYTES, WORKSPACE_DIAGNOSTICS_DEFAULT_LIMIT, WORKSPACE_SYMBOL_DEFAULT_LIMIT,
+        parse_cursor, resolve_limit, shape_document_symbols, truncate_completion, truncate_hover,
+        COMPLETION_DEFAULT_LIMIT, HOVER_MAX_BYTES, WORKSPACE_DIAGNOSTICS_DEFAULT_LIMIT,
+        WORKSPACE_SYMBOL_DEFAULT_LIMIT,
     },
     workspace::WorkspaceEntry,
     workspace_edit::apply_workspace_edit,
@@ -200,8 +201,10 @@ pub async fn handle_tool_call(
             wrap(truncate_completion(value, limit, verbose))
         }
         "rust_analyzer_symbols" => {
+            let verbose = params::verbose(&args);
             with_doc(server, &args, move |c, uri| async move {
-                c.document_symbols(&uri).await
+                let value = c.document_symbols(&uri).await?;
+                Ok(shape_document_symbols(value, verbose))
             })
             .await
         }

@@ -179,6 +179,51 @@ fn completion_sort_key(item: &Value) -> String {
     sort.unwrap_or_else(|| label.clone()) + "\u{1f}" + &label
 }
 
+/// Shape a `textDocument/documentSymbol` response. rust-analyzer returns
+/// hierarchical `DocumentSymbol[]` and the nested `children` arrays explode
+/// into the response: a single struct with many typed fields (or an enum with
+/// many variants holding tuple types) can produce tens of kilobytes for one
+/// file. Default: keep top-level symbols only, replace each `children` array
+/// with a `child_count` integer. Verbose: pass the tree through unchanged.
+/// Wrapper: `{ symbols, total_top_level, verbose }`.
+pub fn shape_document_symbols(value: Value, verbose: bool) -> Value {
+    if value.is_null() {
+        return value;
+    }
+    let Value::Array(items) = value else {
+        return value;
+    };
+
+    let total_top_level = items.len();
+    let symbols: Vec<Value> = if verbose {
+        items
+    } else {
+        items.into_iter().map(strip_children).collect()
+    };
+
+    json!({
+        "symbols": symbols,
+        "total_top_level": total_top_level,
+        "verbose": verbose,
+    })
+}
+
+/// Replace the `children` array on a single DocumentSymbol with a numeric
+/// `child_count`. Items lacking the field (flat `SymbolInformation` shape)
+/// get `child_count: 0` so the output stays uniformly shaped.
+fn strip_children(mut sym: Value) -> Value {
+    let child_count = sym
+        .get("children")
+        .and_then(|c| c.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if let Some(obj) = sym.as_object_mut() {
+        obj.remove("children");
+        obj.insert("child_count".to_string(), json!(child_count));
+    }
+    sym
+}
+
 /// Drop entries that share the same `(name, containerName, location)` triple.
 /// rust-analyzer's `workspace/symbol` returns each match twice in many cases
 /// (once per index source) and the duplicates eat token budget without adding
@@ -477,6 +522,73 @@ mod tests {
         // First-seen order preserved.
         assert_eq!(syms[0]["containerName"], "DirAction");
         assert_eq!(syms[1]["containerName"], "RecurseOptions");
+    }
+
+    #[test]
+    fn doc_symbols_strips_children_by_default() {
+        let raw = json!([
+            {
+                "name": "UiStyles",
+                "kind": 23,
+                "range": { "start": {"line":0,"character":0}, "end": {"line":50,"character":1} },
+                "selectionRange": { "start": {"line":0,"character":11}, "end": {"line":0,"character":19} },
+                "children": [
+                    { "name": "field_a", "kind": 8, "range": {}, "selectionRange": {} },
+                    { "name": "field_b", "kind": 8, "range": {}, "selectionRange": {} },
+                    { "name": "field_c", "kind": 8, "range": {}, "selectionRange": {} }
+                ]
+            },
+            {
+                "name": "Theme",
+                "kind": 23,
+                "range": {}, "selectionRange": {},
+                "children": []
+            }
+        ]);
+        let out = shape_document_symbols(raw, false);
+        assert_eq!(out["total_top_level"], 2);
+        assert_eq!(out["verbose"], false);
+        let syms = out["symbols"].as_array().unwrap();
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0]["name"], "UiStyles");
+        assert_eq!(syms[0]["child_count"], 3);
+        assert!(syms[0].get("children").is_none());
+        assert_eq!(syms[1]["child_count"], 0);
+    }
+
+    #[test]
+    fn doc_symbols_verbose_keeps_full_tree() {
+        let raw = json!([
+            {
+                "name": "S",
+                "kind": 23,
+                "range": {}, "selectionRange": {},
+                "children": [{ "name": "f", "kind": 8, "range": {}, "selectionRange": {} }]
+            }
+        ]);
+        let out = shape_document_symbols(raw, true);
+        assert_eq!(out["total_top_level"], 1);
+        assert_eq!(out["verbose"], true);
+        let s0 = &out["symbols"][0];
+        assert!(s0.get("children").is_some());
+        assert_eq!(s0["children"].as_array().unwrap().len(), 1);
+        assert!(s0.get("child_count").is_none());
+    }
+
+    #[test]
+    fn doc_symbols_null_passthrough() {
+        let out = shape_document_symbols(json!(null), false);
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn doc_symbols_handles_missing_children_field() {
+        // SymbolInformation-style flat output: no "children" key.
+        let raw = json!([
+            { "name": "foo", "kind": 12, "location": { "uri": "file:///x.rs", "range": {} } }
+        ]);
+        let out = shape_document_symbols(raw, false);
+        assert_eq!(out["symbols"][0]["child_count"], 0);
     }
 
     #[test]

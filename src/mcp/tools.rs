@@ -189,8 +189,15 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
         ),
         tool(
             "rust_analyzer_symbols",
-            "Get document symbols (functions, structs, etc.) for a Rust file",
-            file_only_schema(),
+            "Get document symbols (functions, structs, etc.) for a Rust file. By default returns only top-level symbols with `child_count` per item; nested members (struct fields, enum variants, methods inside impls) are collapsed to keep the response token cost predictable. Pass verbose=true to receive the full hierarchical tree (`children` arrays preserved). Output: { symbols, total_top_level, verbose }.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": file_path_prop(),
+                    "verbose": { "type": "boolean", "description": "If true, return the full nested DocumentSymbol tree. Default: false (top-level only with child_count)." }
+                },
+                "required": ["file_path"]
+            }),
         ),
         tool(
             "rust_analyzer_format",

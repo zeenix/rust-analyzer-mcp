@@ -1580,8 +1580,13 @@ async fn test_error_handling_invalid_files() -> Result<()> {
         if let Ok(response) = result {
             if let Some(content) = response.get("content") {
                 if let Some(text) = content[0].get("text") {
-                    let symbols: Vec<Value> =
-                        serde_json::from_str(text.as_str().unwrap_or("[]")).unwrap_or_default();
+                    let parsed: Value = serde_json::from_str(text.as_str().unwrap_or("null"))
+                        .unwrap_or(Value::Null);
+                    let symbols = parsed
+                        .get("symbols")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
                     assert!(
                         symbols.is_empty(),
                         "Should not have symbols for invalid file: {}",
@@ -1666,7 +1671,10 @@ async fn test_symbols(client: &mut IpcClient, workspace_path: &Path) -> Result<(
         return Err(anyhow::anyhow!("Text is not a string"));
     };
 
-    let symbols: Vec<Value> = serde_json::from_str(text_str)?;
+    let parsed: Value = serde_json::from_str(text_str)?;
+    let symbols = parsed["symbols"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Expected 'symbols' array in response: {parsed}"))?;
     assert!(!symbols.is_empty(), "Should have symbols in main.rs");
 
     let symbol_names: Vec<String> = symbols
