@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -9,6 +9,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     sync::{Mutex, RwLock},
+    task::AbortHandle,
 };
 use tracing::{debug, error, info, warn};
 
@@ -24,6 +25,11 @@ pub struct RustAnalyzerMCPServer {
     /// Timestamps of recent automatic restarts, oldest first. Used to back off
     /// when rust-analyzer keeps crashing (see `MAX_RESTART_COUNT`).
     restart_history: parking_lot::Mutex<VecDeque<Instant>>,
+    /// AbortHandles for currently-running tool calls, keyed by the canonical
+    /// string form of the MCP request id. `notifications/cancelled` looks up
+    /// the matching handle and aborts the task; tasks remove themselves on
+    /// completion.
+    in_flight: Arc<parking_lot::Mutex<HashMap<String, AbortHandle>>>,
 }
 
 impl Default for RustAnalyzerMCPServer {
@@ -40,6 +46,7 @@ impl RustAnalyzerMCPServer {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             ),
             restart_history: parking_lot::Mutex::new(VecDeque::new()),
+            in_flight: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -58,6 +65,7 @@ impl RustAnalyzerMCPServer {
             client: RwLock::new(None),
             workspace_root: RwLock::new(workspace_root),
             restart_history: parking_lot::Mutex::new(VecDeque::new()),
+            in_flight: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -217,11 +225,34 @@ impl RustAnalyzerMCPServer {
                         continue;
                     };
 
+                    // Cancellation notifications are handled inline so we don't
+                    // race against the spawn that would otherwise run the
+                    // (already-cancelled) request.
+                    if request.method == "notifications/cancelled" {
+                        self.handle_cancellation(request.params.as_ref());
+                        continue;
+                    }
+
                     let server = Arc::clone(&self);
                     let stdout = Arc::clone(&stdout);
-                    tokio::spawn(async move {
+                    let in_flight = Arc::clone(&self.in_flight);
+                    let id_key = request.id.as_ref().map(canonical_id_key);
+
+                    let handle = tokio::spawn(async move {
                         server.handle_one_request(request, stdout).await;
                     });
+
+                    if let Some(key) = id_key {
+                        let abort = handle.abort_handle();
+                        in_flight.lock().insert(key.clone(), abort);
+
+                        // Unregister once the task finishes (normal or aborted).
+                        let in_flight_cleanup = Arc::clone(&in_flight);
+                        tokio::spawn(async move {
+                            let _ = handle.await;
+                            in_flight_cleanup.lock().remove(&key);
+                        });
+                    }
                 }
             }
         }
@@ -233,6 +264,26 @@ impl RustAnalyzerMCPServer {
         }
 
         Ok(())
+    }
+
+    fn handle_cancellation(&self, params: Option<&Value>) {
+        let Some(params) = params else {
+            debug!("notifications/cancelled without params, ignoring");
+            return;
+        };
+        let Some(request_id) = params.get("requestId") else {
+            debug!("notifications/cancelled without requestId, ignoring");
+            return;
+        };
+        let key = canonical_id_key(request_id);
+        let abort = self.in_flight.lock().remove(&key);
+        match abort {
+            Some(handle) => {
+                info!("Cancelling MCP request {}", key);
+                handle.abort();
+            }
+            None => debug!("notifications/cancelled for unknown request {}", key),
+        }
     }
 
     async fn handle_one_request(
@@ -354,5 +405,17 @@ impl RustAnalyzerMCPServer {
                 },
             },
         }
+    }
+}
+
+/// Canonicalises a JSON-RPC request id (string, number, or null) into a stable
+/// HashMap key. Numbers are stringified consistently so that `1` and `1.0` map
+/// to the same task.
+fn canonical_id_key(id: &Value) -> String {
+    match id {
+        Value::String(s) => format!("s:{}", s),
+        Value::Number(n) => format!("n:{}", n),
+        Value::Null => "null".to_string(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "unknown".to_string()),
     }
 }
