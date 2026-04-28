@@ -132,5 +132,71 @@ fn build_tools() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
+        ToolDefinition {
+            name: "rust_analyzer_rename".to_string(),
+            description: "Rename a symbol at a specific position. Returns a WorkspaceEdit with the changes that should be applied.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" },
+                    "new_name": { "type": "string", "description": "The new symbol name" }
+                },
+                "required": ["file_path", "line", "character", "new_name"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_prepare_rename".to_string(),
+            description: "Check whether a symbol at a specific position can be renamed; returns the renameable range or null.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_signature_help".to_string(),
+            description: "Get parameter/signature information for a function call at a specific position".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_inlay_hints".to_string(),
+            description: "Get inlay hints (inferred types, parameter names) for a range in a Rust file".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "line": { "type": "number", "description": "Start line number (0-based)" },
+                    "character": { "type": "number", "description": "Start character position (0-based)" },
+                    "end_line": { "type": "number", "description": "End line number (0-based)" },
+                    "end_character": { "type": "number", "description": "End character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character", "end_line", "end_character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_workspace_symbol".to_string(),
+            description: "Search for symbols across the entire workspace by name (fuzzy match)".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Symbol name query (fuzzy match)" }
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }

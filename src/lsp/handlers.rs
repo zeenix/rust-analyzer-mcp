@@ -152,6 +152,74 @@ impl RustAnalyzerClient {
         }
     }
 
+    pub async fn rename(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "newName": new_name
+        });
+
+        lookup_to_null(self.send_request("textDocument/rename", Some(params)).await)
+    }
+
+    pub async fn prepare_rename(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("textDocument/prepareRename", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn signature_help(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("textDocument/signatureHelp", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn inlay_hints(
+        &self,
+        uri: &str,
+        start_line: u32,
+        start_char: u32,
+        end_line: u32,
+        end_char: u32,
+    ) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": start_line, "character": start_char },
+                "end": { "line": end_line, "character": end_char }
+            }
+        });
+
+        lookup_to_null(
+            self.send_request("textDocument/inlayHint", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn workspace_symbol(&self, query: &str) -> Result<Value> {
+        let params = json!({ "query": query });
+
+        lookup_to_null(self.send_request("workspace/symbol", Some(params)).await)
+    }
+
     pub async fn code_actions(
         &self,
         uri: &str,

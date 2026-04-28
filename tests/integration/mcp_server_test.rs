@@ -128,6 +128,94 @@ async fn test_workspace_change() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_new_lsp_tools() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
+    let main_path = workspace_path.join("src/main.rs");
+
+    // 1. workspace_symbol — fuzzy search across the workspace.
+    let response = client
+        .call_tool(
+            "rust_analyzer_workspace_symbol",
+            json!({ "query": "Calculator" }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    // Either an array of SymbolInformation/WorkspaceSymbol or null while indexing.
+    if text != "null" {
+        serde_json::from_str::<Value>(&text)?;
+    }
+
+    // 2. prepare_rename — at the `greet` definition (line 13, char 3).
+    let response = client
+        .call_tool(
+            "rust_analyzer_prepare_rename",
+            json!({
+                "file_path": main_path.to_str().unwrap(),
+                "line": 13,
+                "character": 3
+            }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?; // null or a Range/PrepareRenameResult.
+
+    // 3. rename — same position, new name.
+    let response = client
+        .call_tool(
+            "rust_analyzer_rename",
+            json!({
+                "file_path": main_path.to_str().unwrap(),
+                "line": 13,
+                "character": 3,
+                "new_name": "salute"
+            }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?; // null or a WorkspaceEdit.
+
+    // 4. signature_help — inside greet("World") on line 1.
+    let response = client
+        .call_tool(
+            "rust_analyzer_signature_help",
+            json!({
+                "file_path": main_path.to_str().unwrap(),
+                "line": 1,
+                "character": 24
+            }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?; // null or SignatureHelp.
+
+    // 5. inlay_hints — over the entire file.
+    let response = client
+        .call_tool(
+            "rust_analyzer_inlay_hints",
+            json!({
+                "file_path": main_path.to_str().unwrap(),
+                "line": 0,
+                "character": 0,
+                "end_line": 60,
+                "end_character": 0
+            }),
+        )
+        .await?;
+    let _ = extract_tool_text(&response)?; // null or InlayHint[].
+
+    Ok(())
+}
+
+fn extract_tool_text(response: &Value) -> Result<String> {
+    let content = response
+        .get("content")
+        .ok_or_else(|| anyhow::anyhow!("no content"))?;
+    let text = content[0]
+        .get("text")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("no text"))?;
+    Ok(text.to_string())
+}
+
+#[tokio::test]
 async fn test_error_handling_invalid_files() -> Result<()> {
     let mut client = IpcClient::get_or_create("test-project").await?;
     let workspace_path = client.workspace_path().to_path_buf();

@@ -304,10 +304,30 @@ impl RustAnalyzerClient {
                             "valueSet": [1, 2]
                         }
                     },
-                    "formatting": {}
+                    "formatting": {},
+                    "rename": {
+                        "dynamicRegistration": false,
+                        "prepareSupport": true
+                    },
+                    "signatureHelp": {
+                        "dynamicRegistration": false,
+                        "signatureInformation": {
+                            "documentationFormat": ["markdown", "plaintext"],
+                            "parameterInformation": {
+                                "labelOffsetSupport": true
+                            },
+                            "activeParameterSupport": true
+                        }
+                    },
+                    "inlayHint": {
+                        "dynamicRegistration": false
+                    }
                 },
                 "workspace": {
                     "didChangeConfiguration": {
+                        "dynamicRegistration": false
+                    },
+                    "symbol": {
                         "dynamicRegistration": false
                     }
                 },

@@ -124,11 +124,56 @@ pub async fn handle_tool_call(
             })
             .await
         }
+        "rust_analyzer_rename" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            let new_name = args["new_name"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Missing new_name"))?
+                .to_string();
+            with_doc(server, &args, move |c, uri| async move {
+                c.rename(&uri, line, ch, &new_name).await
+            })
+            .await
+        }
+        "rust_analyzer_prepare_rename" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.prepare_rename(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_signature_help" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.signature_help(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_inlay_hints" => {
+            let (l1, c1, l2, c2) = ToolParams::extract_range(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.inlay_hints(&uri, l1, c1, l2, c2).await
+            })
+            .await
+        }
+        "rust_analyzer_workspace_symbol" => handle_workspace_symbol(server, args).await,
         "rust_analyzer_set_workspace" => handle_set_workspace(server, args).await,
         "rust_analyzer_diagnostics" => handle_diagnostics(server, args).await,
         "rust_analyzer_workspace_diagnostics" => handle_workspace_diagnostics(server, args).await,
         _ => Err(anyhow!("Unknown tool: {}", tool_name)),
     }
+}
+
+async fn handle_workspace_symbol(
+    server: &Arc<RustAnalyzerMCPServer>,
+    args: Value,
+) -> Result<ToolResult> {
+    let query = args["query"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Missing query"))?;
+    let client = server.current_client().await?;
+    let value = client.workspace_symbol(query).await?;
+    wrap(value)
 }
 
 async fn handle_set_workspace(
@@ -166,13 +211,19 @@ async fn handle_diagnostics(
 
     // Poll briefly for diagnostics — rust-analyzer needs time to run cargo check after didSave.
     // Stop early as soon as we see any diagnostics; otherwise return whatever's available
-    // (possibly empty) once the timeout elapses.
+    // (possibly empty) once the timeout elapses. Transient errors (request cancelled by the
+    // server while indexing, etc.) are swallowed within the loop so the next poll can retry.
     let mut result = json!([]);
     let start = std::time::Instant::now();
     let timeout = tokio::time::Duration::from_secs(8);
     let poll_interval = tokio::time::Duration::from_millis(500);
     while start.elapsed() < timeout {
-        result = client.diagnostics(&uri).await?;
+        match client.diagnostics(&uri).await {
+            Ok(v) => result = v,
+            Err(e) => {
+                tracing::debug!("Transient diagnostics error, retrying: {}", e);
+            }
+        }
         if result.as_array().is_some_and(|a| !a.is_empty()) {
             break;
         }
