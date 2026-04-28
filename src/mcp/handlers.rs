@@ -338,6 +338,7 @@ pub async fn handle_tool_call(
         }
         "rust_analyzer_type_hierarchy" => handle_type_hierarchy(server, args).await,
         "rust_analyzer_impact" => handle_impact(server, args).await,
+        "rust_analyzer_get_type_by_name" => handle_get_type_by_name(server, args).await,
         "rust_analyzer_add_workspace" => handle_add_workspace(server, args).await,
         "rust_analyzer_remove_workspace" => handle_remove_workspace(server, args).await,
         "rust_analyzer_list_workspaces" => handle_list_workspaces(server, args).await,
@@ -425,6 +426,157 @@ fn sample_references(value: Value) -> Value {
         Value::Null => Value::Null,
         other => other,
     }
+}
+
+/// Name-based symbol lookup. Splits the input on `::`, fuzzy-searches the
+/// workspace by the last segment, then narrows to entries whose
+/// `containerName` agrees with the path prefix. Drives `hover` +
+/// `type_definition` on the first surviving match for the `primary` detail
+/// block; the rest are reported in `matches` without enrichment beyond the
+/// snippet walker.
+async fn handle_get_type_by_name(
+    server: &Arc<RustAnalyzerMCPServer>,
+    args: Value,
+) -> Result<ToolResult> {
+    const SAMPLE_SIZE: usize = 10;
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Missing name"))?
+        .to_string();
+    let path_parts: Vec<&str> = name.split("::").filter(|s| !s.is_empty()).collect();
+    if path_parts.is_empty() {
+        return Err(anyhow!("name must contain at least one non-empty segment"));
+    }
+    let last_segment = *path_parts.last().expect("non-empty per check above");
+    let snippet_opts = params::snippet_opts(&args);
+
+    let ws = server.resolve_workspace(&args).await?;
+    let client = ws.ensure_client_started().await?;
+
+    let raw = client.workspace_symbol(last_segment).await?;
+    let all_symbols: Vec<Value> = match raw {
+        Value::Array(items) => items,
+        _ => Vec::new(),
+    };
+
+    let matches: Vec<Value> = all_symbols
+        .into_iter()
+        .filter(|s| symbol_matches_path(s, &path_parts))
+        .collect();
+
+    let total = matches.len();
+    let shown = total.min(SAMPLE_SIZE);
+    let matches_sample: Vec<Value> = matches.iter().take(SAMPLE_SIZE).cloned().collect();
+
+    let primary = match matches.first() {
+        Some(first) => primary_detail(&ws, &client, first).await,
+        None => Value::Null,
+    };
+
+    let mut out = json!({
+        "matches": matches_sample,
+        "total": total,
+        "shown": shown,
+    });
+    if !primary.is_null() {
+        out.as_object_mut()
+            .expect("just constructed")
+            .insert("primary".to_string(), primary);
+    }
+    wrap(maybe_enrich_locations(out, snippet_opts))
+}
+
+/// Decide whether a `WorkspaceSymbol`/`SymbolInformation` JSON object satisfies
+/// the user-supplied path. Last segment must equal `name`; for multi-segment
+/// paths the `containerName` either matches the prefix exactly, ends with it,
+/// or contains every prefix segment as a substring (so "auth::User" still
+/// matches `containerName: "crate::auth"` even when rust-analyzer reports a
+/// shortened container).
+fn symbol_matches_path(symbol: &Value, path_parts: &[&str]) -> bool {
+    let Some(name) = symbol.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(last) = path_parts.last() else {
+        return false;
+    };
+    if name != *last {
+        return false;
+    }
+    if path_parts.len() == 1 {
+        return true;
+    }
+    let prefix_parts = &path_parts[..path_parts.len() - 1];
+    let container = symbol
+        .get("containerName")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let full_prefix = prefix_parts.join("::");
+    if container == full_prefix || container.ends_with(&full_prefix) {
+        return true;
+    }
+    prefix_parts.iter().all(|seg| container.contains(seg))
+}
+
+/// Open the document for the first match's location and run hover +
+/// type_definition concurrently. Per-sub-call errors degrade to null so a
+/// single failure doesn't poison the primary block.
+async fn primary_detail(
+    ws: &Arc<WorkspaceEntry>,
+    client: &Arc<RustAnalyzerClient>,
+    symbol: &Value,
+) -> Value {
+    let Some(location) = symbol.get("location") else {
+        return Value::Null;
+    };
+    let Some(uri_str) = location.get("uri").and_then(Value::as_str) else {
+        return Value::Null;
+    };
+    let Some(file_path) = uri_to_path_for_open(uri_str) else {
+        return Value::Null;
+    };
+    let Some(range) = location.get("range") else {
+        return Value::Null;
+    };
+    let Some(line) = range
+        .get("start")
+        .and_then(|s| s.get("line"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+    else {
+        return Value::Null;
+    };
+    let Some(character) = range
+        .get("start")
+        .and_then(|s| s.get("character"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+    else {
+        return Value::Null;
+    };
+
+    let opened_uri = match ws.open_document_if_needed(&file_path).await {
+        Ok(u) => u,
+        Err(_) => return Value::Null,
+    };
+
+    let (hover_res, type_def_res) = tokio::join!(
+        client.hover(&opened_uri, line, character),
+        client.type_definition(&opened_uri, line, character),
+    );
+
+    json!({
+        "hover": hover_res.unwrap_or(Value::Null),
+        "type_definition": type_def_res.unwrap_or(Value::Null),
+        "location": location.clone(),
+    })
+}
+
+/// Strip `file://` so the resulting absolute path can be passed to
+/// `open_document_if_needed` (which `workspace_root.join`s it; an absolute
+/// second argument wins, so the workspace root is harmless filler).
+fn uri_to_path_for_open(uri: &str) -> Option<String> {
+    uri.strip_prefix("file://").map(str::to_string)
 }
 
 /// Composite that estimates the blast radius of changing a symbol. Fans out

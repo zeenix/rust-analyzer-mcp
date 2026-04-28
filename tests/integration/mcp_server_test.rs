@@ -867,6 +867,85 @@ async fn test_phase24_call_and_type_hierarchy() -> Result<()> {
     Ok(())
 }
 
+/// ANALYSIS §5.2 — `get_type_by_name`. Name-based lookup that resolves via
+/// workspace_symbol and adds hover + type_definition on the first match.
+#[tokio::test]
+async fn test_get_type_by_name() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    // Wait for the workspace to finish indexing — workspace_symbol is empty
+    // before that, and this composite has nothing to filter.
+    client
+        .call_tool(
+            "rust_analyzer_workspace_symbol",
+            json!({ "query": "Calculator" }),
+        )
+        .await?;
+
+    // Single-segment lookup.
+    let response = client
+        .call_tool(
+            "rust_analyzer_get_type_by_name",
+            json!({ "name": "Calculator" }),
+        )
+        .await?;
+    let v: Value = serde_json::from_str(&extract_tool_text(&response)?)?;
+    assert!(
+        v.get("matches").and_then(Value::as_array).is_some(),
+        "matches must always be an array, got {v:#?}"
+    );
+    assert!(v.get("total").and_then(Value::as_u64).is_some());
+    assert!(v.get("shown").and_then(Value::as_u64).is_some());
+
+    // The test-project defines `Calculator`, so we expect at least one hit.
+    let total = v["total"].as_u64().unwrap();
+    if total > 0 {
+        let primary = v
+            .get("primary")
+            .unwrap_or_else(|| panic!("primary must appear when matches exist, got {v:#?}"));
+        for key in ["hover", "type_definition", "location"] {
+            assert!(
+                primary.get(key).is_some(),
+                "primary must have `{key}`, got {primary:#?}"
+            );
+        }
+    }
+
+    // Empty-segment input must surface as a tool error.
+    let bad = client
+        .call_tool("rust_analyzer_get_type_by_name", json!({ "name": "::" }))
+        .await
+        .err();
+    assert!(bad.is_some(), "empty path must error");
+
+    // include_snippets=false propagates through `matches` and `primary`.
+    let no_snip = client
+        .call_tool(
+            "rust_analyzer_get_type_by_name",
+            json!({ "name": "Calculator", "include_snippets": false }),
+        )
+        .await?;
+    let v: Value = serde_json::from_str(&extract_tool_text(&no_snip)?)?;
+    fn has_any_snippet(v: &Value) -> bool {
+        match v {
+            Value::Object(obj) => {
+                if obj.contains_key("snippet") {
+                    return true;
+                }
+                obj.values().any(has_any_snippet)
+            }
+            Value::Array(arr) => arr.iter().any(has_any_snippet),
+            _ => false,
+        }
+    }
+    assert!(
+        !has_any_snippet(&v),
+        "include_snippets=false must skip every nested snippet, got {v:#?}"
+    );
+
+    Ok(())
+}
+
 /// ANALYSIS §5.3 — `impact` composite. Aggregates references + callers
 /// (incoming calls) + implementors (subtypes) + related_tests in one
 /// round-trip. Asserts every bucket appears with the documented

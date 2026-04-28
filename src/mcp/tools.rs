@@ -38,6 +38,7 @@ pub(super) const SNIPPET_ENRICHED_TOOLS: &[&str] = &[
     "rust_analyzer_call_hierarchy_outgoing",
     "rust_analyzer_type_hierarchy",
     "rust_analyzer_impact",
+    "rust_analyzer_get_type_by_name",
 ];
 
 fn build_tools() -> Vec<ToolDefinition> {
@@ -371,6 +372,20 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["file_path", "line", "character"]
+            }),
+        ),
+        tool(
+            "rust_analyzer_get_type_by_name",
+            "Look up a type or item by its name path without needing a file/position. Accepts a `name` like \"Calculator\" or \"crate::auth::User\" or \"serde_json::Value\". Resolves via workspace_symbol on the last segment, filters to entries whose container matches the path prefix, then runs hover + type_definition on the first match. Returns { matches: [...up to 10 candidates], total, shown, primary?: { hover, type_definition, location } }. The `primary` block is omitted when no match is found. Useful for code generation: \"can I use X, what methods does it have?\" without already knowing where it's defined.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Symbol path to look up (e.g. \"Calculator\", \"crate::auth::User\", \"serde_json::Value\"). Segments are split on \"::\"."
+                    }
+                },
+                "required": ["name"]
             }),
         ),
         tool(
