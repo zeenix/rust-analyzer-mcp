@@ -8,7 +8,14 @@ use crate::{
     protocol::mcp::{ContentItem, ToolResult},
 };
 
-use super::server::RustAnalyzerMCPServer;
+use super::{
+    server::RustAnalyzerMCPServer,
+    truncate::{
+        paginate_workspace_diagnostics, paginate_workspace_symbol, parse_cursor, resolve_limit,
+        truncate_completion, truncate_hover, COMPLETION_DEFAULT_LIMIT, HOVER_MAX_BYTES,
+        WORKSPACE_DIAGNOSTICS_DEFAULT_LIMIT, WORKSPACE_SYMBOL_DEFAULT_LIMIT,
+    },
+};
 
 /// Helper struct for extracting common tool parameters.
 struct ToolParams;
@@ -40,6 +47,22 @@ impl ToolParams {
             return Err(anyhow!("Missing end_character"));
         };
         Ok((line, character, end_line as u32, end_character as u32))
+    }
+
+    fn extract_verbose(args: &Value) -> bool {
+        args.get("verbose")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    fn extract_limit(args: &Value) -> Option<usize> {
+        args.get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+    }
+
+    fn extract_cursor(args: &Value) -> Option<&str> {
+        args.get("cursor").and_then(|v| v.as_str())
     }
 }
 
@@ -79,10 +102,12 @@ pub async fn handle_tool_call(
     match tool_name {
         "rust_analyzer_hover" => {
             let (line, ch) = ToolParams::extract_position(&args)?;
-            with_doc(server, &args, move |c, uri| async move {
-                c.hover(&uri, line, ch).await
-            })
-            .await
+            let verbose = ToolParams::extract_verbose(&args);
+            let file_path = ToolParams::extract_file_path(&args)?;
+            let uri = server.open_document_if_needed(&file_path).await?;
+            let client = server.current_client().await?;
+            let value = client.hover(&uri, line, ch).await?;
+            wrap(truncate_hover(value, HOVER_MAX_BYTES, verbose))
         }
         "rust_analyzer_definition" => {
             let (line, ch) = ToolParams::extract_position(&args)?;
@@ -100,10 +125,17 @@ pub async fn handle_tool_call(
         }
         "rust_analyzer_completion" => {
             let (line, ch) = ToolParams::extract_position(&args)?;
-            with_doc(server, &args, move |c, uri| async move {
-                c.completion(&uri, line, ch).await
-            })
-            .await
+            let verbose = ToolParams::extract_verbose(&args);
+            let limit = resolve_limit(
+                ToolParams::extract_limit(&args),
+                verbose,
+                COMPLETION_DEFAULT_LIMIT,
+            );
+            let file_path = ToolParams::extract_file_path(&args)?;
+            let uri = server.open_document_if_needed(&file_path).await?;
+            let client = server.current_client().await?;
+            let value = client.completion(&uri, line, ch).await?;
+            wrap(truncate_completion(value, limit, verbose))
         }
         "rust_analyzer_symbols" => {
             with_doc(server, &args, move |c, uri| async move {
@@ -220,9 +252,16 @@ async fn handle_workspace_symbol(
     let query = args["query"]
         .as_str()
         .ok_or_else(|| anyhow!("Missing query"))?;
+    let verbose = ToolParams::extract_verbose(&args);
+    let cursor = parse_cursor(ToolParams::extract_cursor(&args));
+    let limit = resolve_limit(
+        ToolParams::extract_limit(&args),
+        verbose,
+        WORKSPACE_SYMBOL_DEFAULT_LIMIT,
+    );
     let client = server.current_client().await?;
     let value = client.workspace_symbol(query).await?;
-    wrap(value)
+    wrap(paginate_workspace_symbol(value, cursor, limit, verbose))
 }
 
 async fn handle_set_workspace(
@@ -285,13 +324,22 @@ async fn handle_diagnostics(
 
 async fn handle_workspace_diagnostics(
     server: &Arc<RustAnalyzerMCPServer>,
-    _args: Value,
+    args: Value,
 ) -> Result<ToolResult> {
+    let verbose = ToolParams::extract_verbose(&args);
+    let cursor = parse_cursor(ToolParams::extract_cursor(&args));
+    let limit = resolve_limit(
+        ToolParams::extract_limit(&args),
+        verbose,
+        WORKSPACE_DIAGNOSTICS_DEFAULT_LIMIT,
+    );
     let client = server.current_client().await?;
     let result = client.workspace_diagnostics().await?;
     let workspace_root = server.workspace_root_clone().await;
     let formatted = format_workspace_diagnostics(&workspace_root, &result);
-    wrap(formatted)
+    wrap(paginate_workspace_diagnostics(
+        formatted, cursor, limit, verbose,
+    ))
 }
 
 fn format_workspace_diagnostics(workspace_root: &Path, result: &Value) -> Value {

@@ -12,14 +12,15 @@ fn build_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "rust_analyzer_hover".to_string(),
-            description: "Get hover information for a symbol at a specific position in a Rust file"
+            description: "Get hover information for a symbol at a specific position in a Rust file. Markdown output is capped at ~5 KB by default; pass verbose=true for the full content."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "file_path": { "type": "string", "description": "Path to the Rust file" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
-                    "character": { "type": "number", "description": "Character position (0-based)" }
+                    "character": { "type": "number", "description": "Character position (0-based)" },
+                    "verbose": { "type": "boolean", "description": "If true, return the full hover content without truncation. Default: false." }
                 },
                 "required": ["file_path", "line", "character"]
             }),
@@ -52,13 +53,15 @@ fn build_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rust_analyzer_completion".to_string(),
-            description: "Get code completion suggestions at a specific position".to_string(),
+            description: "Get code completion suggestions at a specific position. By default, items are sorted by sortText and capped at 50; pass verbose=true to remove the cap or limit=N to override.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "file_path": { "type": "string", "description": "Path to the Rust file" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
-                    "character": { "type": "number", "description": "Character position (0-based)" }
+                    "character": { "type": "number", "description": "Character position (0-based)" },
+                    "verbose": { "type": "boolean", "description": "If true, return all completion items without truncation. Default: false." },
+                    "limit": { "type": "number", "description": "Maximum number of items to return. Default: 50, cap: 1000." }
                 },
                 "required": ["file_path", "line", "character"]
             }),
@@ -126,10 +129,14 @@ fn build_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rust_analyzer_workspace_diagnostics".to_string(),
-            description: "Get all compiler diagnostics across the entire workspace".to_string(),
+            description: "Get all compiler diagnostics across the entire workspace. Files are paginated (default 50 files per page); the response includes { workspace, files, summary, pagination: { total_files, returned_files, next_cursor? } }. Use cursor for next page, limit to override, or verbose=true for all files (capped at 1000). The `summary` totals always cover the whole workspace, not just the page.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "verbose": { "type": "boolean", "description": "If true, return all files (subject to a 1000-file absolute cap). Default: false." },
+                    "limit": { "type": "number", "description": "Page size in files. Default: 50, cap: 1000." },
+                    "cursor": { "type": "string", "description": "Opaque pagination cursor returned by a previous call. Omit to start from the beginning." }
+                }
             }),
         },
         ToolDefinition {
@@ -189,11 +196,14 @@ fn build_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rust_analyzer_workspace_symbol".to_string(),
-            description: "Search for symbols across the entire workspace by name (fuzzy match)".to_string(),
+            description: "Search for symbols across the entire workspace by name (fuzzy match). Returns { symbols, total, returned, next_cursor? }. Default page size is 100; pass cursor (from a previous next_cursor) to fetch the next page, limit to override page size, or verbose=true to retrieve all matches up to a 1000-item cap. Cursors are best-effort opaque indices and may become stale across re-analysis.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Symbol name query (fuzzy match)" }
+                    "query": { "type": "string", "description": "Symbol name query (fuzzy match)" },
+                    "verbose": { "type": "boolean", "description": "If true, return all matches (subject to a 1000-item absolute cap). Default: false." },
+                    "limit": { "type": "number", "description": "Page size. Default: 100, cap: 1000." },
+                    "cursor": { "type": "string", "description": "Opaque pagination cursor returned by a previous call. Omit to start from the beginning." }
                 },
                 "required": ["query"]
             }),

@@ -293,6 +293,131 @@ async fn test_phase1_tools() -> Result<()> {
     Ok(())
 }
 
+/// Phase 2 — Result-Truncation und Pagination.
+///
+/// Wir prüfen die Output-Shape (verbose=true vs Default) und das
+/// pagination-Roundtrip-Verhalten ohne uns auf konkrete LSP-Ergebnisgrößen
+/// festzulegen — der Test-Workspace ist klein, also sind die meisten Pfade
+/// "unter dem Cap". Was zählt: Shape-Stabilität.
+#[tokio::test]
+async fn test_phase2_truncation_and_pagination() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
+    let main_path = workspace_path.join("src/main.rs");
+    let main_str = main_path.to_str().unwrap();
+
+    // 1. Hover — verbose-Param wird akzeptiert, _truncated darf erscheinen oder nicht (kleine
+    //    Hover-Inhalte im Test-Projekt → meist nicht).
+    let response = client
+        .call_tool(
+            "rust_analyzer_hover",
+            json!({ "file_path": main_str, "line": 4, "character": 15, "verbose": true }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    if text != "null" {
+        let v: Value = serde_json::from_str(&text)?;
+        assert!(
+            v.get("_truncated").is_none(),
+            "verbose=true must skip truncation"
+        );
+    }
+
+    // 2. Completion — Default cap, Form ist immer { items, isIncomplete, total, returned }.
+    let response = client
+        .call_tool(
+            "rust_analyzer_completion",
+            json!({ "file_path": main_str, "line": 2, "character": 5 }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    if text != "null" {
+        let v: Value = serde_json::from_str(&text)?;
+        assert!(v.get("items").is_some(), "completion must wrap items");
+        assert!(v.get("total").is_some());
+        assert!(v.get("returned").is_some());
+        let returned = v["returned"].as_u64().unwrap();
+        let total = v["total"].as_u64().unwrap();
+        assert!(returned <= 50);
+        assert!(returned <= total);
+        if returned < total {
+            assert!(v.get("_truncated").is_some());
+        }
+    }
+
+    // 3. Workspace-Symbol — Default page=100; wir setzen limit=1 um Pagination zu erzwingen
+    //    (rust-analyzer findet >1 Symbol für "C" im Test-Projekt — Calculator etc.).
+    let response = client
+        .call_tool(
+            "rust_analyzer_workspace_symbol",
+            json!({ "query": "C", "limit": 1 }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    if text != "null" {
+        let v: Value = serde_json::from_str(&text)?;
+        assert!(v.get("symbols").is_some());
+        let total = v["total"].as_u64().unwrap();
+        let returned = v["returned"].as_u64().unwrap();
+        assert!(returned <= 1);
+        assert!(returned <= total);
+        if total > 1 {
+            // Erste Seite ist limit=1 → next_cursor muss kommen.
+            assert_eq!(
+                v["next_cursor"], "1",
+                "next_cursor should be set when more results exist"
+            );
+
+            // Roundtrip: cursor mit der letzten Seite holen.
+            let response2 = client
+                .call_tool(
+                    "rust_analyzer_workspace_symbol",
+                    json!({ "query": "C", "limit": 1, "cursor": "1" }),
+                )
+                .await?;
+            let text2 = extract_tool_text(&response2)?;
+            let v2: Value = serde_json::from_str(&text2)?;
+            assert_eq!(v2["total"], v["total"]);
+            assert!(v2["returned"].as_u64().unwrap() <= 1);
+        }
+    }
+
+    // 4. Workspace-Symbol — verbose=true entfernt das Cap.
+    let response = client
+        .call_tool(
+            "rust_analyzer_workspace_symbol",
+            json!({ "query": "C", "verbose": true }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    if text != "null" {
+        let v: Value = serde_json::from_str(&text)?;
+        let total = v["total"].as_u64().unwrap();
+        let returned = v["returned"].as_u64().unwrap();
+        assert_eq!(returned, total, "verbose=true should return all symbols");
+        assert!(v.get("next_cursor").is_none());
+    }
+
+    // 5. Workspace-Diagnostics — pagination-Block muss vorhanden sein.
+    let response = client
+        .call_tool("rust_analyzer_workspace_diagnostics", json!({}))
+        .await?;
+    let text = extract_tool_text(&response)?;
+    let v: Value = serde_json::from_str(&text)?;
+    if v.get("files").is_some() {
+        assert!(
+            v.get("pagination").is_some(),
+            "workspace_diagnostics must include pagination block"
+        );
+        assert!(v["pagination"]["total_files"].is_u64());
+        assert!(v["pagination"]["returned_files"].is_u64());
+        // Summary bleibt full-workspace.
+        assert!(v.get("summary").is_some());
+    }
+
+    Ok(())
+}
+
 fn extract_tool_text(response: &Value) -> Result<String> {
     let content = response
         .get("content")
