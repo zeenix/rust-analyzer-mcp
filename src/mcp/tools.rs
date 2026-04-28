@@ -215,7 +215,7 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
         ),
         tool(
             "rust_analyzer_diagnostics",
-            "Get compiler diagnostics (errors, warnings, hints) for a Rust file",
+            "Get compiler diagnostics (errors, warnings, hints) for a Rust file. Each diagnostic carries the LSP fields plus rust-analyzer extensions: `data.rendered` (the cargo-formatted error block with ASCII pointers — read this first when fixing a bug), `codeDescription.href` (link to the error-index doc page), and `tags` (LSP DiagnosticTag, e.g. [1] for unused code). Fields are null when upstream omits them.",
             file_only_schema(),
         ),
         tool(

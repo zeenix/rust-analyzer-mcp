@@ -58,8 +58,11 @@ pub fn format_diagnostics(file_path: &str, result: &Value) -> Value {
             "range": diag.get("range").cloned().unwrap_or(json!(null)),
             "message": diag.get("message").and_then(|m| m.as_str()).unwrap_or(""),
             "code": diag.get("code").cloned().unwrap_or(json!(null)),
+            "codeDescription": diag.get("codeDescription").cloned().unwrap_or(json!(null)),
             "source": diag.get("source").and_then(|s| s.as_str()).unwrap_or("rust-analyzer"),
-            "relatedInformation": diag.get("relatedInformation").cloned().unwrap_or(json!(null))
+            "tags": diag.get("tags").cloned().unwrap_or(json!(null)),
+            "relatedInformation": diag.get("relatedInformation").cloned().unwrap_or(json!(null)),
+            "data": diag.get("data").cloned().unwrap_or(json!(null))
         }));
     }
 
@@ -69,4 +72,63 @@ pub fn format_diagnostics(file_path: &str, result: &Value) -> Value {
     output["summary"]["hints"] = json!(hints);
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_diag(out: &Value) -> &Value {
+        &out["diagnostics"][0]
+    }
+
+    #[test]
+    fn passes_through_data_code_description_and_tags() {
+        let raw = json!([{
+            "severity": 1,
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+            "message": "boom",
+            "code": "E0382",
+            "codeDescription": { "href": "https://doc.rust-lang.org/error-index.html#E0382" },
+            "source": "rustc",
+            "tags": [1],
+            "data": { "rendered": "error[E0382]: ...\n  --> src/x.rs:1:1\n" }
+        }]);
+
+        let out = format_diagnostics("src/x.rs", &raw);
+        let d = first_diag(&out);
+
+        assert_eq!(d["severity"], "error");
+        assert_eq!(d["code"], "E0382");
+        assert_eq!(
+            d["codeDescription"]["href"],
+            "https://doc.rust-lang.org/error-index.html#E0382"
+        );
+        assert_eq!(d["tags"], json!([1]));
+        assert!(d["data"]["rendered"]
+            .as_str()
+            .unwrap()
+            .contains("error[E0382]"));
+    }
+
+    #[test]
+    fn missing_optional_fields_become_null_not_absent() {
+        let raw = json!([{
+            "severity": 2,
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+            "message": "warn",
+            "source": "rustc"
+        }]);
+
+        let out = format_diagnostics("src/x.rs", &raw);
+        let d = first_diag(&out);
+
+        // Stable shape: keys exist, values are null when absent upstream.
+        assert!(d.get("data").is_some());
+        assert!(d["data"].is_null());
+        assert!(d["codeDescription"].is_null());
+        assert!(d["tags"].is_null());
+        assert!(d["code"].is_null());
+        assert!(d["relatedInformation"].is_null());
+    }
 }
