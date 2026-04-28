@@ -18,6 +18,14 @@ fn strict(res: std::result::Result<Value, LspError>) -> Result<Value> {
     res.map_err(anyhow::Error::new)
 }
 
+fn rename_lookup_to_null(res: std::result::Result<Value, LspError>) -> Result<Value> {
+    match res {
+        Ok(v) => Ok(v),
+        Err(e) if e.is_no_rename_target() => Ok(json!(null)),
+        Err(e) => Err(anyhow::Error::new(e)),
+    }
+}
+
 impl RustAnalyzerClient {
     pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
         let params = json!({
@@ -166,7 +174,7 @@ impl RustAnalyzerClient {
             "newName": new_name
         });
 
-        lookup_to_null(self.send_request("textDocument/rename", Some(params)).await)
+        rename_lookup_to_null(self.send_request("textDocument/rename", Some(params)).await)
     }
 
     pub async fn prepare_rename(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
@@ -175,7 +183,7 @@ impl RustAnalyzerClient {
             "position": { "line": line, "character": character }
         });
 
-        lookup_to_null(
+        rename_lookup_to_null(
             self.send_request("textDocument/prepareRename", Some(params))
                 .await,
         )

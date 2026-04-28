@@ -36,6 +36,12 @@ impl LspError {
             LspError::MethodNotFound { .. } | LspError::InternalError { .. }
         )
     }
+
+    /// rust-analyzer signals "no renamable symbol at this position" via InvalidParams (-32602)
+    /// instead of returning null. Treat that as a lookup miss for rename/prepareRename callers.
+    pub fn is_no_rename_target(&self) -> bool {
+        self.is_no_result() || matches!(self, LspError::InvalidParams(_))
+    }
 }
 
 impl fmt::Display for LspError {
