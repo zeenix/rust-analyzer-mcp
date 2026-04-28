@@ -1456,6 +1456,93 @@ async fn test_move_file_rejects_existing_destination() -> Result<()> {
     Ok(())
 }
 
+/// ANALYSIS §2.3 — `runnables` reshape: verify the new compact envelope
+/// (`runnables`/`total`/`can_run_via_mcp`) and per-item shape (kind, label,
+/// cargo_args, location). `can_run_via_mcp` reflects the daemon's env state at
+/// startup; we only assert it's a bool, not a specific value, so the test
+/// doesn't depend on whether the host opts into in-MCP execution.
+#[tokio::test]
+async fn test_runnables_reshape_shape() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
+    let main_path = workspace_path.join("src/main.rs");
+    let main_str = main_path.to_str().unwrap();
+
+    let response = client
+        .call_tool("rust_analyzer_runnables", json!({ "file_path": main_str }))
+        .await?;
+    let value: Value = serde_json::from_str(&extract_tool_text(&response)?)?;
+
+    assert!(
+        value["runnables"].is_array(),
+        "expected runnables array, got {value}"
+    );
+    assert!(value["total"].is_u64(), "total must be a number");
+    assert!(
+        value["can_run_via_mcp"].is_boolean(),
+        "can_run_via_mcp must be a bool"
+    );
+
+    let arr = value["runnables"].as_array().unwrap();
+    if !arr.is_empty() {
+        let first = &arr[0];
+        assert!(first["kind"].is_string(), "each runnable has kind");
+        assert!(first["label"].is_string(), "each runnable has label");
+        assert!(
+            first["cargo_args"].is_array(),
+            "cargo_args must be an array"
+        );
+        assert!(
+            !first["cargo_args"].as_array().unwrap().is_empty(),
+            "cargo_args must be non-empty (cargo subcommand at minimum)"
+        );
+        assert!(
+            first["location"].is_object() || first["location"].is_null(),
+            "location should be an object or null"
+        );
+        assert!(
+            first["can_run_via_mcp"].is_boolean(),
+            "per-item can_run_via_mcp must be a bool"
+        );
+    }
+
+    Ok(())
+}
+
+/// ANALYSIS §2.3 — `run_runnable`: a call with invalid args (empty
+/// cargo_args) must error out, regardless of whether the env gate is on or
+/// off. Two surfaces produce errors here — the gate (env not set) and the
+/// allowlist validator (gate on but bad subcommand) — and both belong to
+/// `run_runnable`'s contract; either failure path is acceptable here.
+#[tokio::test]
+async fn test_run_runnable_rejects_invalid_input() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    // Empty cargo_args — must always fail.
+    let result = client
+        .call_tool("rust_analyzer_run_runnable", json!({ "cargo_args": [] }))
+        .await;
+    assert!(
+        result.is_err(),
+        "empty cargo_args should fail, got {result:?}"
+    );
+
+    // Disallowed subcommand — also must fail (both gate-off and validator
+    // reject it).
+    let result = client
+        .call_tool(
+            "rust_analyzer_run_runnable",
+            json!({ "cargo_args": ["uninstall", "--all"] }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "disallowed subcommand should fail, got {result:?}"
+    );
+
+    Ok(())
+}
+
 fn extract_tool_text(response: &Value) -> Result<String> {
     let content = response
         .get("content")

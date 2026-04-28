@@ -10,6 +10,10 @@ use crate::{
 };
 
 use super::{
+    runnables::{
+        cap_output, reshape_runnables, run_gate_enabled, validate_cargo_args,
+        DEFAULT_RUN_TIMEOUT_SECS, MAX_RUN_TIMEOUT_SECS, RUN_GATE_ENV,
+    },
     server::RustAnalyzerMCPServer,
     snippets::{
         enrich_locations, enrich_workspace_diagnostics, EnrichOpts, SNIPPET_DEFAULT_CONTEXT_LINES,
@@ -287,12 +291,15 @@ pub async fn handle_tool_call(
         "rust_analyzer_runnables" => {
             let position = params::position(&args).ok();
             let opts = params::snippet_opts(&args);
+            let can_run = run_gate_enabled();
             with_doc(server, &args, move |c, uri| async move {
                 let value = c.runnables(&uri, position).await?;
-                Ok(maybe_enrich_locations(value, opts))
+                let reshaped = reshape_runnables(value, can_run);
+                Ok(maybe_enrich_locations(reshaped, opts))
             })
             .await
         }
+        "rust_analyzer_run_runnable" => handle_run_runnable(server, args).await,
         "rust_analyzer_related_tests" => {
             let (line, ch) = params::position(&args)?;
             let opts = params::snippet_opts(&args);
@@ -679,6 +686,111 @@ fn resolve_under_workspace(workspace_root: &Path, p: &str) -> std::path::PathBuf
         path
     } else {
         workspace_root.join(path)
+    }
+}
+
+/// Execute a cargo runnable (typically the `cargo_args` returned by
+/// `rust_analyzer_runnables`) as a subprocess inside the workspace root.
+///
+/// Gated behind the `RUST_ANALYZER_MCP_ALLOW_RUN=1` env var: hosts that don't
+/// want LLM-driven cargo execution simply leave it unset and the tool refuses.
+/// First arg of `cargo_args` is constrained to the cargo subcommands we
+/// know we emit from runnables — anything else (`uninstall`, `+toolchain`)
+/// is rejected before spawning. `kill_on_drop(true)` lets the existing MCP
+/// cancellation path (which aborts the host task) tear down the cargo child
+/// without extra plumbing.
+async fn handle_run_runnable(
+    server: &Arc<RustAnalyzerMCPServer>,
+    args: Value,
+) -> Result<ToolResult> {
+    if !run_gate_enabled() {
+        return Err(anyhow!(
+            "run_runnable is disabled in this MCP host. Set {}=1 to opt in.",
+            RUN_GATE_ENV
+        ));
+    }
+
+    let cargo_args: Vec<String> = args
+        .get("cargo_args")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Missing cargo_args (array of strings)"))?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| anyhow!("cargo_args entries must be strings"))
+                .map(str::to_string)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    validate_cargo_args(&cargo_args).map_err(|e| anyhow!("{}", e))?;
+
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS)
+        .min(MAX_RUN_TIMEOUT_SECS);
+
+    let ws = server.resolve_workspace(&args).await?;
+    let workspace_root = ws.root_clone();
+
+    // The Tokio task running this future is the same one the MCP server
+    // tracks via `in_flight`; aborting it drops the Child and SIGKILLs cargo
+    // because of `kill_on_drop`.
+    let mut cmd = tokio::process::Command::new("cargo");
+    cmd.args(&cargo_args)
+        .current_dir(&workspace_root)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let started_at = std::time::Instant::now();
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn cargo: {}", e))?;
+
+    let wait = child.wait_with_output();
+    let timeout = tokio::time::Duration::from_secs(timeout_secs);
+    let result = tokio::time::timeout(timeout, wait).await;
+    let elapsed = started_at.elapsed().as_secs_f64();
+
+    match result {
+        Ok(Ok(output)) => {
+            let exit_code = output.status.code();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let (stdout, stdout_trunc) = cap_output(stdout);
+            let (stderr, stderr_trunc) = cap_output(stderr);
+            let mut out = json!({
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "elapsed_secs": elapsed,
+                "timed_out": false,
+            });
+            if stdout_trunc {
+                out["stdout_truncated"] = json!(true);
+            }
+            if stderr_trunc {
+                out["stderr_truncated"] = json!(true);
+            }
+            wrap(out)
+        }
+        Ok(Err(e)) => Err(anyhow!("cargo subprocess failed: {}", e)),
+        Err(_) => {
+            // Timeout: the Child was consumed by `wait_with_output`, so the
+            // owning future is dropped here, kill_on_drop fires, cargo dies.
+            wrap(json!({
+                "exit_code": Value::Null,
+                "stdout": "",
+                "stderr": format!(
+                    "cargo timed out after {} seconds and was killed",
+                    timeout_secs
+                ),
+                "elapsed_secs": elapsed,
+                "timed_out": true,
+            }))
+        }
     }
 }
 

@@ -295,7 +295,7 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
         ),
         tool(
             "rust_analyzer_runnables",
-            "List the runnable items (tests, benchmarks, binaries, doctests) in a file. Provide `line`/`character` to limit the result to runnables at that position.",
+            "List the runnable items (tests, benchmarks, binaries, doctests) in a file, reshaped for direct consumption. Returns { runnables: [{ kind, label, fq_name?, cargo_args, location, can_run_via_mcp }], total, can_run_via_mcp }. `kind` is the leading word from the rust-analyzer label (e.g. \"test\", \"test-mod\", \"bench\", \"run\", \"doctest\"). `cargo_args` is a flat argv ready for `rust_analyzer_run_runnable` — pass it through verbatim. `can_run_via_mcp` reflects the RUST_ANALYZER_MCP_ALLOW_RUN env gate; when false, copy `cargo_args` into the host's shell tool instead. Provide `line`/`character` to filter to runnables at that position.",
             json!({
                 "type": "object",
                 "properties": {
@@ -304,6 +304,25 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
                     "character": { "type": "number", "description": "Optional character position (0-based)" }
                 },
                 "required": ["file_path"]
+            }),
+        ),
+        tool(
+            "rust_analyzer_run_runnable",
+            "Execute a cargo runnable (test, bench, run, build, check, clippy, doc, nextest) inside the workspace root. Pass the `cargo_args` array from rust_analyzer_runnables verbatim. Disabled by default; set RUST_ANALYZER_MCP_ALLOW_RUN=1 in the MCP host environment to enable. Output: { exit_code, stdout, stderr, elapsed_secs, timed_out, stdout_truncated?, stderr_truncated? }. Stdout/stderr are each capped at 5 KiB. Default timeout 60 s, override via `timeout_secs` (max 600). Cancellation flows through MCP — cancelling the request kills the cargo subprocess.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "cargo_args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Argv for `cargo`. First element must be one of: test, bench, run, build, check, clippy, doc, nextest."
+                    },
+                    "timeout_secs": {
+                        "type": "number",
+                        "description": "Subprocess timeout in seconds. Default: 60, hard cap: 600."
+                    }
+                },
+                "required": ["cargo_args"]
             }),
         ),
         tool(
