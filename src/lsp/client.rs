@@ -14,9 +14,9 @@ use std::{
 use tokio::{
     io::{AsyncWriteExt, BufWriter},
     process::{Child, Command},
-    sync::{oneshot, Mutex},
+    sync::{oneshot, Mutex, Notify},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{INDEXING_WAIT_TIMEOUT_SECS, LSP_REQUEST_TIMEOUT_SECS},
@@ -25,6 +25,7 @@ use crate::{
         error::LspError,
     },
     protocol::lsp::LSPRequest,
+    util::canonicalize_path,
 };
 
 tokio::task_local! {
@@ -57,6 +58,10 @@ pub struct RustAnalyzerClient {
     pub(super) initialized: AtomicBool,
     pub(super) open_documents: Mutex<HashMap<String, OpenDocState>>,
     pub(super) diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    /// Pulsed by the connection task whenever rust-analyzer publishes new
+    /// diagnostics. Lets `wait_for_diagnostics_change` block until something
+    /// arrives instead of busy-polling the diagnostics map.
+    pub(super) diagnostics_changed: Arc<Notify>,
     pub(super) progress: ProgressMap,
     /// Set by the monitor task when rust-analyzer's process has exited. The MCP
     /// server polls this to decide whether to restart the client.
@@ -65,16 +70,7 @@ pub struct RustAnalyzerClient {
 
 impl RustAnalyzerClient {
     pub fn new(workspace_root: PathBuf) -> Self {
-        // Ensure the workspace root is absolute.
-        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-            if workspace_root.is_absolute() {
-                workspace_root.clone()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(&workspace_root)
-            }
-        });
+        let workspace_root = canonicalize_path(workspace_root);
 
         Self {
             process: Arc::new(Mutex::new(None)),
@@ -85,6 +81,7 @@ impl RustAnalyzerClient {
             initialized: AtomicBool::new(false),
             open_documents: Mutex::new(HashMap::new()),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            diagnostics_changed: Arc::new(Notify::new()),
             progress: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             process_died: Arc::new(AtomicBool::new(false)),
         }
@@ -117,7 +114,11 @@ impl RustAnalyzerClient {
         cmd.current_dir(&self.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Backstop for the `Drop` impl: if the client is ever dropped without an
+            // explicit `shutdown()` (panic, abandoned future, ctrl-c after a select! race),
+            // tokio reaps the child instead of leaving it as a zombie.
+            .kill_on_drop(true);
 
         // Pass through isolation environment variables if they're set.
         if let Ok(cache_home) = std::env::var("XDG_CACHE_HOME") {
@@ -157,6 +158,7 @@ impl RustAnalyzerClient {
             Arc::clone(&self.stdin),
             Arc::clone(&self.pending_requests),
             Arc::clone(&self.diagnostics),
+            Arc::clone(&self.diagnostics_changed),
             Arc::clone(&self.progress),
         );
 
@@ -208,7 +210,7 @@ impl RustAnalyzerClient {
         let content = serde_json::to_string(&notification)?;
         let message = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
 
-        info!("Sending LSP notification: {}", method);
+        debug!("Sending LSP notification: {}", method);
 
         let mut stdin_lock = self.stdin.lock().await;
         let stdin = stdin_lock
@@ -238,7 +240,7 @@ impl RustAnalyzerClient {
             .map_err(|e| LspError::Transport(format!("serialize: {}", e)))?;
         let message = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
 
-        info!("Sending LSP request: {} with params: {:?}", method, params);
+        debug!("Sending LSP request: {} with params: {:?}", method, params);
 
         // Register the pending request *before* writing, so a fast response can't race past us.
         // Inherit the current MCP request id (if any) so cancel_mcp can find this LSP call later.
@@ -294,7 +296,7 @@ impl RustAnalyzerClient {
             return;
         }
 
-        info!(
+        debug!(
             "Cancelling {} LSP requests for MCP request {}",
             entries.len(),
             mcp_request_id
@@ -455,6 +457,20 @@ impl RustAnalyzerClient {
         .map_err(|_| ())
     }
 
+    /// Block until rust-analyzer publishes a `textDocument/publishDiagnostics`
+    /// for *any* URI, or `timeout` elapses. Returns `Ok(())` on a publish,
+    /// `Err(())` on timeout. Call repeatedly in a loop and re-check the
+    /// diagnostics map for the URI you actually care about — `Notify` pulses
+    /// don't carry payload, so multiple URIs share the same wake-up.
+    pub async fn wait_for_diagnostics_change(&self, timeout: Duration) -> Result<(), ()> {
+        // Subscribe BEFORE the await so we don't miss a pulse that arrives
+        // between the caller's last map-check and our `notified()` call.
+        let notified = self.diagnostics_changed.notified();
+        tokio::time::timeout(timeout, notified)
+            .await
+            .map_err(|_| ())
+    }
+
     pub async fn is_open(&self, uri: &str) -> bool {
         self.open_documents.lock().await.contains_key(uri)
     }
@@ -508,7 +524,7 @@ impl RustAnalyzerClient {
         // Old diagnostics are now stale for this content.
         self.diagnostics.lock().await.remove(uri);
 
-        info!("Updating document {} to version {}", uri, new_version);
+        debug!("Updating document {} to version {}", uri, new_version);
         let params = json!({
             "textDocument": { "uri": uri, "version": new_version },
             "contentChanges": [ { "text": content } ]
@@ -535,13 +551,13 @@ impl RustAnalyzerClient {
         // or wait their turn here.
         let mut open_docs = self.open_documents.lock().await;
         if open_docs.contains_key(uri) {
-            info!("Document already open: {}", uri);
+            debug!("Document already open: {}", uri);
             return Ok(());
         }
 
         self.diagnostics.lock().await.remove(uri);
 
-        info!("Opening document: {}", uri);
+        debug!("Opening document: {}", uri);
         let params = json!({
             "textDocument": {
                 "uri": uri,
@@ -590,14 +606,24 @@ impl RustAnalyzerClient {
 
     pub async fn shutdown(&self) -> Result<()> {
         if self.initialized.swap(false, Ordering::AcqRel) {
-            let _ = self.send_request("shutdown", None).await;
-            let _ = self.send_notification("exit", None).await;
+            if let Err(e) = self.send_request("shutdown", None).await {
+                debug!(
+                    "LSP shutdown request failed (process may already be gone): {}",
+                    e
+                );
+            }
+            if let Err(e) = self.send_notification("exit", None).await {
+                debug!("LSP exit notification failed: {}", e);
+            }
         }
 
         if let Some(mut process) = self.process.lock().await.take() {
-            // Kill the process and wait for it to actually exit.
-            let _ = process.kill().await;
-            let _ = process.wait().await;
+            if let Err(e) = process.kill().await {
+                warn!("Failed to kill rust-analyzer process: {}", e);
+            }
+            if let Err(e) = process.wait().await {
+                warn!("Failed to reap rust-analyzer process: {}", e);
+            }
         }
 
         // Drop stdin so the BufWriter releases the FD.
@@ -610,6 +636,26 @@ impl RustAnalyzerClient {
     }
 }
 
+impl Drop for RustAnalyzerClient {
+    /// Backstop for callers that drop the client without `shutdown()`.
+    /// `kill_on_drop(true)` on the spawned `Command` already arranges for
+    /// tokio to reap the child as soon as the `Child` value drops; here we
+    /// just make sure that happens by taking the `Child` out of its mutex.
+    /// We intentionally don't `await` anything — `Drop` is sync.
+    fn drop(&mut self) {
+        // Best effort: try to grab the child without blocking. If the mutex
+        // is contended (e.g. shutdown is in flight on another task), the
+        // owner of that lock is responsible for cleanup.
+        if let Ok(mut guard) = self.process.try_lock() {
+            if let Some(mut child) = guard.take() {
+                // start_kill is sync; the kernel-level reap happens via the
+                // tokio runtime's child-reaper.
+                let _ = child.start_kill();
+            }
+        }
+    }
+}
+
 fn hash_content(content: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);
@@ -617,20 +663,18 @@ fn hash_content(content: &str) -> u64 {
 }
 
 fn find_rust_analyzer() -> Result<PathBuf> {
-    which::which("rust-analyzer").or_else(|_| {
-        // Try common installation locations if not in PATH.
-        let home = std::env::var("HOME").unwrap_or_else(|_| String::from("~"));
+    if let Ok(p) = which::which("rust-analyzer") {
+        return Ok(p);
+    }
+    // Fallback: ~/.cargo/bin install location, in case PATH wasn't inherited
+    // (e.g. when this binary is launched from a GUI on macOS/Linux).
+    if let Some(home) = std::env::var_os("HOME") {
         let cargo_bin = PathBuf::from(home).join(".cargo/bin/rust-analyzer");
         if cargo_bin.exists() {
-            Ok(cargo_bin)
-        } else {
-            which::which("rust-analyzer")
+            return Ok(cargo_bin);
         }
-    })
-    .map_err(|e| {
-        anyhow!(
-            "Failed to find rust-analyzer in PATH or ~/.cargo/bin: {}. Please ensure rust-analyzer is installed.",
-            e
-        )
-    })
+    }
+    Err(anyhow!(
+        "Failed to find rust-analyzer in PATH or ~/.cargo/bin. Please ensure rust-analyzer is installed."
+    ))
 }

@@ -11,6 +11,7 @@ use tracing::warn;
 use crate::{
     config::{MAX_RESTART_COUNT, RESTART_WINDOW_SECS},
     lsp::RustAnalyzerClient,
+    util::canonicalize_path,
 };
 
 /// One isolated rust-analyzer workspace. Owns its own subprocess (lazy), its
@@ -30,13 +31,13 @@ pub(super) struct WorkspaceEntry {
 }
 
 impl WorkspaceEntry {
-    fn new(id: String, root: PathBuf) -> Arc<Self> {
-        Arc::new(Self {
+    fn new(id: String, root: PathBuf) -> Self {
+        Self {
             id,
-            root: parking_lot::RwLock::new(canonicalize_root(root)),
+            root: parking_lot::RwLock::new(canonicalize_path(root)),
             client: RwLock::new(None),
             restart_history: parking_lot::Mutex::new(VecDeque::new()),
-        })
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -151,7 +152,7 @@ impl WorkspaceEntry {
         if let Some(c) = self.client.write().await.take() {
             let _ = c.shutdown().await;
         }
-        *self.root.write() = canonicalize_root(new_root);
+        *self.root.write() = canonicalize_path(new_root);
     }
 
     /// Tear down the client (if running). Used when removing a workspace from
@@ -210,7 +211,7 @@ impl WorkspaceRegistry {
     pub fn add(&mut self, root: PathBuf) -> Arc<WorkspaceEntry> {
         let id = format!("ws-{}", self.next_id);
         self.next_id += 1;
-        let entry = WorkspaceEntry::new(id.clone(), root);
+        let entry = Arc::new(WorkspaceEntry::new(id.clone(), root));
         self.by_id.insert(id.clone(), Arc::clone(&entry));
         self.order.push(id);
         entry
@@ -238,16 +239,4 @@ impl WorkspaceRegistry {
             .filter_map(|id| self.by_id.get(id).cloned())
             .collect()
     }
-}
-
-fn canonicalize_root(root: PathBuf) -> PathBuf {
-    root.canonicalize().unwrap_or_else(|_| {
-        if root.is_absolute() {
-            root.clone()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(&root)
-        }
-    })
 }

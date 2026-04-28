@@ -1,29 +1,37 @@
 use anyhow::Result;
 use serde_json::{json, Value};
-use tracing::info;
+use tracing::debug;
 
 use super::{client::RustAnalyzerClient, error::LspError};
 
-/// Lookup-tool errors (no symbol at position, index not ready) collapse to Ok(null) so callers
-/// can distinguish them from transport/timeout failures, which keep propagating as Err.
-fn lookup_to_null(res: std::result::Result<Value, LspError>) -> Result<Value> {
+/// Coerce an `LspError` to `Ok(null)` when the predicate matches (used to
+/// turn "no symbol here" / "index not ready" into a lookup miss the LLM can
+/// recognize), otherwise propagate the error.
+fn coerce_null<F>(res: std::result::Result<Value, LspError>, treat_as_null: F) -> Result<Value>
+where
+    F: Fn(&LspError) -> bool,
+{
     match res {
         Ok(v) => Ok(v),
-        Err(e) if e.is_no_result() => Ok(json!(null)),
+        Err(e) if treat_as_null(&e) => Ok(json!(null)),
         Err(e) => Err(anyhow::Error::new(e)),
     }
 }
 
+/// Standard lookup-style coercion: errors that mean "no result for this position".
+fn lookup_to_null(res: std::result::Result<Value, LspError>) -> Result<Value> {
+    coerce_null(res, LspError::is_no_result)
+}
+
+/// Pass through every `LspError` as `anyhow::Error` (no null coercion).
 fn strict(res: std::result::Result<Value, LspError>) -> Result<Value> {
     res.map_err(anyhow::Error::new)
 }
 
+/// Rename-style coercion: also treats `InvalidParams` as a miss because
+/// rust-analyzer reports "no renamable symbol" via -32602 instead of null.
 fn rename_lookup_to_null(res: std::result::Result<Value, LspError>) -> Result<Value> {
-    match res {
-        Ok(v) => Ok(v),
-        Err(e) if e.is_no_rename_target() => Ok(json!(null)),
-        Err(e) => Err(anyhow::Error::new(e)),
-    }
+    coerce_null(res, LspError::is_no_rename_target)
 }
 
 impl RustAnalyzerClient {
@@ -102,18 +110,13 @@ impl RustAnalyzerClient {
     pub async fn diagnostics(&self, uri: &str) -> Result<Value> {
         // First check if we have stored diagnostics from publishDiagnostics.
         let diag_lock = self.diagnostics.lock().await;
-        info!("Looking for diagnostics for URI: {}", uri);
-        info!(
-            "Available URIs with diagnostics: {:?}",
-            diag_lock.keys().collect::<Vec<_>>()
-        );
         if let Some(diags) = diag_lock.get(uri) {
-            info!("Found {} stored diagnostics for {}", diags.len(), uri);
+            debug!("Found {} stored diagnostics for {}", diags.len(), uri);
             return Ok(json!(diags));
         }
         drop(diag_lock);
 
-        info!("No stored diagnostics for {}, trying pull model", uri);
+        debug!("No stored diagnostics for {}, trying pull model", uri);
         // If no stored diagnostics, try the pull model as fallback.
         let params = json!({
             "textDocument": { "uri": uri }
@@ -424,8 +427,16 @@ fn filter_diagnostics_in_range(diagnostics: &Value, start_line: u32, end_line: u
                 return false;
             };
 
-            let diag_start_line = start.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32;
-            let diag_end_line = end.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as u32;
+            let diag_start_line = start
+                .get("line")
+                .and_then(|l| l.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0);
+            let diag_end_line = end
+                .get("line")
+                .and_then(|l| l.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0);
 
             // Check if diagnostic overlaps with requested range.
             diag_start_line <= end_line && diag_end_line >= start_line

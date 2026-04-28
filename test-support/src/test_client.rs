@@ -177,7 +177,7 @@ impl MCPTestClient {
         std::fs::create_dir_all(format!("{}/target", temp_dir)).ok();
 
         let mut process = Command::new("cargo")
-            .args(&["run", "--", workspace.to_str().unwrap()])
+            .args(["run", "--", workspace.to_str().unwrap()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -227,10 +227,7 @@ pub fn paginate_workspace_diagnostics(
     let Some(obj) = value.as_object_mut() else {
         return value;
     };
-    let Some(files_val) = obj.get_mut("files") else {
-        return value;
-    };
-    let Some(files) = files_val.as_object() else {
+    let Some(files) = obj.get_mut("files").and_then(|v| v.as_object_mut()) else {
         return value;
     };
 
@@ -245,12 +242,7 @@ pub fn paginate_workspace_diagnostics(
     if returned < total {
         let kept: std::collections::HashSet<&str> =
             keys[start..end].iter().map(|s| s.as_str()).collect();
-        let original = files.clone();
-        let filtered: serde_json::Map<String, Value> = original
-            .into_iter()
-            .filter(|(k, _)| kept.contains(k.as_str()))
-            .collect();
-        *files_val = Value::Object(filtered);
+        files.retain(|k, _| kept.contains(k.as_str()));
     }
 
     let mut pagination = json!({

@@ -10,7 +10,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     lsp::client::CURRENT_MCP_REQUEST_ID,
-    protocol::mcp::{MCPError, MCPRequest, MCPResponse},
+    protocol::mcp::{error_codes, MCPRequest, MCPResponse},
 };
 
 use super::workspace::{WorkspaceEntry, WorkspaceRegistry};
@@ -240,48 +240,24 @@ impl RustAnalyzerMCPServer {
         .await;
 
         match listed {
-            Ok(value) => MCPResponse::Success {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: value,
-            },
+            Ok(value) => MCPResponse::success(request.id, value),
             Err(e) => {
                 error!("resources/list join error: {}", e);
-                MCPResponse::Error {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    error: MCPError {
-                        code: -32603,
-                        message: format!("Internal error: {e}"),
-                        data: None,
-                    },
-                }
+                MCPResponse::error(
+                    request.id,
+                    error_codes::INTERNAL_ERROR,
+                    format!("Internal error: {e}"),
+                )
             }
         }
     }
 
     async fn handle_resources_read(self: &Arc<Self>, request: MCPRequest) -> MCPResponse {
         let Some(params) = request.params else {
-            return MCPResponse::Error {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                error: MCPError {
-                    code: -32602,
-                    message: "Invalid params".to_string(),
-                    data: None,
-                },
-            };
+            return MCPResponse::error(request.id, error_codes::INVALID_PARAMS, "Invalid params");
         };
         let Some(uri) = params["uri"].as_str().map(|s| s.to_string()) else {
-            return MCPResponse::Error {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                error: MCPError {
-                    code: -32602,
-                    message: "Missing uri".to_string(),
-                    data: None,
-                },
-            };
+            return MCPResponse::error(request.id, error_codes::INVALID_PARAMS, "Missing uri");
         };
 
         // Resolve workspace from URI: `workspace://<id>/<rest>` targets a
@@ -295,15 +271,11 @@ impl RustAnalyzerMCPServer {
         let (workspace_root, read_uri) = match resolved {
             Some(pair) => pair,
             None => {
-                return MCPResponse::Error {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    error: MCPError {
-                        code: -32603,
-                        message: "No workspace registered to serve this URI".to_string(),
-                        data: None,
-                    },
-                };
+                return MCPResponse::error(
+                    request.id,
+                    error_codes::INTERNAL_ERROR,
+                    "No workspace registered to serve this URI",
+                );
             }
         };
 
@@ -330,32 +302,18 @@ impl RustAnalyzerMCPServer {
                         }
                     }
                 }
-                MCPResponse::Success {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: value,
-                }
+                MCPResponse::success(request.id, value)
             }
-            Ok(Err(e)) => MCPResponse::Error {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                error: MCPError {
-                    code: -32602,
-                    message: e.to_string(),
-                    data: None,
-                },
-            },
+            Ok(Err(e)) => {
+                MCPResponse::error(request.id, error_codes::INVALID_PARAMS, e.to_string())
+            }
             Err(e) => {
                 error!("resources/read join error: {}", e);
-                MCPResponse::Error {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    error: MCPError {
-                        code: -32603,
-                        message: format!("Internal error: {e}"),
-                        data: None,
-                    },
-                }
+                MCPResponse::error(
+                    request.id,
+                    error_codes::INTERNAL_ERROR,
+                    format!("Internal error: {e}"),
+                )
             }
         }
     }
@@ -434,10 +392,9 @@ impl RustAnalyzerMCPServer {
 
     async fn handle_request(self: &Arc<Self>, request: MCPRequest) -> MCPResponse {
         match request.method.as_str() {
-            "initialize" => MCPResponse::Success {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: json!({
+            "initialize" => MCPResponse::success(
+                request.id,
+                json!({
                     "protocolVersion": "2024-11-05",
                     "serverInfo": {
                         "name": "rust-analyzer-mcp",
@@ -448,37 +405,27 @@ impl RustAnalyzerMCPServer {
                         "resources": {}
                     }
                 }),
-            },
-            "tools/list" => MCPResponse::Success {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: super::tools::tools_list_result().clone(),
-            },
+            ),
+            "tools/list" => {
+                MCPResponse::success(request.id, super::tools::tools_list_result().clone())
+            }
             "resources/list" => self.handle_resources_list(request).await,
             "resources/read" => self.handle_resources_read(request).await,
             "tools/call" => {
                 let Some(params) = request.params else {
-                    return MCPResponse::Error {
-                        jsonrpc: "2.0".to_string(),
-                        id: request.id,
-                        error: MCPError {
-                            code: -32602,
-                            message: "Invalid params".to_string(),
-                            data: None,
-                        },
-                    };
+                    return MCPResponse::error(
+                        request.id,
+                        error_codes::INVALID_PARAMS,
+                        "Invalid params",
+                    );
                 };
 
                 let Some(tool_name) = params["name"].as_str() else {
-                    return MCPResponse::Error {
-                        jsonrpc: "2.0".to_string(),
-                        id: request.id,
-                        error: MCPError {
-                            code: -32602,
-                            message: "Missing tool name".to_string(),
-                            data: None,
-                        },
-                    };
+                    return MCPResponse::error(
+                        request.id,
+                        error_codes::INVALID_PARAMS,
+                        "Missing tool name",
+                    );
                 };
 
                 let args = params
@@ -487,34 +434,23 @@ impl RustAnalyzerMCPServer {
                     .unwrap_or_else(|| json!({}));
 
                 match super::handlers::handle_tool_call(self, tool_name, args).await {
-                    Ok(result) => MCPResponse::Success {
-                        jsonrpc: "2.0".to_string(),
-                        id: request.id,
-                        result: serde_json::to_value(result).unwrap(),
-                    },
+                    Ok(result) => MCPResponse::success(
+                        request.id,
+                        // ToolResult is a fixed shape (Vec<ContentItem> of strings) — to_value
+                        // can only fail on cycles, which we don't construct.
+                        serde_json::to_value(result).expect("ToolResult always serializes to JSON"),
+                    ),
                     Err(e) => {
                         error!("Tool call error: {}", e);
-                        MCPResponse::Error {
-                            jsonrpc: "2.0".to_string(),
-                            id: request.id,
-                            error: MCPError {
-                                code: -1,
-                                message: e.to_string(),
-                                data: None,
-                            },
-                        }
+                        MCPResponse::error(request.id, error_codes::INTERNAL_ERROR, e.to_string())
                     }
                 }
             }
-            _ => MCPResponse::Error {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                error: MCPError {
-                    code: -32601,
-                    message: format!("Method not found: {}", request.method),
-                    data: None,
-                },
-            },
+            _ => MCPResponse::error(
+                request.id,
+                error_codes::METHOD_NOT_FOUND,
+                format!("Method not found: {}", request.method),
+            ),
         }
     }
 }
@@ -551,12 +487,16 @@ fn resolve_resource_uri(uri: &str, registry: &WorkspaceRegistry) -> Option<(Path
 
 /// Canonicalises a JSON-RPC request id (string, number, or null) into a stable
 /// HashMap key. Numbers are stringified consistently so that `1` and `1.0` map
-/// to the same task.
+/// to the same task. Disjoint `s::` / `n::` prefixes prevent a string id like
+/// `"n:1"` from colliding with the numeric id `1`.
 fn canonical_id_key(id: &Value) -> String {
     match id {
-        Value::String(s) => format!("s:{}", s),
-        Value::Number(n) => format!("n:{}", n),
+        Value::String(s) => format!("s::{}", s),
+        Value::Number(n) => format!("n::{}", n),
         Value::Null => "null".to_string(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| "unknown".to_string()),
+        other => format!(
+            "x::{}",
+            serde_json::to_string(other).unwrap_or_else(|_| "unknown".to_string())
+        ),
     }
 }

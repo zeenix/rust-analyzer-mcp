@@ -10,7 +10,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{Child, ChildStdin},
-    sync::{oneshot, watch, Mutex},
+    sync::{oneshot, watch, Mutex, Notify},
 };
 use tracing::{debug, error, info, warn};
 
@@ -105,6 +105,7 @@ pub fn start_handlers(
     stdin: SharedStdin,
     pending_requests: PendingRequests,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    diagnostics_changed: Arc<Notify>,
     progress: ProgressMap,
 ) {
     // Log stderr in background.
@@ -116,6 +117,7 @@ pub fn start_handlers(
         stdin,
         pending_requests,
         diagnostics,
+        diagnostics_changed,
         progress,
     ));
 }
@@ -150,6 +152,7 @@ async fn handle_stdout(
     stdin: SharedStdin,
     pending: PendingRequests,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    diagnostics_changed: Arc<Notify>,
     progress: ProgressMap,
 ) {
     let mut reader = BufReader::new(stdout);
@@ -191,7 +194,15 @@ async fn handle_stdout(
         let response_str = String::from_utf8_lossy(&json_buffer);
         debug!("Received LSP message: {}", response_str);
 
-        handle_lsp_message(&json_buffer, &stdin, &pending, &diagnostics, &progress).await;
+        handle_lsp_message(
+            &json_buffer,
+            &stdin,
+            &pending,
+            &diagnostics,
+            &diagnostics_changed,
+            &progress,
+        )
+        .await;
     }
 }
 
@@ -206,6 +217,7 @@ async fn handle_lsp_message(
     stdin: &SharedStdin,
     pending: &PendingRequests,
     diagnostics: &Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    diagnostics_changed: &Arc<Notify>,
     progress: &ProgressMap,
 ) {
     let Ok(json_value) = serde_json::from_slice::<Value>(json_buffer) else {
@@ -221,7 +233,7 @@ async fn handle_lsp_message(
 
     // Notification (method, no id).
     if has_method && !has_id {
-        handle_notification(json_value, diagnostics, progress).await;
+        handle_notification(json_value, diagnostics, diagnostics_changed, progress).await;
         return;
     }
 
@@ -266,6 +278,7 @@ async fn handle_lsp_message(
 async fn handle_notification(
     json_value: Value,
     diagnostics: &Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    diagnostics_changed: &Arc<Notify>,
     progress: &ProgressMap,
 ) {
     let Some(method) = json_value.get("method").and_then(|m| m.as_str()) else {
@@ -276,7 +289,7 @@ async fn handle_notification(
 
     match method {
         "textDocument/publishDiagnostics" => {
-            handle_publish_diagnostics(&json_value, diagnostics).await;
+            handle_publish_diagnostics(&json_value, diagnostics, diagnostics_changed).await;
         }
         "$/progress" => {
             handle_progress(&json_value, progress);
@@ -288,6 +301,7 @@ async fn handle_notification(
 async fn handle_publish_diagnostics(
     json_value: &Value,
     diagnostics: &Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    diagnostics_changed: &Arc<Notify>,
 ) {
     let Some(params) = json_value.get("params") else {
         return;
@@ -303,7 +317,12 @@ async fn handle_publish_diagnostics(
 
     let mut diag_lock = diagnostics.lock().await;
     diag_lock.insert(uri.to_string(), diags.clone());
-    info!("Stored {} diagnostics for {}", diags.len(), uri);
+    drop(diag_lock);
+
+    debug!("Stored {} diagnostics for {}", diags.len(), uri);
+    // Wake every task currently awaiting `client.wait_for_diagnostics_change()`
+    // so it can re-check its URI against the freshly populated map.
+    diagnostics_changed.notify_waiters();
 }
 
 fn handle_progress(json_value: &Value, progress: &ProgressMap) {

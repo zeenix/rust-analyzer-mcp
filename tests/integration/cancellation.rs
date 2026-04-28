@@ -47,16 +47,13 @@ async fn test_cancellation_doesnt_break_server() -> Result<()> {
     // either the cancelled-but-already-completed response or nothing at all.
     let mut leftover = Vec::new();
     let drain = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        loop {
-            match client.send_request("tools/list", None).await {
-                Ok(v) => {
-                    leftover.push(v);
-                    break;
-                }
-                Err(e) => return Err::<(), _>(e),
+        match client.send_request("tools/list", None).await {
+            Ok(v) => {
+                leftover.push(v);
+                Ok(())
             }
+            Err(e) => Err::<(), _>(e),
         }
-        Ok(())
     })
     .await;
     let _ = drain; // we don't care about the exact result, only that nothing panicked

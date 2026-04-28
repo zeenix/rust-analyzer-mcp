@@ -488,6 +488,134 @@ async fn test_phase2_truncation_and_pagination() -> Result<()> {
     Ok(())
 }
 
+/// Phase 2.1 — Snippet-Anreicherung: `references` und `workspace_symbol`
+/// liefern per Default ein `snippet`-Sibling neben jeder Location, und
+/// `include_snippets=false` schaltet das ab.
+#[tokio::test]
+async fn test_phase2_1_snippets() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
+    let main_path = workspace_path.join("src/main.rs");
+    let main_str = main_path.to_str().unwrap();
+
+    // Helper: collect every nested `snippet` field in a JSON value.
+    fn collect_snippets(v: &Value, out: &mut Vec<Value>) {
+        match v {
+            Value::Array(items) => items.iter().for_each(|i| collect_snippets(i, out)),
+            Value::Object(obj) => {
+                if let Some(s) = obj.get("snippet") {
+                    out.push(s.clone());
+                }
+                for (_, child) in obj {
+                    collect_snippets(child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 1. references with default args → snippets attached.
+    let response = client
+        .call_tool(
+            "rust_analyzer_references",
+            json!({ "file_path": main_str, "line": 9, "character": 4 }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    if text != "null" {
+        let v: Value = serde_json::from_str(&text)?;
+        let mut snippets = Vec::new();
+        collect_snippets(&v, &mut snippets);
+        // We don't pin the count (depends on indexing state) but if any
+        // references came back, at least one should carry a snippet.
+        if let Some(arr) = v.as_array() {
+            if !arr.is_empty() {
+                assert!(
+                    !snippets.is_empty(),
+                    "default references call should attach snippets, got {v:#?}"
+                );
+                let first = &snippets[0];
+                assert!(first.get("start_line").is_some());
+                assert!(first.get("lines").is_some());
+                assert!(first["lines"].is_array());
+            }
+        }
+    }
+
+    // 2. references with include_snippets=false → no snippets at all.
+    let response = client
+        .call_tool(
+            "rust_analyzer_references",
+            json!({
+                "file_path": main_str,
+                "line": 9,
+                "character": 4,
+                "include_snippets": false,
+            }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    if text != "null" {
+        let v: Value = serde_json::from_str(&text)?;
+        let mut snippets = Vec::new();
+        collect_snippets(&v, &mut snippets);
+        assert!(
+            snippets.is_empty(),
+            "include_snippets=false must skip snippet attachment, got {snippets:#?}"
+        );
+    }
+
+    // 3. workspace_symbol — paginated wrapper, snippet must sit on the nested location object (not
+    //    the symbol itself).
+    let response = client
+        .call_tool(
+            "rust_analyzer_workspace_symbol",
+            json!({ "query": "Calculator", "limit": 5 }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    if text != "null" {
+        let v: Value = serde_json::from_str(&text)?;
+        if let Some(symbols) = v.get("symbols").and_then(|s| s.as_array()) {
+            for sym in symbols {
+                if let Some(loc) = sym.get("location") {
+                    // If a location is present, it should also carry a snippet.
+                    assert!(
+                        loc.get("snippet").is_some(),
+                        "expected snippet on location in symbol {sym:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // 4. snippet_context_lines=0 → snippet covers exactly the range lines.
+    let response = client
+        .call_tool(
+            "rust_analyzer_definition",
+            json!({
+                "file_path": main_str,
+                "line": 1,
+                "character": 18,
+                "snippet_context_lines": 0,
+            }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    if text != "null" && text != "[]" {
+        let v: Value = serde_json::from_str(&text)?;
+        let mut snippets = Vec::new();
+        collect_snippets(&v, &mut snippets);
+        if let Some(s) = snippets.first() {
+            let lines = s["lines"].as_array().expect("snippet lines");
+            // 1 line for a single-line range, up to a few for a multi-line one.
+            assert!(!lines.is_empty(), "snippet must include at least one line");
+        }
+    }
+
+    Ok(())
+}
+
 /// Phase 3.1 — MCP-Resources: list + read für `workspace://files`,
 /// `workspace://crates` und per-Crate-Manifests.
 #[tokio::test]
@@ -560,7 +688,7 @@ async fn test_phase3_resources() -> Result<()> {
     );
     let test_project = pkgs.iter().find(|p| p["name"] == "test-project").unwrap();
     assert_eq!(test_project["is_workspace_member"], true);
-    assert!(test_project["targets"].as_array().unwrap().len() >= 1);
+    assert!(!test_project["targets"].as_array().unwrap().is_empty());
 
     // 4. resources/read for the per-crate manifest — returns the actual Cargo.toml.
     let manifest_resp = client

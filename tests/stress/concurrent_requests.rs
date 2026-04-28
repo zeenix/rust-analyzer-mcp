@@ -16,7 +16,7 @@ async fn test_concurrent_tool_calls() -> Result<()> {
     let main_path_str = main_path.to_str().unwrap();
 
     // Each concurrent task will create its own client connection to the shared server
-    let tasks = vec![
+    let tasks = [
         ("rust_analyzer_symbols", json!({"file_path": main_path_str})),
         (
             "rust_analyzer_hover",
@@ -273,7 +273,7 @@ async fn test_stress_different_files() -> Result<()> {
     let workspace_path = temp_client.workspace_path().to_path_buf();
     drop(temp_client);
 
-    let files = vec![
+    let files = [
         workspace_path
             .join("src/main.rs")
             .to_str()

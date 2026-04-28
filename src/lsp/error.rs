@@ -1,13 +1,20 @@
-use std::fmt;
+use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Error)]
 pub enum LspError {
+    #[error("LSP method '{method}' not found: {message}")]
     MethodNotFound { method: String, message: String },
+    #[error("invalid LSP params: {0}")]
     InvalidParams(String),
+    #[error("LSP internal error {code}: {message}")]
     InternalError { code: i64, message: String },
+    #[error("LSP request cancelled")]
     Cancelled,
+    #[error("LSP request timeout: {0}")]
     Timeout(String),
+    #[error("rust-analyzer process exited")]
     ProcessDied,
+    #[error("LSP transport error: {0}")]
     Transport(String),
 }
 
@@ -30,6 +37,15 @@ impl LspError {
         }
     }
 
+    /// Treat "no symbol/out-of-range/index not ready" errors as a lookup miss
+    /// (Ok(null)) rather than propagating. rust-analyzer in practice signals
+    /// every flavour of "I have nothing useful here" via generic InternalError
+    /// -32603 (e.g. `Invalid offset`, `no rust file`) on top of the standard
+    /// MethodNotFound and the request-state sentinel codes (-32801..=-32803).
+    ///
+    /// Callers that want to distinguish a real internal bug from a lookup miss
+    /// should rely on the `tracing` logs — `lsp/connection.rs` logs every
+    /// non-zero LSP error at `error!` level before this coercion runs.
     pub fn is_no_result(&self) -> bool {
         matches!(
             self,
@@ -43,23 +59,3 @@ impl LspError {
         self.is_no_result() || matches!(self, LspError::InvalidParams(_))
     }
 }
-
-impl fmt::Display for LspError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LspError::MethodNotFound { method, message } => {
-                write!(f, "LSP method '{}' not found: {}", method, message)
-            }
-            LspError::InvalidParams(m) => write!(f, "invalid LSP params: {}", m),
-            LspError::InternalError { code, message } => {
-                write!(f, "LSP internal error {}: {}", code, message)
-            }
-            LspError::Cancelled => write!(f, "LSP request cancelled"),
-            LspError::Timeout(m) => write!(f, "LSP request timeout: {}", m),
-            LspError::ProcessDied => write!(f, "rust-analyzer process exited"),
-            LspError::Transport(m) => write!(f, "LSP transport error: {}", m),
-        }
-    }
-}
-
-impl std::error::Error for LspError {}
