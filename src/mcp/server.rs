@@ -289,6 +289,35 @@ impl RustAnalyzerMCPServer {
         Ok(())
     }
 
+    async fn handle_resources_list(self: &Arc<Self>, request: MCPRequest) -> MCPResponse {
+        let workspace_root = self.workspace_root.read().await.clone();
+        // list_resources may shell out to `cargo metadata`; offload to a
+        // blocking thread so a slow workspace doesn't stall the request reader.
+        let listed =
+            tokio::task::spawn_blocking(move || super::resources::list_resources(&workspace_root))
+                .await;
+
+        match listed {
+            Ok(value) => MCPResponse::Success {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: value,
+            },
+            Err(e) => {
+                error!("resources/list join error: {}", e);
+                MCPResponse::Error {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    error: MCPError {
+                        code: -32603,
+                        message: format!("Internal error: {e}"),
+                        data: None,
+                    },
+                }
+            }
+        }
+    }
+
     async fn handle_resources_read(self: &Arc<Self>, request: MCPRequest) -> MCPResponse {
         let Some(params) = request.params else {
             return MCPResponse::Error {
@@ -441,11 +470,7 @@ impl RustAnalyzerMCPServer {
                 id: request.id,
                 result: super::tools::tools_list_result().clone(),
             },
-            "resources/list" => MCPResponse::Success {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: super::resources::list_resources(),
-            },
+            "resources/list" => self.handle_resources_list(request).await,
             "resources/read" => self.handle_resources_read(request).await,
             "tools/call" => {
                 let Some(params) = request.params else {

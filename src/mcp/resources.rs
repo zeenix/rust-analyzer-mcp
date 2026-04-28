@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 pub const FILES_URI: &str = "workspace://files";
+pub const CRATES_URI: &str = "workspace://crates";
+pub const CRATE_MANIFEST_PREFIX: &str = "workspace://crate/";
+pub const CRATE_MANIFEST_SUFFIX: &str = "/Cargo.toml";
 pub const FILE_TREE_MAX_ENTRIES: usize = 5000;
 pub const FILE_TREE_MAX_DEPTH: usize = 16;
 
@@ -25,35 +28,172 @@ const IGNORED_DIRS: &[&str] = &[
     ".direnv",
 ];
 
-pub fn list_resources() -> Value {
-    json!({
-        "resources": [
-            {
-                "uri": FILES_URI,
-                "name": "Workspace files",
-                "description": "Recursive file tree of the workspace root. Skips target/, .git/, node_modules/ and similar build/VCS dirs. Capped at 5000 entries and 16 levels deep; symlinks are reported but not followed.",
-                "mimeType": "application/json",
+pub fn list_resources(workspace_root: &Path) -> Value {
+    let mut resources = vec![json!({
+        "uri": FILES_URI,
+        "name": "Workspace files",
+        "description": "Recursive file tree of the workspace root. Skips target/, .git/, node_modules/ and similar build/VCS dirs. Capped at 5000 entries and 16 levels deep; symlinks are reported but not followed.",
+        "mimeType": "application/json",
+    })];
+
+    if let Some(metadata) = cargo_metadata(workspace_root) {
+        resources.push(json!({
+            "uri": CRATES_URI,
+            "name": "Workspace crates",
+            "description": "Summary of crates in this Cargo workspace (name, version, manifest path, targets, declared dependencies). Sourced from `cargo metadata --no-deps`.",
+            "mimeType": "application/json",
+        }));
+
+        if let Some(packages) = metadata["packages"].as_array() {
+            for pkg in packages {
+                let Some(name) = pkg["name"].as_str() else {
+                    continue;
+                };
+                resources.push(json!({
+                    "uri": format!("{CRATE_MANIFEST_PREFIX}{name}{CRATE_MANIFEST_SUFFIX}"),
+                    "name": format!("{name} Cargo.toml"),
+                    "description": format!("Cargo manifest for the `{name}` crate."),
+                    "mimeType": "application/toml",
+                }));
             }
-        ]
-    })
+        }
+    }
+
+    json!({ "resources": resources })
 }
 
 pub fn read_resource(workspace_root: &Path, uri: &str) -> Result<Value> {
-    match uri {
-        FILES_URI => {
-            let tree = build_file_tree(workspace_root);
-            Ok(json!({
-                "contents": [
-                    {
-                        "uri": uri,
-                        "mimeType": "application/json",
-                        "text": serde_json::to_string_pretty(&tree)?,
-                    }
-                ]
-            }))
-        }
-        _ => Err(anyhow!("Unknown resource: {uri}")),
+    if uri == FILES_URI {
+        let tree = build_file_tree(workspace_root);
+        return Ok(json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": serde_json::to_string_pretty(&tree)?,
+            }]
+        }));
     }
+
+    if uri == CRATES_URI {
+        let metadata = cargo_metadata(workspace_root).ok_or_else(|| {
+            anyhow!("cargo metadata failed (workspace root is not a Cargo workspace?)")
+        })?;
+        let summary = reshape_metadata(&metadata);
+        return Ok(json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": serde_json::to_string_pretty(&summary)?,
+            }]
+        }));
+    }
+
+    if let Some(name) = uri
+        .strip_prefix(CRATE_MANIFEST_PREFIX)
+        .and_then(|rest| rest.strip_suffix(CRATE_MANIFEST_SUFFIX))
+    {
+        // Look up the crate's manifest path via cargo metadata so we never
+        // dereference a caller-supplied path component — guards against
+        // path-traversal via crafted crate names.
+        let metadata =
+            cargo_metadata(workspace_root).ok_or_else(|| anyhow!("cargo metadata failed"))?;
+        let manifest_path = find_manifest_for_crate(&metadata, name)
+            .ok_or_else(|| anyhow!("Unknown crate: {name}"))?;
+        let content = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| anyhow!("Failed to read {}: {e}", manifest_path))?;
+        return Ok(json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/toml",
+                "text": content,
+            }]
+        }));
+    }
+
+    Err(anyhow!("Unknown resource: {uri}"))
+}
+
+fn cargo_metadata(workspace_root: &Path) -> Option<Value> {
+    let output = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(workspace_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Collapse the full `cargo metadata` output into a smaller summary suited
+/// to LLM consumption: per-package name/version/manifest, target list, and
+/// declared dependency names. Drops registry metadata, license fields,
+/// resolution graph, etc.
+fn reshape_metadata(metadata: &Value) -> Value {
+    let workspace_root = metadata["workspace_root"].as_str().unwrap_or("");
+    let workspace_members: Vec<&str> = metadata["workspace_members"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let packages: Vec<Value> = metadata["packages"]
+        .as_array()
+        .map(|pkgs| {
+            pkgs.iter()
+                .filter_map(|p| {
+                    let name = p["name"].as_str()?;
+                    let version = p["version"].as_str()?;
+                    let manifest_path = p["manifest_path"].as_str()?;
+                    let id = p["id"].as_str().unwrap_or("");
+                    let is_workspace_member = workspace_members.contains(&id);
+
+                    let targets: Vec<Value> = p["targets"]
+                        .as_array()
+                        .map(|ts| {
+                            ts.iter()
+                                .filter_map(|t| {
+                                    Some(json!({
+                                        "name": t["name"].as_str()?,
+                                        "kind": t["kind"].clone(),
+                                        "src_path": t["src_path"].as_str()?,
+                                    }))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    let dependencies: Vec<&str> = p["dependencies"]
+                        .as_array()
+                        .map(|ds| ds.iter().filter_map(|d| d["name"].as_str()).collect())
+                        .unwrap_or_default();
+
+                    Some(json!({
+                        "name": name,
+                        "version": version,
+                        "manifest_path": manifest_path,
+                        "is_workspace_member": is_workspace_member,
+                        "targets": targets,
+                        "dependencies": dependencies,
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "workspace_root": workspace_root,
+        "packages": packages,
+    })
+}
+
+fn find_manifest_for_crate(metadata: &Value, name: &str) -> Option<String> {
+    metadata["packages"].as_array()?.iter().find_map(|p| {
+        if p["name"].as_str()? == name {
+            p["manifest_path"].as_str().map(String::from)
+        } else {
+            None
+        }
+    })
 }
 
 fn build_file_tree(root: &Path) -> Value {
@@ -160,12 +300,108 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn list_advertises_files_resource() {
-        let v = list_resources();
+    fn list_advertises_files_resource_in_non_cargo_dir() {
+        // A plain temp dir is not a Cargo workspace, so cargo metadata fails
+        // and only the static file-tree resource is advertised.
+        let dir = TempDir::new().unwrap();
+        let v = list_resources(dir.path());
         let arr = v["resources"].as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["uri"], FILES_URI);
-        assert_eq!(arr[0]["mimeType"], "application/json");
+        let uris: Vec<&str> = arr.iter().filter_map(|r| r["uri"].as_str()).collect();
+        assert!(uris.contains(&FILES_URI));
+        assert!(!uris.contains(&CRATES_URI));
+    }
+
+    #[test]
+    fn list_includes_crates_for_cargo_workspace() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "// empty\n").unwrap();
+
+        let v = list_resources(dir.path());
+        let arr = v["resources"].as_array().unwrap();
+        let uris: Vec<&str> = arr.iter().filter_map(|r| r["uri"].as_str()).collect();
+        assert!(uris.contains(&FILES_URI));
+        assert!(uris.contains(&CRATES_URI));
+        assert!(uris.iter().any(|u| u.contains("/crate/demo/Cargo.toml")));
+    }
+
+    #[test]
+    fn read_crates_returns_workspace_summary() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "// empty\n").unwrap();
+
+        let v = read_resource(dir.path(), CRATES_URI).unwrap();
+        let text = v["contents"][0]["text"].as_str().unwrap();
+        let body: Value = serde_json::from_str(text).unwrap();
+        let pkgs = body["packages"].as_array().unwrap();
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0]["name"], "demo");
+        assert_eq!(pkgs[0]["is_workspace_member"], true);
+        assert!(pkgs[0]["manifest_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("Cargo.toml"));
+    }
+
+    #[test]
+    fn read_crate_manifest_returns_toml() {
+        let dir = TempDir::new().unwrap();
+        let manifest = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        fs::write(dir.path().join("Cargo.toml"), manifest).unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "// empty\n").unwrap();
+
+        let v = read_resource(dir.path(), "workspace://crate/demo/Cargo.toml").unwrap();
+        assert_eq!(v["contents"][0]["mimeType"], "application/toml");
+        assert_eq!(v["contents"][0]["text"], manifest);
+    }
+
+    #[test]
+    fn read_crate_manifest_unknown_name_errors() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "// empty\n").unwrap();
+
+        let err =
+            read_resource(dir.path(), "workspace://crate/nonexistent/Cargo.toml").unwrap_err();
+        assert!(err.to_string().contains("Unknown crate"));
+    }
+
+    #[test]
+    fn read_crate_manifest_path_traversal_blocked() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "// empty\n").unwrap();
+
+        // Crafted name with ../ — must NOT escape the workspace; it should
+        // simply fail to match any package.
+        let err = read_resource(
+            dir.path(),
+            "workspace://crate/..%2F..%2Fetc%2Fpasswd/Cargo.toml",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Unknown crate"));
     }
 
     #[test]

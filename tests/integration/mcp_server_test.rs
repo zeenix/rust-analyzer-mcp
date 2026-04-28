@@ -418,22 +418,28 @@ async fn test_phase2_truncation_and_pagination() -> Result<()> {
     Ok(())
 }
 
-/// Phase 3.1 — MCP-Resources: list + read für `workspace://files`.
-///
-/// Verifiziert, dass der Server die Capability anbietet, dass `resources/list`
-/// die Files-Resource zurückgibt, und dass `resources/read` einen sortierten
-/// File-Tree mit `Cargo.toml` und `src/` für das test-project liefert.
+/// Phase 3.1 — MCP-Resources: list + read für `workspace://files`,
+/// `workspace://crates` und per-Crate-Manifests.
 #[tokio::test]
 async fn test_phase3_resources() -> Result<()> {
     let mut client = IpcClient::get_or_create("test-project").await?;
 
-    // 1. resources/list — must include workspace://files.
+    // 1. resources/list — must include workspace://files plus crate resources discovered via cargo
+    //    metadata.
     let list_resp = client.send_request("resources/list", None).await?;
     let resources = list_resp["resources"].as_array().expect("resources array");
     let uris: Vec<&str> = resources.iter().filter_map(|r| r["uri"].as_str()).collect();
     assert!(
         uris.contains(&"workspace://files"),
         "expected workspace://files in resources/list, got {uris:?}"
+    );
+    assert!(
+        uris.contains(&"workspace://crates"),
+        "expected workspace://crates in resources/list, got {uris:?}"
+    );
+    assert!(
+        uris.contains(&"workspace://crate/test-project/Cargo.toml"),
+        "expected per-crate manifest URI in resources/list, got {uris:?}"
     );
 
     // 2. resources/read for workspace://files — yields a JSON file-tree.
@@ -453,7 +459,6 @@ async fn test_phase3_resources() -> Result<()> {
     assert_eq!(tree["tree"]["type"], "dir");
     assert!(tree["stats"]["entries"].as_u64().unwrap() > 0);
 
-    // test-project has Cargo.toml and src/ at the root.
     let children = tree["tree"]["children"].as_array().expect("root children");
     let names: Vec<&str> = children.iter().filter_map(|c| c["name"].as_str()).collect();
     assert!(
@@ -464,10 +469,60 @@ async fn test_phase3_resources() -> Result<()> {
         names.contains(&"src"),
         "expected src/ at root, got {names:?}"
     );
-    // target/ must be skipped even if cargo built earlier.
     assert!(!names.contains(&"target"), "target/ should be ignored");
 
-    // 3. Unknown URI → error.
+    // 3. resources/read for workspace://crates — yields cargo metadata summary.
+    let crates_resp = client
+        .send_request(
+            "resources/read",
+            Some(json!({ "uri": "workspace://crates" })),
+        )
+        .await?;
+    let crates_text = crates_resp["contents"][0]["text"]
+        .as_str()
+        .expect("crates text");
+    let crates: Value = serde_json::from_str(crates_text)?;
+    let pkgs = crates["packages"].as_array().expect("packages");
+    let pkg_names: Vec<&str> = pkgs.iter().filter_map(|p| p["name"].as_str()).collect();
+    assert!(
+        pkg_names.contains(&"test-project"),
+        "expected test-project crate, got {pkg_names:?}"
+    );
+    let test_project = pkgs.iter().find(|p| p["name"] == "test-project").unwrap();
+    assert_eq!(test_project["is_workspace_member"], true);
+    assert!(test_project["targets"].as_array().unwrap().len() >= 1);
+
+    // 4. resources/read for the per-crate manifest — returns the actual Cargo.toml.
+    let manifest_resp = client
+        .send_request(
+            "resources/read",
+            Some(json!({ "uri": "workspace://crate/test-project/Cargo.toml" })),
+        )
+        .await?;
+    assert_eq!(manifest_resp["contents"][0]["mimeType"], "application/toml");
+    let manifest_text = manifest_resp["contents"][0]["text"]
+        .as_str()
+        .expect("manifest text");
+    assert!(
+        manifest_text.contains("[package]"),
+        "expected [package] section in manifest, got: {manifest_text}"
+    );
+    assert!(
+        manifest_text.contains("name = \"test-project\""),
+        "expected name = \"test-project\" in manifest"
+    );
+
+    // 5. Path-traversal attempts via crafted crate names must fail with Unknown crate, not a
+    //    filesystem read.
+    let bogus = client
+        .send_request(
+            "resources/read",
+            Some(json!({ "uri": "workspace://crate/..%2F..%2Fetc%2Fpasswd/Cargo.toml" })),
+        )
+        .await;
+    assert!(bogus.is_err(), "path traversal should fail");
+
+    // 6. Unknown URI → error.
     let resp = client
         .send_request("resources/read", Some(json!({ "uri": "workspace://nope" })))
         .await;
