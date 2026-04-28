@@ -1,21 +1,24 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use rust_analyzer_mcp::RustAnalyzerMCPServer;
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
 
-    // Get workspace path from command line or use current directory.
     let workspace_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
 
-    // Create and run the server.
-    let mut server = RustAnalyzerMCPServer::with_workspace(workspace_path);
+    let server = Arc::new(RustAnalyzerMCPServer::with_workspace(workspace_path));
     server.run().await?;
 
     Ok(())

@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
-use log::debug;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::{path::Path, sync::Arc};
 
 use crate::{
     diagnostics::format_diagnostics,
+    lsp::RustAnalyzerClient,
     protocol::mcp::{ContentItem, ToolResult},
 };
 
@@ -43,21 +43,87 @@ impl ToolParams {
     }
 }
 
+fn wrap(value: Value) -> Result<ToolResult> {
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&value)?,
+        }],
+    })
+}
+
+/// Common path: extract file_path, ensure the document is open, then run the LSP call.
+async fn with_doc<F, Fut>(
+    server: &Arc<RustAnalyzerMCPServer>,
+    args: &Value,
+    f: F,
+) -> Result<ToolResult>
+where
+    F: FnOnce(Arc<RustAnalyzerClient>, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    let file_path = ToolParams::extract_file_path(args)?;
+    let uri = server.open_document_if_needed(&file_path).await?;
+    let client = server.current_client().await?;
+    let value = f(client, uri).await?;
+    wrap(value)
+}
+
 pub async fn handle_tool_call(
-    server: &mut RustAnalyzerMCPServer,
+    server: &Arc<RustAnalyzerMCPServer>,
     tool_name: &str,
     args: Value,
 ) -> Result<ToolResult> {
     server.ensure_client_started().await?;
 
     match tool_name {
-        "rust_analyzer_hover" => handle_hover(server, args).await,
-        "rust_analyzer_definition" => handle_definition(server, args).await,
-        "rust_analyzer_references" => handle_references(server, args).await,
-        "rust_analyzer_completion" => handle_completion(server, args).await,
-        "rust_analyzer_symbols" => handle_symbols(server, args).await,
-        "rust_analyzer_format" => handle_format(server, args).await,
-        "rust_analyzer_code_actions" => handle_code_actions(server, args).await,
+        "rust_analyzer_hover" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.hover(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_definition" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.definition(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_references" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.references(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_completion" => {
+            let (line, ch) = ToolParams::extract_position(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.completion(&uri, line, ch).await
+            })
+            .await
+        }
+        "rust_analyzer_symbols" => {
+            with_doc(server, &args, move |c, uri| async move {
+                c.document_symbols(&uri).await
+            })
+            .await
+        }
+        "rust_analyzer_format" => {
+            with_doc(server, &args, move |c, uri| async move {
+                c.formatting(&uri).await
+            })
+            .await
+        }
+        "rust_analyzer_code_actions" => {
+            let (l1, c1, l2, c2) = ToolParams::extract_range(&args)?;
+            with_doc(server, &args, move |c, uri| async move {
+                c.code_actions(&uri, l1, c1, l2, c2).await
+            })
+            .await
+        }
         "rust_analyzer_set_workspace" => handle_set_workspace(server, args).await,
         "rust_analyzer_diagnostics" => handle_diagnostics(server, args).await,
         "rust_analyzer_workspace_diagnostics" => handle_workspace_diagnostics(server, args).await,
@@ -65,256 +131,67 @@ pub async fn handle_tool_call(
     }
 }
 
-async fn handle_hover(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
-    let file_path = ToolParams::extract_file_path(&args)?;
-    let (line, character) = ToolParams::extract_position(&args)?;
-
-    let uri = server.open_document_if_needed(&file_path).await?;
-
-    let Some(client) = &mut server.client else {
-        return Err(anyhow!("Client not initialized"));
-    };
-
-    let result = client.hover(&uri, line, character).await?;
-
-    Ok(ToolResult {
-        content: vec![ContentItem {
-            content_type: "text".to_string(),
-            text: serde_json::to_string_pretty(&result)?,
-        }],
-    })
-}
-
-async fn handle_definition(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
-    let file_path = ToolParams::extract_file_path(&args)?;
-    let (line, character) = ToolParams::extract_position(&args)?;
-
-    let uri = server.open_document_if_needed(&file_path).await?;
-
-    let Some(client) = &mut server.client else {
-        return Err(anyhow!("Client not initialized"));
-    };
-
-    let result = client.definition(&uri, line, character).await?;
-
-    Ok(ToolResult {
-        content: vec![ContentItem {
-            content_type: "text".to_string(),
-            text: serde_json::to_string_pretty(&result)?,
-        }],
-    })
-}
-
-async fn handle_references(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
-    let file_path = ToolParams::extract_file_path(&args)?;
-    let (line, character) = ToolParams::extract_position(&args)?;
-
-    let uri = server.open_document_if_needed(&file_path).await?;
-
-    let Some(client) = &mut server.client else {
-        return Err(anyhow!("Client not initialized"));
-    };
-
-    let result = client.references(&uri, line, character).await?;
-
-    Ok(ToolResult {
-        content: vec![ContentItem {
-            content_type: "text".to_string(),
-            text: serde_json::to_string_pretty(&result)?,
-        }],
-    })
-}
-
-async fn handle_completion(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
-    let file_path = ToolParams::extract_file_path(&args)?;
-    let (line, character) = ToolParams::extract_position(&args)?;
-
-    let uri = server.open_document_if_needed(&file_path).await?;
-
-    let Some(client) = &mut server.client else {
-        return Err(anyhow!("Client not initialized"));
-    };
-
-    let result = client.completion(&uri, line, character).await?;
-
-    Ok(ToolResult {
-        content: vec![ContentItem {
-            content_type: "text".to_string(),
-            text: serde_json::to_string_pretty(&result)?,
-        }],
-    })
-}
-
-async fn handle_symbols(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
-    let file_path = ToolParams::extract_file_path(&args)?;
-
-    debug!("Getting symbols for file: {}", file_path);
-    let uri = server.open_document_if_needed(&file_path).await?;
-    debug!("Document opened with URI: {}", uri);
-
-    let Some(client) = &mut server.client else {
-        return Err(anyhow!("Client not initialized"));
-    };
-
-    let result = client.document_symbols(&uri).await?;
-    debug!("Document symbols result: {:?}", result);
-
-    Ok(ToolResult {
-        content: vec![ContentItem {
-            content_type: "text".to_string(),
-            text: serde_json::to_string_pretty(&result)?,
-        }],
-    })
-}
-
-async fn handle_format(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
-    let file_path = ToolParams::extract_file_path(&args)?;
-
-    let uri = server.open_document_if_needed(&file_path).await?;
-
-    let Some(client) = &mut server.client else {
-        return Err(anyhow!("Client not initialized"));
-    };
-
-    let result = client.formatting(&uri).await?;
-
-    Ok(ToolResult {
-        content: vec![ContentItem {
-            content_type: "text".to_string(),
-            text: serde_json::to_string_pretty(&result)?,
-        }],
-    })
-}
-
-async fn handle_code_actions(
-    server: &mut RustAnalyzerMCPServer,
-    args: Value,
-) -> Result<ToolResult> {
-    let file_path = ToolParams::extract_file_path(&args)?;
-    let (line, character, end_line, end_character) = ToolParams::extract_range(&args)?;
-
-    let uri = server.open_document_if_needed(&file_path).await?;
-
-    let Some(client) = &mut server.client else {
-        return Err(anyhow!("Client not initialized"));
-    };
-
-    let result = client
-        .code_actions(&uri, line, character, end_line, end_character)
-        .await?;
-
-    Ok(ToolResult {
-        content: vec![ContentItem {
-            content_type: "text".to_string(),
-            text: serde_json::to_string_pretty(&result)?,
-        }],
-    })
-}
-
 async fn handle_set_workspace(
-    server: &mut RustAnalyzerMCPServer,
+    server: &Arc<RustAnalyzerMCPServer>,
     args: Value,
 ) -> Result<ToolResult> {
     let Some(workspace_path) = args["workspace_path"].as_str() else {
         return Err(anyhow!("Missing workspace_path"));
     };
 
-    // Shutdown existing client.
-    if let Some(client) = &mut server.client {
-        client.shutdown().await?;
-    }
-    server.client = None;
-
-    // Set new workspace with proper absolute path handling.
-    let workspace_root = PathBuf::from(workspace_path);
-    server.workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-        if workspace_root.is_absolute() {
-            workspace_root.clone()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(&workspace_root)
-        }
-    });
+    server
+        .set_workspace_root(std::path::PathBuf::from(workspace_path))
+        .await?;
 
     // Start the new client automatically.
     server.ensure_client_started().await?;
 
+    let new_root = server.workspace_root_clone().await;
+
     Ok(ToolResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
-            text: format!("Workspace set to: {}", server.workspace_root.display()),
+            text: format!("Workspace set to: {}", new_root.display()),
         }],
     })
 }
 
-async fn handle_diagnostics(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
+async fn handle_diagnostics(
+    server: &Arc<RustAnalyzerMCPServer>,
+    args: Value,
+) -> Result<ToolResult> {
     let file_path = ToolParams::extract_file_path(&args)?;
-
     let uri = server.open_document_if_needed(&file_path).await?;
+    let client = server.current_client().await?;
 
-    // Poll for diagnostics - rust-analyzer needs time to run cargo check.
-    // For files with expected errors (like diagnostics_test.rs), poll longer.
-    let should_poll = file_path.contains("diagnostics_test") || file_path.contains("simple_error");
-
-    let Some(client) = &mut server.client else {
-        return Err(anyhow!("Client not initialized"));
-    };
-
+    // Poll briefly for diagnostics — rust-analyzer needs time to run cargo check after didSave.
+    // Stop early as soon as we see any diagnostics; otherwise return whatever's available
+    // (possibly empty) once the timeout elapses.
     let mut result = json!([]);
-    if should_poll {
-        let start = std::time::Instant::now();
-        let timeout = tokio::time::Duration::from_secs(8); // Less than test timeout.
-        let poll_interval = tokio::time::Duration::from_millis(500);
-
-        while start.elapsed() < timeout {
-            result = client.diagnostics(&uri).await?;
-            let Some(diag_array) = result.as_array() else {
-                tokio::time::sleep(poll_interval).await;
-                continue;
-            };
-
-            if !diag_array.is_empty() {
-                // We got diagnostics, stop polling.
-                break;
-            }
-            tokio::time::sleep(poll_interval).await;
-        }
-    } else {
-        // For clean files, just wait a bit and check once.
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    let start = std::time::Instant::now();
+    let timeout = tokio::time::Duration::from_secs(8);
+    let poll_interval = tokio::time::Duration::from_millis(500);
+    while start.elapsed() < timeout {
         result = client.diagnostics(&uri).await?;
+        if result.as_array().is_some_and(|a| !a.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(poll_interval).await;
     }
 
     let diagnostics = format_diagnostics(&file_path, &result);
-
-    Ok(ToolResult {
-        content: vec![ContentItem {
-            content_type: "text".to_string(),
-            text: serde_json::to_string_pretty(&diagnostics)?,
-        }],
-    })
+    wrap(diagnostics)
 }
 
 async fn handle_workspace_diagnostics(
-    server: &mut RustAnalyzerMCPServer,
+    server: &Arc<RustAnalyzerMCPServer>,
     _args: Value,
 ) -> Result<ToolResult> {
-    let Some(client) = &mut server.client else {
-        return Err(anyhow!("Client not initialized"));
-    };
-
+    let client = server.current_client().await?;
     let result = client.workspace_diagnostics().await?;
-
-    // Format workspace diagnostics.
-    let formatted = format_workspace_diagnostics(&server.workspace_root, &result);
-
-    Ok(ToolResult {
-        content: vec![ContentItem {
-            content_type: "text".to_string(),
-            text: serde_json::to_string_pretty(&formatted)?,
-        }],
-    })
+    let workspace_root = server.workspace_root_clone().await;
+    let formatted = format_workspace_diagnostics(&workspace_root, &result);
+    wrap(formatted)
 }
 
 fn format_workspace_diagnostics(workspace_root: &Path, result: &Value) -> Value {
@@ -340,7 +217,6 @@ fn format_workspace_diagnostics(workspace_root: &Path, result: &Value) -> Value 
         });
     }
 
-    // Fallback format (diagnostics per URI).
     let mut output = json!({
         "workspace": workspace_root.display().to_string(),
         "files": {},

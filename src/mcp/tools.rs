@@ -1,7 +1,14 @@
 use crate::protocol::mcp::ToolDefinition;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::sync::OnceLock;
 
-pub fn get_tools() -> Vec<ToolDefinition> {
+static TOOLS_JSON: OnceLock<Value> = OnceLock::new();
+
+pub fn tools_list_result() -> &'static Value {
+    TOOLS_JSON.get_or_init(|| json!({ "tools": build_tools() }))
+}
+
+fn build_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "rust_analyzer_hover".to_string(),

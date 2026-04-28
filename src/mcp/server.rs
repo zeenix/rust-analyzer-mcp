@@ -1,11 +1,11 @@
 use anyhow::Result;
-use log::{debug, error, info};
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
-    sync::Mutex,
+    sync::{Mutex, RwLock},
 };
+use tracing::{debug, error, info};
 
 use crate::{
     lsp::RustAnalyzerClient,
@@ -13,8 +13,8 @@ use crate::{
 };
 
 pub struct RustAnalyzerMCPServer {
-    pub(super) client: Option<RustAnalyzerClient>,
-    pub(super) workspace_root: PathBuf,
+    pub(super) client: RwLock<Option<Arc<RustAnalyzerClient>>>,
+    pub(super) workspace_root: RwLock<PathBuf>,
 }
 
 impl Default for RustAnalyzerMCPServer {
@@ -26,15 +26,15 @@ impl Default for RustAnalyzerMCPServer {
 impl RustAnalyzerMCPServer {
     pub fn new() -> Self {
         Self {
-            client: None,
-            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            client: RwLock::new(None),
+            workspace_root: RwLock::new(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ),
         }
     }
 
     pub fn with_workspace(workspace_root: PathBuf) -> Self {
-        // Ensure the workspace root is absolute.
         let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-            // If canonicalize fails, try to make it absolute.
             if workspace_root.is_absolute() {
                 workspace_root.clone()
             } else {
@@ -45,104 +45,176 @@ impl RustAnalyzerMCPServer {
         });
 
         Self {
-            client: None,
-            workspace_root,
+            client: RwLock::new(None),
+            workspace_root: RwLock::new(workspace_root),
         }
     }
 
-    pub(super) async fn ensure_client_started(&mut self) -> Result<()> {
-        if self.client.is_none() {
-            let mut client = RustAnalyzerClient::new(self.workspace_root.clone());
-            client.start().await?;
-            self.client = Some(client);
+    pub(super) async fn ensure_client_started(&self) -> Result<Arc<RustAnalyzerClient>> {
+        if let Some(c) = self.client.read().await.as_ref() {
+            return Ok(Arc::clone(c));
         }
+
+        // Upgrade: nobody has a client; start one and store it.
+        let mut guard = self.client.write().await;
+        if let Some(c) = guard.as_ref() {
+            return Ok(Arc::clone(c));
+        }
+        let workspace_root = self.workspace_root.read().await.clone();
+        let client = Arc::new(RustAnalyzerClient::new(workspace_root));
+        client.start().await?;
+        *guard = Some(Arc::clone(&client));
+        Ok(client)
+    }
+
+    pub(super) async fn set_workspace_root(&self, workspace_root: PathBuf) -> Result<()> {
+        // Shutdown existing client first.
+        if let Some(c) = self.client.write().await.take() {
+            let _ = c.shutdown().await;
+        }
+        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
+            if workspace_root.is_absolute() {
+                workspace_root.clone()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(&workspace_root)
+            }
+        });
+        *self.workspace_root.write().await = workspace_root;
         Ok(())
     }
 
-    pub(super) async fn open_document_if_needed(&mut self, file_path: &str) -> Result<String> {
-        let absolute_path = self.workspace_root.join(file_path);
-        // Ensure we have an absolute path for the URI.
+    pub(super) async fn workspace_root_clone(&self) -> PathBuf {
+        self.workspace_root.read().await.clone()
+    }
+
+    pub(super) async fn open_document_if_needed(&self, file_path: &str) -> Result<String> {
+        let workspace_root = self.workspace_root.read().await.clone();
+        let absolute_path = workspace_root.join(file_path);
         let absolute_path = absolute_path
             .canonicalize()
             .unwrap_or_else(|_| absolute_path.clone());
         let uri = format!("file://{}", absolute_path.display());
+
+        let client = self.ensure_client_started().await?;
+
+        // Skip disk read entirely if rust-analyzer already has this document open.
+        if client.is_open(&uri).await {
+            return Ok(uri);
+        }
+
         let content = tokio::fs::read_to_string(&absolute_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path, e))?;
-
-        let Some(client) = &mut self.client else {
-            return Err(anyhow::anyhow!("Client not initialized"));
-        };
 
         client.open_document(&uri, &content).await?;
         Ok(uri)
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub(super) async fn current_client(&self) -> Result<Arc<RustAnalyzerClient>> {
+        self.client
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Client not initialized"))
+    }
+
+    pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting rust-analyzer MCP server");
 
         let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin);
-        let mut writer = BufWriter::new(stdout);
+        let stdout = Arc::new(Mutex::new(BufWriter::new(tokio::io::stdout())));
 
-        // Handle shutdown signals.
-        let running = Arc::new(Mutex::new(true));
-        let running_clone = Arc::clone(&running);
-
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Received shutdown signal");
-            *running_clone.lock().await = false;
-        });
+        let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
         loop {
-            // Check if we should stop.
-            if !*running.lock().await {
-                break;
-            }
-
             let mut line = String::new();
-            let bytes_read = match reader.read_line(&mut line).await {
-                Ok(n) => n,
-                Err(e) => {
-                    error!("Error reading from stdin: {}", e);
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    info!("Received shutdown signal");
                     break;
                 }
-            };
+                read_res = reader.read_line(&mut line) => {
+                    match read_res {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("Error reading from stdin: {}", e);
+                            break;
+                        }
+                    }
 
-            if bytes_read == 0 {
-                break; // EOF
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    let Ok(request) = serde_json::from_str::<MCPRequest>(trimmed) else {
+                        debug!("Failed to parse request: {}", trimmed);
+                        continue;
+                    };
+
+                    let server = Arc::clone(&self);
+                    let stdout = Arc::clone(&stdout);
+                    tokio::spawn(async move {
+                        server.handle_one_request(request, stdout).await;
+                    });
+                }
             }
-
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            let Ok(request) = serde_json::from_str::<MCPRequest>(line) else {
-                debug!("Failed to parse request: {}", line);
-                continue;
-            };
-
-            debug!("Received request: {}", request.method);
-            let response = self.handle_request(request).await;
-            let response_json = serde_json::to_string(&response)?;
-            writer.write_all(response_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
         }
 
         // Cleanup.
         info!("Shutting down");
-        if let Some(client) = &mut self.client {
-            let _ = client.shutdown().await;
+        if let Some(c) = self.client.write().await.take() {
+            let _ = c.shutdown().await;
         }
 
         Ok(())
     }
 
-    async fn handle_request(&mut self, request: MCPRequest) -> MCPResponse {
+    async fn handle_one_request(
+        self: Arc<Self>,
+        request: MCPRequest,
+        stdout: Arc<Mutex<BufWriter<tokio::io::Stdout>>>,
+    ) {
+        debug!("Received request: {}", request.method);
+
+        // Notifications (no id) MUST NOT receive a response per JSON-RPC spec.
+        let is_notification = request.id.is_none();
+
+        let response = self.handle_request(request).await;
+
+        if is_notification {
+            return;
+        }
+
+        let response_json = match serde_json::to_string(&response) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to serialize response: {}", e);
+                return;
+            }
+        };
+
+        let mut writer = stdout.lock().await;
+        if let Err(e) = writer.write_all(response_json.as_bytes()).await {
+            error!("Failed to write response: {}", e);
+            return;
+        }
+        if let Err(e) = writer.write_all(b"\n").await {
+            error!("Failed to write newline: {}", e);
+            return;
+        }
+        if let Err(e) = writer.flush().await {
+            error!("Failed to flush stdout: {}", e);
+        }
+    }
+
+    async fn handle_request(self: &Arc<Self>, request: MCPRequest) -> MCPResponse {
         match request.method.as_str() {
             "initialize" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
@@ -161,9 +233,7 @@ impl RustAnalyzerMCPServer {
             "tools/list" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,
-                result: json!({
-                    "tools": super::tools::get_tools()
-                }),
+                result: super::tools::tools_list_result().clone(),
             },
             "tools/call" => {
                 let Some(params) = request.params else {

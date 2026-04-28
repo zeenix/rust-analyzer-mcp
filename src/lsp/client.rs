@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Result};
-use log::info;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
@@ -13,20 +15,27 @@ use tokio::{
     process::{Child, Command},
     sync::{oneshot, Mutex},
 };
+use tracing::info;
 
 use crate::{
     config::{DOCUMENT_OPEN_DELAY_MILLIS, LSP_REQUEST_TIMEOUT_SECS},
+    lsp::{
+        connection::{PendingEntry, PendingRequests},
+        error::LspError,
+    },
     protocol::lsp::LSPRequest,
 };
 
+/// Shared state for an LSP client. All methods take `&self` so the client can be wrapped in
+/// `Arc<RustAnalyzerClient>` and reused concurrently across spawned MCP request handlers.
 pub struct RustAnalyzerClient {
-    pub(super) process: Option<Child>,
-    pub(super) request_id: Arc<Mutex<u64>>,
+    pub(super) process: Mutex<Option<Child>>,
+    pub(super) request_id: AtomicU64,
     pub(super) workspace_root: PathBuf,
-    pub(super) stdin: Option<BufWriter<tokio::process::ChildStdin>>,
-    pub(super) pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    pub(super) initialized: bool,
-    pub(super) open_documents: Arc<Mutex<HashSet<String>>>,
+    pub(super) stdin: Mutex<Option<BufWriter<tokio::process::ChildStdin>>>,
+    pub(super) pending_requests: PendingRequests,
+    pub(super) initialized: AtomicBool,
+    pub(super) open_documents: Mutex<HashSet<String>>,
     pub(super) diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 }
 
@@ -44,18 +53,22 @@ impl RustAnalyzerClient {
         });
 
         Self {
-            process: None,
-            request_id: Arc::new(Mutex::new(1)),
+            process: Mutex::new(None),
+            request_id: AtomicU64::new(1),
             workspace_root,
-            stdin: None,
-            pending_requests: Arc::new(Mutex::new(HashMap::new())),
-            initialized: false,
-            open_documents: Arc::new(Mutex::new(HashSet::new())),
+            stdin: Mutex::new(None),
+            pending_requests: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            initialized: AtomicBool::new(false),
+            open_documents: Mutex::new(HashSet::new()),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub async fn start(&mut self) -> Result<()> {
+    pub fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
+    }
+
+    pub async fn start(&self) -> Result<()> {
         info!(
             "Starting rust-analyzer process in workspace: {}",
             self.workspace_root.display()
@@ -102,7 +115,7 @@ impl RustAnalyzerClient {
             .take()
             .ok_or_else(|| anyhow!("Failed to get stderr"))?;
 
-        self.stdin = Some(BufWriter::new(stdin));
+        *self.stdin.lock().await = Some(BufWriter::new(stdin));
 
         // Start connection handlers.
         super::connection::start_handlers(
@@ -112,11 +125,11 @@ impl RustAnalyzerClient {
             Arc::clone(&self.diagnostics),
         );
 
-        self.process = Some(child);
+        *self.process.lock().await = Some(child);
 
         // Initialize LSP.
         self.initialize().await?;
-        self.initialized = true;
+        self.initialized.store(true, Ordering::Release);
 
         // Send workspace/didChangeConfiguration to ensure settings are applied.
         let config_params = json!({
@@ -139,7 +152,7 @@ impl RustAnalyzerClient {
     }
 
     pub(super) async fn send_notification(
-        &mut self,
+        &self,
         method: &str,
         params: Option<Value>,
     ) -> Result<()> {
@@ -154,9 +167,10 @@ impl RustAnalyzerClient {
 
         info!("Sending LSP notification: {}", method);
 
-        let Some(stdin) = &mut self.stdin else {
-            return Err(anyhow!("No stdin available"));
-        };
+        let mut stdin_lock = self.stdin.lock().await;
+        let stdin = stdin_lock
+            .as_mut()
+            .ok_or_else(|| anyhow!("No stdin available"))?;
 
         stdin.write_all(message.as_bytes()).await?;
         stdin.flush().await?;
@@ -164,14 +178,11 @@ impl RustAnalyzerClient {
     }
 
     pub(super) async fn send_request(
-        &mut self,
+        &self,
         method: &str,
         params: Option<Value>,
-    ) -> Result<Value> {
-        let mut request_id_lock = self.request_id.lock().await;
-        let id = *request_id_lock;
-        *request_id_lock += 1;
-        drop(request_id_lock);
+    ) -> Result<Value, LspError> {
+        let id = self.request_id.fetch_add(1, Ordering::Relaxed);
 
         let request = LSPRequest {
             jsonrpc: "2.0".to_string(),
@@ -180,30 +191,51 @@ impl RustAnalyzerClient {
             params: params.clone(),
         };
 
-        let content = serde_json::to_string(&request)?;
+        let content = serde_json::to_string(&request)
+            .map_err(|e| LspError::Transport(format!("serialize: {}", e)))?;
         let message = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
 
         info!("Sending LSP request: {} with params: {:?}", method, params);
 
-        let Some(stdin) = &mut self.stdin else {
-            return Err(anyhow!("No stdin available"));
-        };
-
-        stdin.write_all(message.as_bytes()).await?;
-        stdin.flush().await?;
-
-        // Set up response channel.
+        // Register the pending request *before* writing, so a fast response can't race past us.
         let (tx, rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(id, tx);
+        self.pending_requests.lock().insert(
+            id,
+            PendingEntry {
+                method: method.to_string(),
+                sender: tx,
+            },
+        );
+
+        // Send under the stdin lock so concurrent senders don't interleave headers/bodies.
+        {
+            let mut stdin_lock = self.stdin.lock().await;
+            let Some(stdin) = stdin_lock.as_mut() else {
+                self.pending_requests.lock().remove(&id);
+                return Err(LspError::Transport("no stdin available".to_string()));
+            };
+            if let Err(e) = stdin.write_all(message.as_bytes()).await {
+                self.pending_requests.lock().remove(&id);
+                return Err(LspError::Transport(format!("write: {}", e)));
+            }
+            if let Err(e) = stdin.flush().await {
+                self.pending_requests.lock().remove(&id);
+                return Err(LspError::Transport(format!("flush: {}", e)));
+            }
+        }
 
         // Wait for response with timeout.
-        tokio::time::timeout(Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS), rx)
-            .await
-            .map_err(|_| anyhow!("Request timeout"))?
-            .map_err(|_| anyhow!("Request cancelled"))
+        match tokio::time::timeout(Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(LspError::Cancelled),
+            Err(_) => {
+                self.pending_requests.lock().remove(&id);
+                Err(LspError::Timeout(method.to_string()))
+            }
+        }
     }
 
-    async fn initialize(&mut self) -> Result<()> {
+    async fn initialize(&self) -> Result<()> {
         let init_params = json!({
             "processId": std::process::id(),
             "rootUri": format!("file://{}", self.workspace_root.display()),
@@ -289,21 +321,21 @@ impl RustAnalyzerClient {
         Ok(())
     }
 
-    pub async fn open_document(&mut self, uri: &str, content: &str) -> Result<()> {
-        // Check if document is already open.
-        {
-            let open_docs = self.open_documents.lock().await;
-            if open_docs.contains(uri) {
-                info!("Document already open: {}", uri);
-                return Ok(());
-            }
+    pub async fn is_open(&self, uri: &str) -> bool {
+        self.open_documents.lock().await.contains(uri)
+    }
+
+    pub async fn open_document(&self, uri: &str, content: &str) -> Result<()> {
+        // Hold the open_documents lock across the didOpen send so check-then-insert is atomic
+        // per-URI. Concurrent callers for the same URI either bail out early ("already open")
+        // or wait their turn here.
+        let mut open_docs = self.open_documents.lock().await;
+        if open_docs.contains(uri) {
+            info!("Document already open: {}", uri);
+            return Ok(());
         }
 
-        // Clear any existing diagnostics for this URI to ensure fresh data.
-        {
-            let mut diag_lock = self.diagnostics.lock().await;
-            diag_lock.remove(uri);
-        }
+        self.diagnostics.lock().await.remove(uri);
 
         info!("Opening document: {}", uri);
         let params = json!({
@@ -315,14 +347,11 @@ impl RustAnalyzerClient {
             }
         });
 
-        self.send_notification("textDocument/didOpen", Some(params.clone()))
+        self.send_notification("textDocument/didOpen", Some(params))
             .await?;
 
-        // Mark document as open.
-        {
-            let mut open_docs = self.open_documents.lock().await;
-            open_docs.insert(uri.to_string());
-        }
+        open_docs.insert(uri.to_string());
+        drop(open_docs);
 
         // Send didSave to trigger cargo check.
         let save_params = json!({
@@ -339,22 +368,24 @@ impl RustAnalyzerClient {
         Ok(())
     }
 
-    pub async fn shutdown(&mut self) -> Result<()> {
-        if self.initialized {
+    pub async fn shutdown(&self) -> Result<()> {
+        if self.initialized.swap(false, Ordering::AcqRel) {
             let _ = self.send_request("shutdown", None).await;
             let _ = self.send_notification("exit", None).await;
         }
 
-        if let Some(mut process) = self.process.take() {
+        if let Some(mut process) = self.process.lock().await.take() {
             // Kill the process and wait for it to actually exit.
             let _ = process.kill().await;
             let _ = process.wait().await;
         }
 
+        // Drop stdin so the BufWriter releases the FD.
+        *self.stdin.lock().await = None;
+
         // Clear open documents and diagnostics.
         self.open_documents.lock().await.clear();
         self.diagnostics.lock().await.clear();
-        self.initialized = false;
         Ok(())
     }
 }

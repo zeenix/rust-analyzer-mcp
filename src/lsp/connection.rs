@@ -1,17 +1,25 @@
-use log::{debug, error, info};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     sync::{oneshot, Mutex},
 };
+use tracing::{debug, error, info};
 
-use crate::protocol::lsp::LSPResponse;
+use crate::{lsp::error::LspError, protocol::lsp::LSPResponse};
+
+pub type ResponseSender = oneshot::Sender<Result<Value, LspError>>;
+pub type PendingRequests = Arc<parking_lot::Mutex<HashMap<u64, PendingEntry>>>;
+
+pub struct PendingEntry {
+    pub method: String,
+    pub sender: ResponseSender,
+}
 
 pub fn start_handlers(
     stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
-    pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    pending_requests: PendingRequests,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 ) {
     // Log stderr in background.
@@ -48,7 +56,7 @@ async fn handle_stderr(stderr: tokio::process::ChildStderr) {
 
 async fn handle_stdout(
     stdout: tokio::process::ChildStdout,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    pending: PendingRequests,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 ) {
     let mut reader = BufReader::new(stdout);
@@ -102,7 +110,7 @@ fn parse_content_length(header: &str) -> Option<usize> {
 
 async fn handle_lsp_message(
     json_buffer: &[u8],
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    pending: &PendingRequests,
     diagnostics: &Arc<Mutex<HashMap<String, Vec<Value>>>>,
 ) {
     let Ok(json_value) = serde_json::from_slice::<Value>(json_buffer) else {
@@ -128,18 +136,21 @@ async fn handle_lsp_message(
         return;
     };
 
-    let mut pending_lock = pending.lock().await;
-    let Some(sender) = pending_lock.remove(&id) else {
+    let entry = pending.lock().remove(&id);
+    let Some(PendingEntry { method, sender }) = entry else {
         return;
     };
 
     if let Some(error) = response.error {
-        error!("LSP error for request {}: {}", id, error);
-        let _ = sender.send(serde_json::json!(null));
+        error!("LSP error for request {} ({}): {}", id, method, error);
+        let _ = sender.send(Err(LspError::from_lsp_error(&method, &error)));
     } else {
         let result = response.result.unwrap_or(serde_json::json!(null));
-        info!("Sending result for request {}: {:?}", id, result);
-        let _ = sender.send(result);
+        info!(
+            "Sending result for request {} ({}): {:?}",
+            id, method, result
+        );
+        let _ = sender.send(Ok(result));
     }
 }
 

@@ -1,60 +1,82 @@
 use anyhow::Result;
-use log::info;
 use serde_json::{json, Value};
+use tracing::info;
 
-use super::client::RustAnalyzerClient;
+use super::{client::RustAnalyzerClient, error::LspError};
+
+/// Lookup-tool errors (no symbol at position, index not ready) collapse to Ok(null) so callers
+/// can distinguish them from transport/timeout failures, which keep propagating as Err.
+fn lookup_to_null(res: std::result::Result<Value, LspError>) -> Result<Value> {
+    match res {
+        Ok(v) => Ok(v),
+        Err(e) if e.is_no_result() => Ok(json!(null)),
+        Err(e) => Err(anyhow::Error::new(e)),
+    }
+}
+
+fn strict(res: std::result::Result<Value, LspError>) -> Result<Value> {
+    res.map_err(anyhow::Error::new)
+}
 
 impl RustAnalyzerClient {
-    pub async fn hover(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
+    pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri },
             "position": { "line": line, "character": character }
         });
 
-        self.send_request("textDocument/hover", Some(params)).await
+        lookup_to_null(self.send_request("textDocument/hover", Some(params)).await)
     }
 
-    pub async fn definition(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
+    pub async fn definition(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri },
             "position": { "line": line, "character": character }
         });
 
-        self.send_request("textDocument/definition", Some(params))
-            .await
+        lookup_to_null(
+            self.send_request("textDocument/definition", Some(params))
+                .await,
+        )
     }
 
-    pub async fn references(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
+    pub async fn references(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri },
             "position": { "line": line, "character": character },
             "context": { "includeDeclaration": true }
         });
 
-        self.send_request("textDocument/references", Some(params))
-            .await
+        lookup_to_null(
+            self.send_request("textDocument/references", Some(params))
+                .await,
+        )
     }
 
-    pub async fn completion(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
+    pub async fn completion(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri },
             "position": { "line": line, "character": character }
         });
 
-        self.send_request("textDocument/completion", Some(params))
-            .await
+        lookup_to_null(
+            self.send_request("textDocument/completion", Some(params))
+                .await,
+        )
     }
 
-    pub async fn document_symbols(&mut self, uri: &str) -> Result<Value> {
+    pub async fn document_symbols(&self, uri: &str) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri }
         });
 
-        self.send_request("textDocument/documentSymbol", Some(params))
-            .await
+        lookup_to_null(
+            self.send_request("textDocument/documentSymbol", Some(params))
+                .await,
+        )
     }
 
-    pub async fn formatting(&mut self, uri: &str) -> Result<Value> {
+    pub async fn formatting(&self, uri: &str) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri },
             "options": {
@@ -63,11 +85,13 @@ impl RustAnalyzerClient {
             }
         });
 
-        self.send_request("textDocument/formatting", Some(params))
-            .await
+        strict(
+            self.send_request("textDocument/formatting", Some(params))
+                .await,
+        )
     }
 
-    pub async fn diagnostics(&mut self, uri: &str) -> Result<Value> {
+    pub async fn diagnostics(&self, uri: &str) -> Result<Value> {
         // First check if we have stored diagnostics from publishDiagnostics.
         let diag_lock = self.diagnostics.lock().await;
         info!("Looking for diagnostics for URI: {}", uri);
@@ -87,9 +111,10 @@ impl RustAnalyzerClient {
             "textDocument": { "uri": uri }
         });
 
-        let response = self
-            .send_request("textDocument/diagnostic", Some(params))
-            .await?;
+        let response = strict(
+            self.send_request("textDocument/diagnostic", Some(params))
+                .await,
+        )?;
 
         // Extract diagnostics from the response.
         if let Some(items) = response.get("items") {
@@ -99,7 +124,7 @@ impl RustAnalyzerClient {
         }
     }
 
-    pub async fn workspace_diagnostics(&mut self) -> Result<Value> {
+    pub async fn workspace_diagnostics(&self) -> Result<Value> {
         // Try workspace/diagnostic if available, otherwise collect from all open documents.
         let params = json!({
             "identifier": "rust-analyzer",
@@ -128,7 +153,7 @@ impl RustAnalyzerClient {
     }
 
     pub async fn code_actions(
-        &mut self,
+        &self,
         uri: &str,
         start_line: u32,
         start_char: u32,
@@ -153,8 +178,10 @@ impl RustAnalyzerClient {
             }
         });
 
-        self.send_request("textDocument/codeAction", Some(params))
-            .await
+        strict(
+            self.send_request("textDocument/codeAction", Some(params))
+                .await,
+        )
     }
 }
 
