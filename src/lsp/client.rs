@@ -20,7 +20,7 @@ use tracing::info;
 use crate::{
     config::{DOCUMENT_OPEN_DELAY_MILLIS, LSP_REQUEST_TIMEOUT_SECS},
     lsp::{
-        connection::{PendingEntry, PendingRequests},
+        connection::{PendingEntry, PendingRequests, ProgressMap, SharedStdin},
         error::LspError,
     },
     protocol::lsp::LSPRequest,
@@ -32,11 +32,12 @@ pub struct RustAnalyzerClient {
     pub(super) process: Mutex<Option<Child>>,
     pub(super) request_id: AtomicU64,
     pub(super) workspace_root: PathBuf,
-    pub(super) stdin: Mutex<Option<BufWriter<tokio::process::ChildStdin>>>,
+    pub(super) stdin: SharedStdin,
     pub(super) pending_requests: PendingRequests,
     pub(super) initialized: AtomicBool,
     pub(super) open_documents: Mutex<HashSet<String>>,
     pub(super) diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    pub(super) progress: ProgressMap,
 }
 
 impl RustAnalyzerClient {
@@ -56,11 +57,12 @@ impl RustAnalyzerClient {
             process: Mutex::new(None),
             request_id: AtomicU64::new(1),
             workspace_root,
-            stdin: Mutex::new(None),
+            stdin: Arc::new(Mutex::new(None)),
             pending_requests: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             initialized: AtomicBool::new(false),
             open_documents: Mutex::new(HashSet::new()),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            progress: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -117,12 +119,15 @@ impl RustAnalyzerClient {
 
         *self.stdin.lock().await = Some(BufWriter::new(stdin));
 
-        // Start connection handlers.
+        // Start connection handlers. The shared `stdin` lets the response loop
+        // reply to server-initiated requests like `window/workDoneProgress/create`.
         super::connection::start_handlers(
             stdout,
             stderr,
+            Arc::clone(&self.stdin),
             Arc::clone(&self.pending_requests),
             Arc::clone(&self.diagnostics),
+            Arc::clone(&self.progress),
         );
 
         *self.process.lock().await = Some(child);
@@ -305,6 +310,9 @@ impl RustAnalyzerClient {
                     "didChangeConfiguration": {
                         "dynamicRegistration": false
                     }
+                },
+                "window": {
+                    "workDoneProgress": true
                 }
             }
         });
@@ -319,6 +327,34 @@ impl RustAnalyzerClient {
             .ok();
 
         Ok(())
+    }
+
+    /// Wait until rust-analyzer reports `$/progress` `end` for the given token, or
+    /// the timeout elapses. If the token has already ended (or never been seen and
+    /// then quickly ends), this returns immediately. Returns `Err(())` on timeout.
+    pub async fn wait_for_progress_end(&self, token: &str, timeout: Duration) -> Result<(), ()> {
+        let mut rx = {
+            let mut map = self.progress.lock();
+            let sender = map.entry(token.to_string()).or_insert_with(|| {
+                let (tx, _) = tokio::sync::watch::channel(false);
+                tx
+            });
+            sender.subscribe()
+        };
+
+        if *rx.borrow() {
+            return Ok(());
+        }
+
+        tokio::time::timeout(timeout, async {
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+        .map_err(|_| ())
     }
 
     pub async fn is_open(&self, uri: &str) -> bool {
