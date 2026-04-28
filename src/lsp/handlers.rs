@@ -364,6 +364,76 @@ impl RustAnalyzerClient {
         )
     }
 
+    pub async fn prepare_call_hierarchy(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("textDocument/prepareCallHierarchy", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn call_hierarchy_incoming(&self, item: &Value) -> Result<Value> {
+        let params = json!({ "item": item });
+
+        lookup_to_null(
+            self.send_request("callHierarchy/incomingCalls", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn call_hierarchy_outgoing(&self, item: &Value) -> Result<Value> {
+        let params = json!({ "item": item });
+
+        lookup_to_null(
+            self.send_request("callHierarchy/outgoingCalls", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn prepare_type_hierarchy(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        lookup_to_null(
+            self.send_request("textDocument/prepareTypeHierarchy", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn type_hierarchy_supertypes(&self, item: &Value) -> Result<Value> {
+        let params = json!({ "item": item });
+
+        lookup_to_null(
+            self.send_request("typeHierarchy/supertypes", Some(params))
+                .await,
+        )
+    }
+
+    pub async fn type_hierarchy_subtypes(&self, item: &Value) -> Result<Value> {
+        let params = json!({ "item": item });
+
+        lookup_to_null(
+            self.send_request("typeHierarchy/subtypes", Some(params))
+                .await,
+        )
+    }
+
     pub async fn open_docs(&self, uri: &str, line: u32, character: u32) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri },

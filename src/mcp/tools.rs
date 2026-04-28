@@ -34,6 +34,10 @@ pub(super) const SNIPPET_ENRICHED_TOOLS: &[&str] = &[
     "rust_analyzer_workspace_symbol",
     "rust_analyzer_workspace_diagnostics",
     "rust_analyzer_explore_symbol",
+    "rust_analyzer_call_hierarchy_incoming",
+    "rust_analyzer_call_hierarchy_outgoing",
+    "rust_analyzer_type_hierarchy",
+    "rust_analyzer_impact",
 ];
 
 fn build_tools() -> Vec<ToolDefinition> {
@@ -339,6 +343,39 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
         tool(
             "rust_analyzer_explore_symbol",
             "One-shot symbol exploration: in a single round-trip returns hover, definition, type_definition, parent_module, and a sample of up to 5 references for the symbol at the given position. Use this whenever you want to *understand* a symbol — it replaces the typical 4-5 follow-up tool calls. Locations come pre-enriched with source snippets (toggle via include_snippets). The references sample is wrapped as { items, total, shown }; if references take longer than 2 seconds, the rest of the response still returns and `references_timed_out: true` is added.",
+            position_schema(),
+        ),
+        tool(
+            "rust_analyzer_call_hierarchy_incoming",
+            "Find every caller of the function/method at the given position. Returns { items: [{ item, incoming: [{ from, call_sites: [{uri, range}] }] }], total } where `item` is the prepared call-hierarchy node (one item is typical, multiple appear for trait methods with several impls), `from` is each caller, and `call_sites` are the actual call expressions inside the caller. Locations come pre-enriched with snippets. Prefer this over `references` when you need callers specifically — it filters out string-match noise from comments/strings.",
+            position_schema(),
+        ),
+        tool(
+            "rust_analyzer_call_hierarchy_outgoing",
+            "Find every function/method called by the function at the given position. Returns { items: [{ item, outgoing: [{ to, call_sites: [{uri, range}] }] }], total } where `to` is each callee and `call_sites` are the call expressions inside the current item. Locations come pre-enriched with snippets.",
+            position_schema(),
+        ),
+        tool(
+            "rust_analyzer_type_hierarchy",
+            "Walk the type hierarchy at the given position (traits, impls, structurally related types). Returns { items: [{ item, supertypes?, subtypes? }], total }. `direction` defaults to \"both\"; pass \"supertypes\" for parents only or \"subtypes\" for children/implementors only. Use this for trait introspection (\"who supertypes/implements this trait?\") — distinct from `implementation`, which targets a specific impl block.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": file_path_prop(),
+                    "line": line_prop("Line number (0-based)"),
+                    "character": char_prop("Character position (0-based)"),
+                    "direction": {
+                        "type": "string",
+                        "enum": ["supertypes", "subtypes", "both"],
+                        "description": "Which direction to walk. Default: \"both\"."
+                    }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        ),
+        tool(
+            "rust_analyzer_impact",
+            "Estimate the blast radius of changing the symbol at the given position. In a single round-trip aggregates four buckets: `references` (textual usages), `callers` (semantic incoming calls), `implementors` (type-hierarchy subtypes — for traits, who implements them), and `tests` (related test items). Each bucket has shape { items, total, shown, timed_out? }; items are capped at 10 per bucket but `total` reflects the full count. Per-bucket 2 s timeouts ensure one slow workspace-wide search can't block the others. Use this before any non-trivial refactor.",
             position_schema(),
         ),
         tool(

@@ -177,8 +177,14 @@ fn walk(value: Value, ctx: &mut SnippetCtx) -> Value {
 }
 
 fn location_snippet(obj: &serde_json::Map<String, Value>, ctx: &mut SnippetCtx) -> Option<Value> {
-    if let (Some(uri), Some(range)) = (obj.get("uri").and_then(Value::as_str), obj.get("range")) {
-        return ctx.snippet_for(uri, range);
+    if let Some(uri) = obj.get("uri").and_then(Value::as_str) {
+        // Call/Type-hierarchy items carry both `range` (the whole declaration)
+        // and `selectionRange` (just the name). Prefer the latter so the
+        // attached snippet stays a few lines, not the full body.
+        let range = obj.get("selectionRange").or_else(|| obj.get("range"));
+        if let Some(range) = range {
+            return ctx.snippet_for(uri, range);
+        }
     }
     if let (Some(uri), Some(range)) = (
         obj.get("targetUri").and_then(Value::as_str),

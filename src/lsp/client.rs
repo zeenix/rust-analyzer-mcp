@@ -358,6 +358,12 @@ impl RustAnalyzerClient {
                     "implementation": {
                         "linkSupport": true
                     },
+                    "callHierarchy": {
+                        "dynamicRegistration": false
+                    },
+                    "typeHierarchy": {
+                        "dynamicRegistration": false
+                    },
                     "references": {},
                     "documentSymbol": {},
                     "codeAction": {

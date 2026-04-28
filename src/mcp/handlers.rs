@@ -330,6 +330,14 @@ pub async fn handle_tool_call(
             .await
         }
         "rust_analyzer_explore_symbol" => handle_explore_symbol(server, args).await,
+        "rust_analyzer_call_hierarchy_incoming" => {
+            handle_call_hierarchy(server, args, CallDirection::Incoming).await
+        }
+        "rust_analyzer_call_hierarchy_outgoing" => {
+            handle_call_hierarchy(server, args, CallDirection::Outgoing).await
+        }
+        "rust_analyzer_type_hierarchy" => handle_type_hierarchy(server, args).await,
+        "rust_analyzer_impact" => handle_impact(server, args).await,
         "rust_analyzer_add_workspace" => handle_add_workspace(server, args).await,
         "rust_analyzer_remove_workspace" => handle_remove_workspace(server, args).await,
         "rust_analyzer_list_workspaces" => handle_list_workspaces(server, args).await,
@@ -417,6 +425,319 @@ fn sample_references(value: Value) -> Value {
         Value::Null => Value::Null,
         other => other,
     }
+}
+
+/// Composite that estimates the blast radius of changing a symbol. Fans out
+/// four LSP queries in parallel — references, prepareCallHierarchy +
+/// incomingCalls (callers), prepareTypeHierarchy + subtypes (implementors),
+/// and relatedTests — and packages each as a `{ items, total, shown,
+/// timed_out? }` bucket so the LLM sees a stable shape regardless of which
+/// queries were productive. Items are sampled (cap 10) to keep the response
+/// scan-able; `total` always reflects the full count.
+async fn handle_impact(server: &Arc<RustAnalyzerMCPServer>, args: Value) -> Result<ToolResult> {
+    const SAMPLE_SIZE: usize = 10;
+    let bucket_timeout = std::time::Duration::from_secs(2);
+
+    let (line, ch) = params::position(&args)?;
+    let snippet_opts = params::snippet_opts(&args);
+    let file_path = params::file_path(&args)?;
+
+    let ws = server.resolve_workspace(&args).await?;
+    let uri = ws.open_document_if_needed(&file_path).await?;
+    let client = ws.current_client().await?;
+
+    // Stage 1: four parallel queries — three direct lookups plus the two
+    // hierarchy `prepare*` calls. The hierarchy fan-outs in stage 2 depend
+    // on stage-1 prepared items, but everything else can race.
+    let (refs_res, prep_call_res, prep_type_res, tests_res) = tokio::join!(
+        tokio::time::timeout(bucket_timeout, client.references(&uri, line, ch)),
+        tokio::time::timeout(
+            bucket_timeout,
+            client.prepare_call_hierarchy(&uri, line, ch)
+        ),
+        tokio::time::timeout(
+            bucket_timeout,
+            client.prepare_type_hierarchy(&uri, line, ch)
+        ),
+        tokio::time::timeout(bucket_timeout, client.related_tests(&uri, line, ch)),
+    );
+
+    let prep_call_items = take_prepared_items(&prep_call_res);
+    let prep_type_items = take_prepared_items(&prep_type_res);
+
+    // Stage 2: fan out hierarchy children. A single prepared item is the
+    // common case; trait methods with multiple impls return more.
+    let callers_fut = collect_caller_items(&client, &prep_call_items, bucket_timeout);
+    let implementors_fut = collect_subtype_items(&client, &prep_type_items, bucket_timeout);
+    let (callers_collected, implementors_collected) = tokio::join!(callers_fut, implementors_fut);
+
+    let references_bucket = bucket_from_locations(refs_res, SAMPLE_SIZE);
+    let callers_bucket = bucket_from_collected(callers_collected, SAMPLE_SIZE);
+    let implementors_bucket = bucket_from_collected(implementors_collected, SAMPLE_SIZE);
+    let tests_bucket = bucket_from_locations(tests_res, SAMPLE_SIZE);
+
+    let value = json!({
+        "references": references_bucket,
+        "callers": callers_bucket,
+        "implementors": implementors_bucket,
+        "tests": tests_bucket,
+    });
+    wrap(maybe_enrich_locations(value, snippet_opts))
+}
+
+/// Pull the array out of a timed `prepareXxx` result. Errors and timeouts
+/// degrade silently to empty — stage 2 just gets nothing to fan out and the
+/// resulting bucket carries `total: 0` (and `timed_out: true` if relevant —
+/// that is set by the bucket helpers based on the same inputs they see).
+fn take_prepared_items(
+    res: &std::result::Result<Result<Value>, tokio::time::error::Elapsed>,
+) -> Vec<Value> {
+    match res {
+        Ok(Ok(Value::Array(items))) => items.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Outcome of a per-bucket fan-out: collected items plus a flag telling the
+/// caller whether at least one sub-call ran out of time so we can surface
+/// `timed_out: true` to the LLM.
+struct CollectedBucket {
+    items: Vec<Value>,
+    timed_out: bool,
+}
+
+async fn collect_caller_items(
+    client: &Arc<RustAnalyzerClient>,
+    prepared: &[Value],
+    timeout: std::time::Duration,
+) -> CollectedBucket {
+    let mut items = Vec::new();
+    let mut timed_out = false;
+    for item in prepared {
+        match tokio::time::timeout(timeout, client.call_hierarchy_incoming(item)).await {
+            Ok(Ok(Value::Array(calls))) => {
+                for call in calls {
+                    if let Some(from) = call.get("from").cloned() {
+                        items.push(from);
+                    }
+                }
+            }
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => timed_out = true,
+        }
+    }
+    CollectedBucket { items, timed_out }
+}
+
+async fn collect_subtype_items(
+    client: &Arc<RustAnalyzerClient>,
+    prepared: &[Value],
+    timeout: std::time::Duration,
+) -> CollectedBucket {
+    let mut items = Vec::new();
+    let mut timed_out = false;
+    for item in prepared {
+        match tokio::time::timeout(timeout, client.type_hierarchy_subtypes(item)).await {
+            Ok(Ok(Value::Array(subs))) => items.extend(subs),
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => timed_out = true,
+        }
+    }
+    CollectedBucket { items, timed_out }
+}
+
+/// Wrap a timed `references`/`related_tests`-style result (Vec<Location>)
+/// into the bucket shape. Errors degrade to total=0; the timeout case is
+/// reflected with `timed_out: true`.
+fn bucket_from_locations(
+    res: std::result::Result<Result<Value>, tokio::time::error::Elapsed>,
+    sample_size: usize,
+) -> Value {
+    match res {
+        Ok(Ok(Value::Array(items))) => sample_to_bucket(items, sample_size, false),
+        Ok(Ok(_)) | Ok(Err(_)) => sample_to_bucket(Vec::new(), sample_size, false),
+        Err(_) => sample_to_bucket(Vec::new(), sample_size, true),
+    }
+}
+
+fn bucket_from_collected(collected: CollectedBucket, sample_size: usize) -> Value {
+    sample_to_bucket(collected.items, sample_size, collected.timed_out)
+}
+
+fn sample_to_bucket(items: Vec<Value>, sample_size: usize, timed_out: bool) -> Value {
+    let total = items.len();
+    let shown = total.min(sample_size);
+    let sample: Vec<Value> = items.into_iter().take(sample_size).collect();
+    let mut out = json!({ "items": sample, "total": total, "shown": shown });
+    if timed_out {
+        out.as_object_mut()
+            .expect("just constructed")
+            .insert("timed_out".to_string(), json!(true));
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+enum CallDirection {
+    Incoming,
+    Outgoing,
+}
+
+/// Composite for `callHierarchy/{incoming,outgoing}Calls`. Drives
+/// `prepareCallHierarchy` first, then fans out one call per prepared item
+/// (typically 1; trait methods with multiple impls return more). Each
+/// `fromRanges` entry is reshaped into a self-contained `{uri, range}` so
+/// the snippet walker enriches every call site, not just the caller header.
+async fn handle_call_hierarchy(
+    server: &Arc<RustAnalyzerMCPServer>,
+    args: Value,
+    direction: CallDirection,
+) -> Result<ToolResult> {
+    let (line, ch) = params::position(&args)?;
+    let snippet_opts = params::snippet_opts(&args);
+    let file_path = params::file_path(&args)?;
+
+    let ws = server.resolve_workspace(&args).await?;
+    let uri = ws.open_document_if_needed(&file_path).await?;
+    let client = ws.current_client().await?;
+
+    let prepared = client.prepare_call_hierarchy(&uri, line, ch).await?;
+    let prepared_items: Vec<Value> = match prepared {
+        Value::Array(items) => items,
+        Value::Null => Vec::new(),
+        // rust-analyzer should always return an array per spec; treat anything
+        // else as empty so the LLM gets a stable shape.
+        _ => Vec::new(),
+    };
+
+    let mut out_items: Vec<Value> = Vec::with_capacity(prepared_items.len());
+    for item in prepared_items {
+        let calls_raw = match direction {
+            CallDirection::Incoming => client.call_hierarchy_incoming(&item).await?,
+            CallDirection::Outgoing => client.call_hierarchy_outgoing(&item).await?,
+        };
+        let calls = reshape_call_hierarchy_calls(&item, calls_raw, direction);
+        out_items.push(match direction {
+            CallDirection::Incoming => json!({ "item": item, "incoming": calls }),
+            CallDirection::Outgoing => json!({ "item": item, "outgoing": calls }),
+        });
+    }
+
+    let total = out_items.len();
+    let value = json!({ "items": out_items, "total": total });
+    wrap(maybe_enrich_locations(value, snippet_opts))
+}
+
+/// Convert `{ from|to: Item, fromRanges: [Range] }` to
+/// `{ from|to: Item, call_sites: [{uri, range}] }`.
+///
+/// For incoming calls each `fromRanges[i]` lives in `from.uri` (the caller's
+/// file). For outgoing calls they live in the *current* item's file (the
+/// place doing the calling), not in `to.uri`.
+fn reshape_call_hierarchy_calls(
+    current_item: &Value,
+    calls: Value,
+    direction: CallDirection,
+) -> Value {
+    let Value::Array(arr) = calls else {
+        return json!([]);
+    };
+    let current_uri = current_item.get("uri").and_then(Value::as_str);
+    let reshaped: Vec<Value> = arr
+        .into_iter()
+        .filter_map(|entry| {
+            let mut obj = entry.as_object()?.clone();
+            let ranges = obj.remove("fromRanges").unwrap_or(Value::Null);
+            let site_uri = match direction {
+                CallDirection::Incoming => obj
+                    .get("from")
+                    .and_then(|v| v.get("uri"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                CallDirection::Outgoing => current_uri.map(str::to_string),
+            };
+            let call_sites = match (site_uri, ranges) {
+                (Some(u), Value::Array(rs)) => rs
+                    .into_iter()
+                    .map(|r| json!({ "uri": u, "range": r }))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            obj.insert("call_sites".to_string(), Value::Array(call_sites));
+            Some(Value::Object(obj))
+        })
+        .collect();
+    Value::Array(reshaped)
+}
+
+/// Composite for `typeHierarchy/{super,sub}types`. Drives
+/// `prepareTypeHierarchy`, then fans out the requested directions per
+/// prepared item.
+async fn handle_type_hierarchy(
+    server: &Arc<RustAnalyzerMCPServer>,
+    args: Value,
+) -> Result<ToolResult> {
+    let (line, ch) = params::position(&args)?;
+    let snippet_opts = params::snippet_opts(&args);
+    let file_path = params::file_path(&args)?;
+    let direction = args
+        .get("direction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("both");
+    let (want_super, want_sub) = match direction {
+        "supertypes" => (true, false),
+        "subtypes" => (false, true),
+        "both" => (true, true),
+        other => {
+            return Err(anyhow!(
+                "Invalid direction: {other:?} (expected one of: supertypes, subtypes, both)"
+            ))
+        }
+    };
+
+    let ws = server.resolve_workspace(&args).await?;
+    let uri = ws.open_document_if_needed(&file_path).await?;
+    let client = ws.current_client().await?;
+
+    let prepared = client.prepare_type_hierarchy(&uri, line, ch).await?;
+    let prepared_items: Vec<Value> = match prepared {
+        Value::Array(items) => items,
+        Value::Null => Vec::new(),
+        _ => Vec::new(),
+    };
+
+    let mut out_items: Vec<Value> = Vec::with_capacity(prepared_items.len());
+    for item in prepared_items {
+        let (super_res, sub_res) = tokio::join!(
+            async {
+                if want_super {
+                    Some(client.type_hierarchy_supertypes(&item).await)
+                } else {
+                    None
+                }
+            },
+            async {
+                if want_sub {
+                    Some(client.type_hierarchy_subtypes(&item).await)
+                } else {
+                    None
+                }
+            },
+        );
+        let mut entry = serde_json::Map::new();
+        entry.insert("item".to_string(), item);
+        if let Some(res) = super_res {
+            entry.insert("supertypes".to_string(), res?);
+        }
+        if let Some(res) = sub_res {
+            entry.insert("subtypes".to_string(), res?);
+        }
+        out_items.push(Value::Object(entry));
+    }
+
+    let total = out_items.len();
+    let value = json!({ "items": out_items, "total": total });
+    wrap(maybe_enrich_locations(value, snippet_opts))
 }
 
 async fn handle_workspace_symbol(

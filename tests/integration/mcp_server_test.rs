@@ -696,6 +696,254 @@ async fn test_explore_symbol_composite() -> Result<()> {
     Ok(())
 }
 
+/// ANALYSIS §2.4 — call hierarchy + type hierarchy.
+///
+/// Asserts that the three new tools return the documented wrapper shape
+/// (`{ items, total }`), that incoming/outgoing/super/sub keys appear
+/// where expected, that `call_sites` are reshaped from `fromRanges`, and
+/// that snippet enrichment applies and can be opted out of.
+#[tokio::test]
+async fn test_phase24_call_and_type_hierarchy() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
+    let main_path = workspace_path.join("src/main.rs");
+    let main_str = main_path.to_str().unwrap();
+
+    // `greet` definition is on line 14: "fn greet(name: &str) -> String".
+    // The `greet` identifier starts at character 3.
+    let incoming = client
+        .call_tool(
+            "rust_analyzer_call_hierarchy_incoming",
+            json!({ "file_path": main_str, "line": 14, "character": 3 }),
+        )
+        .await?;
+    let v: Value = serde_json::from_str(&extract_tool_text(&incoming)?)?;
+    assert!(
+        v.get("items").and_then(Value::as_array).is_some(),
+        "incoming must wrap an items array, got {v:#?}"
+    );
+    assert!(v.get("total").is_some());
+    if let Some(items) = v["items"].as_array() {
+        for entry in items {
+            assert!(entry.get("item").is_some(), "each entry has `item`");
+            assert!(
+                entry.get("incoming").is_some(),
+                "each entry has `incoming` for the incoming tool, got {entry:#?}"
+            );
+            // If callers exist, every reshaped call has `from` + `call_sites`,
+            // and call_sites carry an explicit `uri` (NOT raw `fromRanges`).
+            if let Some(arr) = entry["incoming"].as_array() {
+                for call in arr {
+                    assert!(call.get("from").is_some(), "incoming call has `from`");
+                    assert!(
+                        call.get("fromRanges").is_none(),
+                        "fromRanges should be reshaped to call_sites"
+                    );
+                    let sites = call["call_sites"]
+                        .as_array()
+                        .expect("call_sites is always an array");
+                    for s in sites {
+                        assert!(s["uri"].is_string(), "each call_site carries its uri");
+                        assert!(s["range"].is_object());
+                    }
+                }
+            }
+        }
+    }
+
+    // Outgoing on `main` (line 0, "fn main()" — `main` starts at character 3).
+    let outgoing = client
+        .call_tool(
+            "rust_analyzer_call_hierarchy_outgoing",
+            json!({ "file_path": main_str, "line": 0, "character": 3 }),
+        )
+        .await?;
+    let v: Value = serde_json::from_str(&extract_tool_text(&outgoing)?)?;
+    assert!(v.get("items").is_some());
+    assert!(v.get("total").is_some());
+    if let Some(items) = v["items"].as_array() {
+        for entry in items {
+            assert!(entry.get("item").is_some());
+            assert!(
+                entry.get("outgoing").is_some(),
+                "each entry has `outgoing` for the outgoing tool"
+            );
+        }
+    }
+
+    // Type-hierarchy on `Calculator` (line 17 = "struct Calculator {",
+    // identifier at character 7).
+    let th = client
+        .call_tool(
+            "rust_analyzer_type_hierarchy",
+            json!({ "file_path": main_str, "line": 17, "character": 7 }),
+        )
+        .await?;
+    let v: Value = serde_json::from_str(&extract_tool_text(&th)?)?;
+    assert!(v.get("items").is_some());
+    if let Some(items) = v["items"].as_array() {
+        for entry in items {
+            assert!(entry.get("item").is_some());
+            // direction default = both, so both keys must exist (values may be null/[]).
+            assert!(
+                entry.get("supertypes").is_some(),
+                "default=both → supertypes"
+            );
+            assert!(entry.get("subtypes").is_some(), "default=both → subtypes");
+        }
+    }
+
+    // direction=supertypes only → no subtypes key.
+    let th_super = client
+        .call_tool(
+            "rust_analyzer_type_hierarchy",
+            json!({
+                "file_path": main_str,
+                "line": 17,
+                "character": 7,
+                "direction": "supertypes",
+            }),
+        )
+        .await?;
+    let v: Value = serde_json::from_str(&extract_tool_text(&th_super)?)?;
+    if let Some(items) = v["items"].as_array() {
+        for entry in items {
+            assert!(entry.get("supertypes").is_some());
+            assert!(
+                entry.get("subtypes").is_none(),
+                "subtypes omitted when direction=supertypes"
+            );
+        }
+    }
+
+    // Invalid direction → tool error (handler returns an MCP error result).
+    let bad = client
+        .call_tool(
+            "rust_analyzer_type_hierarchy",
+            json!({
+                "file_path": main_str,
+                "line": 17,
+                "character": 7,
+                "direction": "sideways",
+            }),
+        )
+        .await
+        .err();
+    assert!(
+        bad.is_some(),
+        "invalid direction must surface as an error to the client"
+    );
+
+    // include_snippets=false propagates through the composite output.
+    let no_snip = client
+        .call_tool(
+            "rust_analyzer_call_hierarchy_incoming",
+            json!({
+                "file_path": main_str,
+                "line": 14,
+                "character": 3,
+                "include_snippets": false,
+            }),
+        )
+        .await?;
+    let v: Value = serde_json::from_str(&extract_tool_text(&no_snip)?)?;
+    fn has_any_snippet(v: &Value) -> bool {
+        match v {
+            Value::Object(obj) => {
+                if obj.contains_key("snippet") {
+                    return true;
+                }
+                obj.values().any(has_any_snippet)
+            }
+            Value::Array(arr) => arr.iter().any(has_any_snippet),
+            _ => false,
+        }
+    }
+    assert!(
+        !has_any_snippet(&v),
+        "include_snippets=false must skip every nested snippet, got {v:#?}"
+    );
+
+    Ok(())
+}
+
+/// ANALYSIS §5.3 — `impact` composite. Aggregates references + callers
+/// (incoming calls) + implementors (subtypes) + related_tests in one
+/// round-trip. Asserts every bucket appears with the documented
+/// `{ items, total, shown }` shape.
+#[tokio::test]
+async fn test_impact_composite() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
+    let main_path = workspace_path.join("src/main.rs");
+    let main_str = main_path.to_str().unwrap();
+
+    // `greet` definition on line 14 — a function that's referenced from `main`
+    // and from the test module, so references and callers should both have hits
+    // (or be empty/null while indexing — we assert shape, not counts).
+    let response = client
+        .call_tool(
+            "rust_analyzer_impact",
+            json!({ "file_path": main_str, "line": 14, "character": 3 }),
+        )
+        .await?;
+    let v: Value = serde_json::from_str(&extract_tool_text(&response)?)?;
+
+    for bucket_name in ["references", "callers", "implementors", "tests"] {
+        let bucket = v.get(bucket_name).unwrap_or_else(|| {
+            panic!("impact must always include `{bucket_name}` bucket, got {v:#?}")
+        });
+        assert!(
+            bucket.get("items").and_then(Value::as_array).is_some(),
+            "{bucket_name} must wrap items array, got {bucket:#?}"
+        );
+        let total = bucket["total"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{bucket_name} must have total, got {bucket:#?}"));
+        let shown = bucket["shown"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{bucket_name} must have shown, got {bucket:#?}"));
+        assert!(
+            shown <= 10,
+            "{bucket_name} shown must be capped at 10, got {shown}"
+        );
+        assert!(shown <= total, "shown ≤ total invariant");
+    }
+
+    // include_snippets=false propagates to every nested location across all
+    // buckets — even the implementor/caller item locations.
+    let response = client
+        .call_tool(
+            "rust_analyzer_impact",
+            json!({
+                "file_path": main_str,
+                "line": 14,
+                "character": 3,
+                "include_snippets": false,
+            }),
+        )
+        .await?;
+    let v: Value = serde_json::from_str(&extract_tool_text(&response)?)?;
+    fn has_any_snippet(v: &Value) -> bool {
+        match v {
+            Value::Object(obj) => {
+                if obj.contains_key("snippet") {
+                    return true;
+                }
+                obj.values().any(has_any_snippet)
+            }
+            Value::Array(arr) => arr.iter().any(has_any_snippet),
+            _ => false,
+        }
+    }
+    assert!(
+        !has_any_snippet(&v),
+        "include_snippets=false must skip every nested snippet, got {v:#?}"
+    );
+
+    Ok(())
+}
+
 /// Phase 3.1 — MCP-Resources: list + read für `workspace://files`,
 /// `workspace://crates` und per-Crate-Manifests.
 #[tokio::test]
