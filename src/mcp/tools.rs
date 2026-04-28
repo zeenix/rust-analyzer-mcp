@@ -33,6 +33,7 @@ pub(super) const SNIPPET_ENRICHED_TOOLS: &[&str] = &[
     "rust_analyzer_related_tests",
     "rust_analyzer_workspace_symbol",
     "rust_analyzer_workspace_diagnostics",
+    "rust_analyzer_explore_symbol",
 ];
 
 fn build_tools() -> Vec<ToolDefinition> {
@@ -333,6 +334,11 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
         tool(
             "rust_analyzer_view_mir",
             "Return rust-analyzer's MIR (mid-level IR) for the function at the given position, as a debug-printed string. Position must be inside a function body for non-null output.",
+            position_schema(),
+        ),
+        tool(
+            "rust_analyzer_explore_symbol",
+            "One-shot symbol exploration: in a single round-trip returns hover, definition, type_definition, parent_module, and a sample of up to 5 references for the symbol at the given position. Use this whenever you want to *understand* a symbol — it replaces the typical 4-5 follow-up tool calls. Locations come pre-enriched with source snippets (toggle via include_snippets). The references sample is wrapped as { items, total, shown }; if references take longer than 2 seconds, the rest of the response still returns and `references_timed_out: true` is added.",
             position_schema(),
         ),
         tool(

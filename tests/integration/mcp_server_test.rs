@@ -616,6 +616,86 @@ async fn test_phase2_1_snippets() -> Result<()> {
     Ok(())
 }
 
+/// ANALYSIS §2.2 — `explore_symbol` Composite: ein Tool-Call liefert hover,
+/// definition, type_definition, parent_module und eine references_sample mit
+/// total/shown.
+#[tokio::test]
+async fn test_explore_symbol_composite() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let workspace_path = client.workspace_path().to_path_buf();
+    let main_path = workspace_path.join("src/main.rs");
+    let main_str = main_path.to_str().unwrap();
+
+    // greet-call on line 1 — symbol exists, all five sub-results should be
+    // present (some may be null while indexing, that's fine).
+    let response = client
+        .call_tool(
+            "rust_analyzer_explore_symbol",
+            json!({ "file_path": main_str, "line": 1, "character": 18 }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    let v: Value = serde_json::from_str(&text)?;
+
+    // The composite always returns the 5 keys; values may be null.
+    for key in [
+        "hover",
+        "definition",
+        "type_definition",
+        "parent_module",
+        "references_sample",
+    ] {
+        assert!(
+            v.get(key).is_some(),
+            "explore_symbol must always include `{key}` in output, got {v:#?}"
+        );
+    }
+
+    // references_sample is either null or { items, total, shown }
+    let refs = &v["references_sample"];
+    if !refs.is_null() {
+        assert!(refs.get("items").is_some(), "expected items, got {refs:#?}");
+        assert!(refs.get("total").is_some());
+        assert!(refs.get("shown").is_some());
+        let shown = refs["shown"].as_u64().unwrap();
+        assert!(shown <= 5, "shown must be capped at 5");
+    }
+
+    // include_snippets=false must propagate to every nested location.
+    let response = client
+        .call_tool(
+            "rust_analyzer_explore_symbol",
+            json!({
+                "file_path": main_str,
+                "line": 1,
+                "character": 18,
+                "include_snippets": false,
+            }),
+        )
+        .await?;
+    let text = extract_tool_text(&response)?;
+    let v: Value = serde_json::from_str(&text)?;
+
+    fn has_any_snippet(v: &Value) -> bool {
+        match v {
+            Value::Object(obj) => {
+                if obj.contains_key("snippet") {
+                    return true;
+                }
+                obj.values().any(has_any_snippet)
+            }
+            Value::Array(arr) => arr.iter().any(has_any_snippet),
+            _ => false,
+        }
+    }
+    assert!(
+        !has_any_snippet(&v),
+        "include_snippets=false must skip every nested snippet, got {v:#?}"
+    );
+
+    Ok(())
+}
+
 /// Phase 3.1 — MCP-Resources: list + read für `workspace://files`,
 /// `workspace://crates` und per-Crate-Manifests.
 #[tokio::test]

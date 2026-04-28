@@ -329,10 +329,93 @@ pub async fn handle_tool_call(
             })
             .await
         }
+        "rust_analyzer_explore_symbol" => handle_explore_symbol(server, args).await,
         "rust_analyzer_add_workspace" => handle_add_workspace(server, args).await,
         "rust_analyzer_remove_workspace" => handle_remove_workspace(server, args).await,
         "rust_analyzer_list_workspaces" => handle_list_workspaces(server, args).await,
         _ => Err(anyhow!("Unknown tool: {}", tool_name)),
+    }
+}
+
+/// Composite handler that fans out the five most common follow-up calls a
+/// caller would make after locating a symbol — hover, definition,
+/// type_definition, parent_module, and a sample of references — in a single
+/// round-trip. Drives them concurrently via `tokio::join!`; the document is
+/// opened once and the workspace is resolved once. References are wrapped
+/// in a 2 s timeout so a single slow workspace-wide search can't block the
+/// rest of the composite.
+async fn handle_explore_symbol(
+    server: &Arc<RustAnalyzerMCPServer>,
+    args: Value,
+) -> Result<ToolResult> {
+    let (line, ch) = params::position(&args)?;
+    let snippet_opts = params::snippet_opts(&args);
+    let file_path = params::file_path(&args)?;
+
+    let ws = server.resolve_workspace(&args).await?;
+    let uri = ws.open_document_if_needed(&file_path).await?;
+    let client = ws.current_client().await?;
+
+    let refs_timeout = std::time::Duration::from_secs(2);
+
+    let (hover_res, def_res, type_def_res, parent_res, refs_res) = tokio::join!(
+        client.hover(&uri, line, ch),
+        client.definition(&uri, line, ch),
+        client.type_definition(&uri, line, ch),
+        client.parent_module(&uri, line, ch),
+        tokio::time::timeout(refs_timeout, client.references(&uri, line, ch)),
+    );
+
+    // Treat a per-sub-call LSP error as null — explore_symbol is best-effort
+    // and one failure shouldn't poison the rest. Real errors are still logged
+    // by the LSP layer.
+    let hover = hover_res.unwrap_or(Value::Null);
+    let definition = maybe_enrich_locations(def_res.unwrap_or(Value::Null), snippet_opts);
+    let type_definition = maybe_enrich_locations(type_def_res.unwrap_or(Value::Null), snippet_opts);
+    let parent_module = maybe_enrich_locations(parent_res.unwrap_or(Value::Null), snippet_opts);
+
+    let (refs_value, refs_timed_out) = match refs_res {
+        Ok(Ok(v)) => (v, false),
+        Ok(Err(_)) => (Value::Null, false),
+        Err(_) => (Value::Null, true),
+    };
+
+    let references_sample = sample_references(refs_value);
+    let references_sample = maybe_enrich_locations(references_sample, snippet_opts);
+
+    let mut out = json!({
+        "hover": hover,
+        "definition": definition,
+        "type_definition": type_definition,
+        "parent_module": parent_module,
+        "references_sample": references_sample,
+    });
+    if refs_timed_out {
+        out.as_object_mut()
+            .expect("just constructed")
+            .insert("references_timed_out".to_string(), json!(true));
+    }
+    wrap(out)
+}
+
+/// Trim a references response to a small sample plus a `total` count, so the
+/// LLM gets enough to navigate without blowing token budget on every consumer
+/// of the symbol. The shape mirrors paginate_workspace_symbol's wrapper.
+fn sample_references(value: Value) -> Value {
+    const SAMPLE_SIZE: usize = 5;
+    match value {
+        Value::Array(items) => {
+            let total = items.len();
+            let shown = total.min(SAMPLE_SIZE);
+            let sample: Vec<Value> = items.into_iter().take(SAMPLE_SIZE).collect();
+            json!({
+                "items": sample,
+                "total": total,
+                "shown": shown,
+            })
+        }
+        Value::Null => Value::Null,
+        other => other,
     }
 }
 
