@@ -20,9 +20,9 @@ use super::{
         SNIPPET_DEFAULT_MAX_HITS,
     },
     truncate::{
-        paginate_workspace_diagnostics, paginate_workspace_symbol, parse_cursor, resolve_limit,
-        truncate_completion, truncate_hover, COMPLETION_DEFAULT_LIMIT, HOVER_MAX_BYTES,
-        WORKSPACE_DIAGNOSTICS_DEFAULT_LIMIT, WORKSPACE_SYMBOL_DEFAULT_LIMIT,
+        dedup_workspace_symbols, paginate_workspace_diagnostics, paginate_workspace_symbol,
+        parse_cursor, resolve_limit, truncate_completion, truncate_hover, COMPLETION_DEFAULT_LIMIT,
+        HOVER_MAX_BYTES, WORKSPACE_DIAGNOSTICS_DEFAULT_LIMIT, WORKSPACE_SYMBOL_DEFAULT_LIMIT,
     },
     workspace::WorkspaceEntry,
     workspace_edit::apply_workspace_edit,
@@ -465,7 +465,7 @@ async fn handle_get_type_by_name(
 
     let raw = client.workspace_symbol(last_segment).await?;
     let all_symbols: Vec<Value> = match raw {
-        Value::Array(items) => items,
+        Value::Array(items) => dedup_workspace_symbols(items),
         _ => Vec::new(),
     };
 

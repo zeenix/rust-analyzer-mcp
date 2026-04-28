@@ -179,8 +179,40 @@ fn completion_sort_key(item: &Value) -> String {
     sort.unwrap_or_else(|| label.clone()) + "\u{1f}" + &label
 }
 
+/// Drop entries that share the same `(name, containerName, location)` triple.
+/// rust-analyzer's `workspace/symbol` returns each match twice in many cases
+/// (once per index source) and the duplicates eat token budget without adding
+/// signal. First occurrence wins so list order is preserved.
+pub fn dedup_workspace_symbols(items: Vec<Value>) -> Vec<Value> {
+    let mut seen: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let container = item
+            .get("containerName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let location = item
+            .get("location")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        if seen.insert((name, container, location)) {
+            out.push(item);
+        }
+    }
+    out
+}
+
 /// Paginate a workspace_symbol response. LSP returns `SymbolInformation[]` or
-/// `WorkspaceSymbol[]` or null. Output: `{ symbols, total, returned, next_cursor? }`.
+/// `WorkspaceSymbol[]` or null. Identical entries (same name + containerName +
+/// location) are collapsed before counting and paginating. Output:
+/// `{ symbols, total, returned, next_cursor? }`.
 pub fn paginate_workspace_symbol(
     value: Value,
     cursor: usize,
@@ -194,6 +226,7 @@ pub fn paginate_workspace_symbol(
         return value;
     };
 
+    let items = dedup_workspace_symbols(items);
     let total = items.len();
     let start = cursor.min(total);
     let take = if verbose { total - start } else { limit };
@@ -396,6 +429,76 @@ mod tests {
     fn workspace_symbol_null_passthrough() {
         let out = paginate_workspace_symbol(json!(null), 0, 100, false);
         assert!(out.is_null());
+    }
+
+    #[test]
+    fn workspace_symbol_dedups_identical_entries() {
+        let dup = json!({
+            "name": "UseColours",
+            "kind": 10,
+            "location": {
+                "uri": "file:///a/src/theme.rs",
+                "range": { "start": { "line": 46, "character": 9 }, "end": { "line": 46, "character": 19 } }
+            }
+        });
+        let items = vec![dup.clone(), dup.clone()];
+        let out = paginate_workspace_symbol(json!(items), 0, 100, false);
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["returned"], 1);
+        assert_eq!(out["symbols"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workspace_symbol_dedup_distinguishes_container_name() {
+        let a = json!({
+            "name": "deduce",
+            "kind": 12,
+            "containerName": "DirAction",
+            "location": {
+                "uri": "file:///a/src/options/dir_action.rs",
+                "range": { "start": { "line": 20, "character": 11 }, "end": { "line": 20, "character": 17 } }
+            }
+        });
+        let b = json!({
+            "name": "deduce",
+            "kind": 12,
+            "containerName": "RecurseOptions",
+            "location": {
+                "uri": "file:///a/src/options/dir_action.rs",
+                "range": { "start": { "line": 59, "character": 11 }, "end": { "line": 59, "character": 17 } }
+            }
+        });
+        // duplicates of each variant
+        let items = vec![a.clone(), b.clone(), a.clone(), b.clone()];
+        let out = paginate_workspace_symbol(json!(items), 0, 100, false);
+        assert_eq!(out["total"], 2);
+        let syms = out["symbols"].as_array().unwrap();
+        assert_eq!(syms.len(), 2);
+        // First-seen order preserved.
+        assert_eq!(syms[0]["containerName"], "DirAction");
+        assert_eq!(syms[1]["containerName"], "RecurseOptions");
+    }
+
+    #[test]
+    fn workspace_symbol_dedup_keeps_distinct_locations() {
+        let a = json!({
+            "name": "Theme",
+            "kind": 10,
+            "location": {
+                "uri": "file:///a/src/theme/mod.rs",
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 5 } }
+            }
+        });
+        let b = json!({
+            "name": "Theme",
+            "kind": 10,
+            "location": {
+                "uri": "file:///a/src/theme/other.rs",
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 5 } }
+            }
+        });
+        let out = paginate_workspace_symbol(json!(vec![a, b]), 0, 100, false);
+        assert_eq!(out["total"], 2);
     }
 
     #[test]
