@@ -51,6 +51,9 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Disable workspace-registry persistence — tests must not write to
+        // the user's real ~/.local/state/rust-analyzer-mcp/.
+        .env("RUST_ANALYZER_MCP_STATE_DIR", "")
         .spawn()?;
 
     let mut stdin = rust_analyzer.stdin.take().unwrap();

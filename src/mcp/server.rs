@@ -13,7 +13,10 @@ use crate::{
     protocol::mcp::{error_codes, MCPRequest, MCPResponse},
 };
 
-use super::workspace::{WorkspaceEntry, WorkspaceRegistry};
+use super::{
+    persistence,
+    workspace::{WorkspaceEntry, WorkspaceRegistry},
+};
 
 pub struct RustAnalyzerMCPServer {
     pub(super) workspaces: RwLock<WorkspaceRegistry>,
@@ -22,6 +25,14 @@ pub struct RustAnalyzerMCPServer {
     /// the matching handle and aborts the task; tasks remove themselves on
     /// completion.
     in_flight: Arc<parking_lot::Mutex<HashMap<String, AbortHandle>>>,
+    /// Directory where the workspace registry is mirrored to disk so the
+    /// next server boot can re-register the same set. `None` disables
+    /// persistence (e.g. test-mode without a state dir override).
+    persistence_dir: Option<PathBuf>,
+    /// Serialises persistence writes so two concurrent registry mutations
+    /// don't race the on-disk file. Atomic rename plus this lock together
+    /// guarantee the file always reflects a self-consistent snapshot.
+    persistence_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for RustAnalyzerMCPServer {
@@ -37,9 +48,59 @@ impl RustAnalyzerMCPServer {
     }
 
     pub fn with_workspace(workspace_root: PathBuf) -> Self {
+        Self::build(workspace_root, persistence::default_state_dir())
+    }
+
+    /// Variant for tests: pin the persistence directory explicitly so tests
+    /// don't touch the user's real `~/.local/state/...`. Pass `None` to
+    /// disable persistence entirely.
+    pub fn with_workspace_and_persistence(
+        workspace_root: PathBuf,
+        persistence_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::build(workspace_root, persistence_dir)
+    }
+
+    fn build(workspace_root: PathBuf, persistence_dir: Option<PathBuf>) -> Self {
+        let mut registry = WorkspaceRegistry::with_initial_root(workspace_root);
+        if let Some(dir) = &persistence_dir {
+            for root in persistence::load(dir) {
+                let already = registry.list().iter().any(|e| e.root_clone() == root);
+                if !already {
+                    registry.add(root);
+                }
+            }
+        }
         Self {
-            workspaces: RwLock::new(WorkspaceRegistry::with_initial_root(workspace_root)),
+            workspaces: RwLock::new(registry),
             in_flight: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            persistence_dir,
+            persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// Snapshot the current registry roots and write them to disk. Best-effort:
+    /// failures are logged but never propagated — persistence is a convenience,
+    /// not a correctness requirement. The persistence_lock serialises writes so
+    /// two concurrent mutations can't interleave their saves.
+    async fn persist(self: &Arc<Self>) {
+        let Some(dir) = self.persistence_dir.clone() else {
+            return;
+        };
+        let _guard = self.persistence_lock.lock().await;
+        let roots: Vec<PathBuf> = self
+            .workspaces
+            .read()
+            .await
+            .list()
+            .iter()
+            .map(|e| e.root_clone())
+            .collect();
+        let result = tokio::task::spawn_blocking(move || persistence::save(&dir, &roots)).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("Failed to persist workspaces: {}", e),
+            Err(e) => tracing::warn!("persistence task join error: {}", e),
         }
     }
 
@@ -78,17 +139,20 @@ impl RustAnalyzerMCPServer {
     }
 
     /// Add a new workspace. Returns the newly-created entry.
-    pub(super) async fn add_workspace(&self, root: PathBuf) -> Arc<WorkspaceEntry> {
-        self.workspaces.write().await.add(root)
+    pub(super) async fn add_workspace(self: &Arc<Self>, root: PathBuf) -> Arc<WorkspaceEntry> {
+        let entry = self.workspaces.write().await.add(root);
+        self.persist().await;
+        entry
     }
 
     /// Remove a workspace by id. Shuts down its client. Returns `true` if the
     /// id was known.
-    pub(super) async fn remove_workspace(&self, id: &str) -> bool {
+    pub(super) async fn remove_workspace(self: &Arc<Self>, id: &str) -> bool {
         let entry = self.workspaces.write().await.remove(id);
         match entry {
             Some(entry) => {
                 entry.shutdown_client().await;
+                self.persist().await;
                 true
             }
             None => false,
@@ -99,7 +163,10 @@ impl RustAnalyzerMCPServer {
     /// root in place (preserving its id) and shuts down its client so the next
     /// call boots rust-analyzer in the new directory. If the registry is
     /// empty (every workspace was removed), creates a fresh default.
-    pub(super) async fn set_workspace_root(&self, workspace_root: PathBuf) -> Result<()> {
+    pub(super) async fn set_workspace_root(
+        self: &Arc<Self>,
+        workspace_root: PathBuf,
+    ) -> Result<()> {
         let default = self.workspaces.read().await.default();
         match default {
             Some(entry) => {
@@ -109,6 +176,7 @@ impl RustAnalyzerMCPServer {
                 self.workspaces.write().await.add(workspace_root);
             }
         }
+        self.persist().await;
         Ok(())
     }
 
@@ -489,6 +557,115 @@ fn resolve_resource_uri(
     }
     let default = registry.default()?;
     Some((default, uri.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::canonicalize_path;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn add_workspace_persists_and_replays_on_reboot() {
+        let state = TempDir::new().unwrap();
+        let initial = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+
+        let server = Arc::new(RustAnalyzerMCPServer::with_workspace_and_persistence(
+            initial.path().to_path_buf(),
+            Some(state.path().to_path_buf()),
+        ));
+        server.add_workspace(extra.path().to_path_buf()).await;
+
+        // Boot a fresh server with the same state dir — the second workspace
+        // should come back without an explicit add_workspace call.
+        let server2 = Arc::new(RustAnalyzerMCPServer::with_workspace_and_persistence(
+            initial.path().to_path_buf(),
+            Some(state.path().to_path_buf()),
+        ));
+        let roots: Vec<PathBuf> = server2
+            .list_workspaces()
+            .await
+            .iter()
+            .map(|e| e.root_clone())
+            .collect();
+        let want_extra = canonicalize_path(extra.path().to_path_buf());
+        assert!(
+            roots.contains(&want_extra),
+            "rebooted server should re-register persisted workspace; got {roots:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_workspace_drops_from_persistence() {
+        let state = TempDir::new().unwrap();
+        let initial = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+
+        let server = Arc::new(RustAnalyzerMCPServer::with_workspace_and_persistence(
+            initial.path().to_path_buf(),
+            Some(state.path().to_path_buf()),
+        ));
+        let entry = server.add_workspace(extra.path().to_path_buf()).await;
+        let id = entry.id().to_string();
+        assert!(server.remove_workspace(&id).await);
+
+        let server2 = Arc::new(RustAnalyzerMCPServer::with_workspace_and_persistence(
+            initial.path().to_path_buf(),
+            Some(state.path().to_path_buf()),
+        ));
+        let roots: Vec<PathBuf> = server2
+            .list_workspaces()
+            .await
+            .iter()
+            .map(|e| e.root_clone())
+            .collect();
+        let removed = canonicalize_path(extra.path().to_path_buf());
+        assert!(
+            !roots.contains(&removed),
+            "removed workspace must not reappear after reboot; got {roots:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_skips_initial_root_dup() {
+        let state = TempDir::new().unwrap();
+        let initial = TempDir::new().unwrap();
+
+        // First boot: add the same path that's already the initial root.
+        let server = Arc::new(RustAnalyzerMCPServer::with_workspace_and_persistence(
+            initial.path().to_path_buf(),
+            Some(state.path().to_path_buf()),
+        ));
+        // Persist the single root so the file exists.
+        server.persist().await;
+
+        // Second boot with the same initial root: must not duplicate.
+        let server2 = Arc::new(RustAnalyzerMCPServer::with_workspace_and_persistence(
+            initial.path().to_path_buf(),
+            Some(state.path().to_path_buf()),
+        ));
+        let roots: Vec<PathBuf> = server2
+            .list_workspaces()
+            .await
+            .iter()
+            .map(|e| e.root_clone())
+            .collect();
+        assert_eq!(roots.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persistence_disabled_when_dir_is_none() {
+        let initial = TempDir::new().unwrap();
+        let server = Arc::new(RustAnalyzerMCPServer::with_workspace_and_persistence(
+            initial.path().to_path_buf(),
+            None,
+        ));
+        // Should not panic / not write anywhere.
+        let extra = TempDir::new().unwrap();
+        server.add_workspace(extra.path().to_path_buf()).await;
+        assert_eq!(server.list_workspaces().await.len(), 2);
+    }
 }
 
 /// Canonicalises a JSON-RPC request id (string, number, or null) into a stable

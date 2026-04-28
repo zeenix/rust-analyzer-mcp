@@ -123,6 +123,8 @@ impl MCPTestClient {
             .env("RUST_ANALYZER_CONFIG", "")
             // Disable cargo target directory sharing
             .env("CARGO_TARGET_DIR", format!("{}/target", temp_dir))
+            // Disable workspace-registry persistence in tests.
+            .env("RUST_ANALYZER_MCP_STATE_DIR", "")
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
@@ -188,6 +190,8 @@ impl MCPTestClient {
             .env("RUST_ANALYZER_CONFIG", "")
             // Disable cargo target directory sharing
             .env("CARGO_TARGET_DIR", format!("{}/target", temp_dir))
+            // Disable workspace-registry persistence in tests.
+            .env("RUST_ANALYZER_MCP_STATE_DIR", "")
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();

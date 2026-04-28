@@ -1,4 +1,5 @@
 mod handlers;
+mod persistence;
 mod resources;
 mod runnables;
 mod server;
