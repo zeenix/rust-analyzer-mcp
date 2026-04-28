@@ -1,30 +1,22 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
-use std::{
-    collections::{HashMap, VecDeque},
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     sync::{Mutex, RwLock},
     task::AbortHandle,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::{
-    config::{MAX_RESTART_COUNT, RESTART_WINDOW_SECS},
-    lsp::{client::CURRENT_MCP_REQUEST_ID, RustAnalyzerClient},
+    lsp::client::CURRENT_MCP_REQUEST_ID,
     protocol::mcp::{MCPError, MCPRequest, MCPResponse},
 };
 
+use super::workspace::{WorkspaceEntry, WorkspaceRegistry};
+
 pub struct RustAnalyzerMCPServer {
-    pub(super) client: RwLock<Option<Arc<RustAnalyzerClient>>>,
-    pub(super) workspace_root: RwLock<PathBuf>,
-    /// Timestamps of recent automatic restarts, oldest first. Used to back off
-    /// when rust-analyzer keeps crashing (see `MAX_RESTART_COUNT`).
-    restart_history: parking_lot::Mutex<VecDeque<Instant>>,
+    pub(super) workspaces: RwLock<WorkspaceRegistry>,
     /// AbortHandles for currently-running tool calls, keyed by the canonical
     /// string form of the MCP request id. `notifications/cancelled` looks up
     /// the matching handle and aborts the task; tasks remove themselves on
@@ -40,166 +32,84 @@ impl Default for RustAnalyzerMCPServer {
 
 impl RustAnalyzerMCPServer {
     pub fn new() -> Self {
-        Self {
-            client: RwLock::new(None),
-            workspace_root: RwLock::new(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            ),
-            restart_history: parking_lot::Mutex::new(VecDeque::new()),
-            in_flight: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::with_workspace(cwd)
     }
 
     pub fn with_workspace(workspace_root: PathBuf) -> Self {
-        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-            if workspace_root.is_absolute() {
-                workspace_root.clone()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(&workspace_root)
-            }
-        });
-
         Self {
-            client: RwLock::new(None),
-            workspace_root: RwLock::new(workspace_root),
-            restart_history: parking_lot::Mutex::new(VecDeque::new()),
+            workspaces: RwLock::new(WorkspaceRegistry::with_initial_root(workspace_root)),
             in_flight: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
-    /// Returns a healthy `RustAnalyzerClient`, starting it if missing or
-    /// restarting it if the previous one's process has exited. Restarts are
-    /// rate-limited via `restart_history` to avoid hot-loops on a process that
-    /// keeps crashing.
-    pub(super) async fn ensure_client_started(&self) -> Result<Arc<RustAnalyzerClient>> {
-        // Fast path: existing healthy client.
-        if let Some(c) = self.client.read().await.as_ref() {
-            if !c.is_dead() {
-                return Ok(Arc::clone(c));
-            }
-        }
-
-        // Slow path: take write lock and (re)start.
-        let mut guard = self.client.write().await;
-
-        // Re-check under write lock.
-        if let Some(c) = guard.as_ref() {
-            if !c.is_dead() {
-                return Ok(Arc::clone(c));
-            }
-        }
-
-        // If we're replacing a dead client, that counts as a restart.
-        if guard.as_ref().is_some_and(|c| c.is_dead()) {
-            self.record_restart()?;
-            warn!("rust-analyzer process died; restarting");
-            if let Some(old) = guard.take() {
-                // Best-effort cleanup in the background — the process is gone,
-                // but stdin/document state still needs to be dropped.
-                tokio::spawn(async move {
-                    let _ = old.shutdown().await;
-                });
-            }
-        }
-
-        let workspace_root = self.workspace_root.read().await.clone();
-        let client = Arc::new(RustAnalyzerClient::new(workspace_root));
-        client.start().await?;
-        *guard = Some(Arc::clone(&client));
-        Ok(client)
-    }
-
-    /// Records a restart attempt; errors out if too many crashes happened
-    /// within the rolling window. Synchronous (parking_lot) lock — held only
-    /// long enough to push/pop a small VecDeque.
-    fn record_restart(&self) -> Result<()> {
-        let mut hist = self.restart_history.lock();
-        let now = Instant::now();
-        let cutoff = now
-            .checked_sub(Duration::from_secs(RESTART_WINDOW_SECS))
-            .unwrap_or(now);
-        while hist.front().is_some_and(|t| *t < cutoff) {
-            hist.pop_front();
-        }
-        if hist.len() >= MAX_RESTART_COUNT {
-            return Err(anyhow!(
-                "rust-analyzer crashed {} times in the last {}s; refusing to restart again",
-                hist.len(),
-                RESTART_WINDOW_SECS
-            ));
-        }
-        hist.push_back(now);
-        Ok(())
-    }
-
-    pub(super) async fn set_workspace_root(&self, workspace_root: PathBuf) -> Result<()> {
-        // Shutdown existing client first.
-        if let Some(c) = self.client.write().await.take() {
-            let _ = c.shutdown().await;
-        }
-        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-            if workspace_root.is_absolute() {
-                workspace_root.clone()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(&workspace_root)
-            }
-        });
-        *self.workspace_root.write().await = workspace_root;
-        Ok(())
-    }
-
-    pub(super) async fn workspace_root_clone(&self) -> PathBuf {
-        self.workspace_root.read().await.clone()
-    }
-
-    pub(super) async fn open_document_if_needed(&self, file_path: &str) -> Result<String> {
-        let workspace_root = self.workspace_root.read().await.clone();
-        let absolute_path = workspace_root.join(file_path);
-        let absolute_path = absolute_path
-            .canonicalize()
-            .unwrap_or_else(|_| absolute_path.clone());
-        let uri = format!("file://{}", absolute_path.display());
-
-        let client = self.ensure_client_started().await?;
-
-        // Cheapest path: open and mtime hasn't moved → skip disk entirely.
-        let mtime = tokio::fs::metadata(&absolute_path)
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok());
-
-        if client.is_open_and_fresh(&uri, mtime).await {
-            return Ok(uri);
-        }
-
-        let content = tokio::fs::read_to_string(&absolute_path)
-            .await
-            .map_err(|e| anyhow!("Failed to read file {}: {}", file_path, e))?;
-
-        if client.is_open(&uri).await {
-            // Already open but the file moved on disk — sync via didChange.
-            // update_document only emits a notification when the content hash
-            // actually differs.
-            client.update_document(&uri, &content, mtime).await?;
-        } else {
-            client
-                .open_document_with_mtime(&uri, &content, mtime)
-                .await?;
-        }
-        Ok(uri)
-    }
-
-    pub(super) async fn current_client(&self) -> Result<Arc<RustAnalyzerClient>> {
-        self.client
+    /// Returns the default (first-registered) workspace. Errors if every
+    /// workspace has been removed — callers can recover by adding a fresh one.
+    pub(super) async fn default_workspace(&self) -> Result<Arc<WorkspaceEntry>> {
+        self.workspaces
             .read()
             .await
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| anyhow::anyhow!("Client not initialized"))
+            .default()
+            .ok_or_else(|| anyhow::anyhow!("No default workspace registered"))
+    }
+
+    /// Looks up a workspace by id. Errors with a stable message so handlers
+    /// can pass it back to the LLM.
+    pub(super) async fn workspace_by_id(&self, id: &str) -> Result<Arc<WorkspaceEntry>> {
+        self.workspaces
+            .read()
+            .await
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown workspace_id: {}", id))
+    }
+
+    /// Resolve the workspace targeted by a tool call: explicit `workspace_id`
+    /// from args wins, otherwise default.
+    pub(super) async fn resolve_workspace(&self, args: &Value) -> Result<Arc<WorkspaceEntry>> {
+        match args.get("workspace_id").and_then(|v| v.as_str()) {
+            Some(id) => self.workspace_by_id(id).await,
+            None => self.default_workspace().await,
+        }
+    }
+
+    /// Snapshot of all registered workspaces (in insertion order).
+    pub(super) async fn list_workspaces(&self) -> Vec<Arc<WorkspaceEntry>> {
+        self.workspaces.read().await.list()
+    }
+
+    /// Add a new workspace. Returns the newly-created entry.
+    pub(super) async fn add_workspace(&self, root: PathBuf) -> Arc<WorkspaceEntry> {
+        self.workspaces.write().await.add(root)
+    }
+
+    /// Remove a workspace by id. Shuts down its client. Returns `true` if the
+    /// id was known.
+    pub(super) async fn remove_workspace(&self, id: &str) -> bool {
+        let entry = self.workspaces.write().await.remove(id);
+        match entry {
+            Some(entry) => {
+                entry.shutdown_client().await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Backward-compatible "set workspace": replaces the *default* workspace's
+    /// root in place (preserving its id) and shuts down its client so the next
+    /// call boots rust-analyzer in the new directory. If the registry is
+    /// empty (every workspace was removed), creates a fresh default.
+    pub(super) async fn set_workspace_root(&self, workspace_root: PathBuf) -> Result<()> {
+        let default = self.workspaces.read().await.default();
+        match default {
+            Some(entry) => {
+                entry.replace_root(workspace_root).await;
+            }
+            None => {
+                self.workspaces.write().await.add(workspace_root);
+            }
+        }
+        Ok(())
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -280,22 +190,54 @@ impl RustAnalyzerMCPServer {
             }
         }
 
-        // Cleanup.
+        // Cleanup: shutdown every workspace's client.
         info!("Shutting down");
-        if let Some(c) = self.client.write().await.take() {
-            let _ = c.shutdown().await;
+        let entries = self.workspaces.read().await.list();
+        for entry in entries {
+            entry.shutdown_client().await;
         }
 
         Ok(())
     }
 
     async fn handle_resources_list(self: &Arc<Self>, request: MCPRequest) -> MCPResponse {
-        let workspace_root = self.workspace_root.read().await.clone();
-        // list_resources may shell out to `cargo metadata`; offload to a
-        // blocking thread so a slow workspace doesn't stall the request reader.
-        let listed =
-            tokio::task::spawn_blocking(move || super::resources::list_resources(&workspace_root))
-                .await;
+        // Snapshot every workspace's id + root, then run cargo metadata + the
+        // file-tree advert for each one off-thread. Default workspace
+        // additionally gets unprefixed aliases (`workspace://files`, etc.) for
+        // backward compatibility with single-workspace clients.
+        let entries = self.workspaces.read().await.list();
+        let snapshots: Vec<(String, PathBuf, bool)> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.id().to_string(), e.root_clone(), i == 0))
+            .collect();
+
+        let listed = tokio::task::spawn_blocking(move || {
+            let mut all = Vec::new();
+            for (id, root, is_default) in snapshots {
+                let raw = super::resources::list_resources(&root);
+                let Some(resources) = raw["resources"].as_array() else {
+                    continue;
+                };
+                for resource in resources {
+                    let original = resource["uri"].as_str().unwrap_or("").to_string();
+                    let prefixed = prefix_workspace_uri(&original, &id);
+                    let mut entry = resource.clone();
+                    entry["uri"] = json!(prefixed);
+                    if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
+                        entry["name"] = json!(format!("[{id}] {name}"));
+                    }
+                    all.push(entry);
+
+                    if is_default {
+                        // Backward-compat alias on the default workspace.
+                        all.push(resource.clone());
+                    }
+                }
+            }
+            json!({ "resources": all })
+        })
+        .await;
 
         match listed {
             Ok(value) => MCPResponse::Success {
@@ -342,21 +284,58 @@ impl RustAnalyzerMCPServer {
             };
         };
 
-        let workspace_root = self.workspace_root.read().await.clone();
+        // Resolve workspace from URI: `workspace://<id>/<rest>` targets a
+        // specific workspace; an unprefixed `workspace://...` falls back to
+        // the default. The match against known ids is what disambiguates from
+        // the legacy paths (e.g. `workspace://crate/<name>/Cargo.toml`).
+        let resolved = {
+            let registry = self.workspaces.read().await;
+            resolve_resource_uri(&uri, &registry)
+        };
+        let (workspace_root, read_uri) = match resolved {
+            Some(pair) => pair,
+            None => {
+                return MCPResponse::Error {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    error: MCPError {
+                        code: -32603,
+                        message: "No workspace registered to serve this URI".to_string(),
+                        data: None,
+                    },
+                };
+            }
+        };
 
         // Filesystem walk is sync; offload to a blocking thread so we don't
         // stall the request reader on a large workspace.
+        let uri_changed = read_uri != uri;
         let read = tokio::task::spawn_blocking(move || {
-            super::resources::read_resource(&workspace_root, &uri)
+            super::resources::read_resource(&workspace_root, &read_uri)
         })
         .await;
 
         match read {
-            Ok(Ok(value)) => MCPResponse::Success {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: value,
-            },
+            Ok(Ok(mut value)) => {
+                // resources::read_resource stamps each content item with the
+                // URI it was called with (the normalized form). Rewrite back
+                // to the caller-supplied URI so the response round-trips
+                // exactly what the client asked for.
+                if uri_changed {
+                    if let Some(arr) = value.get_mut("contents").and_then(|v| v.as_array_mut()) {
+                        for item in arr {
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("uri".to_string(), json!(uri));
+                            }
+                        }
+                    }
+                }
+                MCPResponse::Success {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: value,
+                }
+            }
             Ok(Err(e)) => MCPResponse::Error {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,
@@ -394,10 +373,15 @@ impl RustAnalyzerMCPServer {
 
         // Forward `$/cancelRequest` to rust-analyzer for any LSP calls this
         // MCP request had in flight, so the upstream work actually stops
-        // instead of being abandoned. Do this before aborting the spawn so the
+        // instead of being abandoned. Workspaces only know about their own LSP
+        // ids — broadcast across all of them; clients without matching
+        // entries no-op cheaply. Do this before aborting the spawn so the
         // tracker still has the LSP ids registered.
-        if let Some(client) = self.client.read().await.as_ref().map(Arc::clone) {
-            client.cancel_mcp(&key).await;
+        let entries = self.workspaces.read().await.list();
+        for entry in entries {
+            if let Some(client) = entry.maybe_client().await {
+                client.cancel_mcp(&key).await;
+            }
         }
 
         let abort = self.in_flight.lock().remove(&key);
@@ -533,6 +517,36 @@ impl RustAnalyzerMCPServer {
             },
         }
     }
+}
+
+/// Add a workspace-id segment after `workspace://` so per-workspace resource
+/// URIs are unambiguous: `workspace://files` → `workspace://ws-2/files`.
+fn prefix_workspace_uri(uri: &str, id: &str) -> String {
+    match uri.strip_prefix("workspace://") {
+        Some(rest) => format!("workspace://{id}/{rest}"),
+        None => uri.to_string(),
+    }
+}
+
+/// Resolve a `workspace://...` URI to the workspace it targets and the
+/// "normalized" form that `resources::read_resource` understands (without the
+/// id segment). Returns `None` if the registry is empty.
+///
+/// - `workspace://<id>/<rest>` → look up `<id>` in the registry; if it exists, return `(root,
+///   "workspace://<rest>")`.
+/// - Any other `workspace://...` URI (including legacy unprefixed paths like
+///   `workspace://crate/foo/Cargo.toml`) → falls through to the default workspace, URI passed
+///   through unchanged.
+fn resolve_resource_uri(uri: &str, registry: &WorkspaceRegistry) -> Option<(PathBuf, String)> {
+    if let Some(rest) = uri.strip_prefix("workspace://") {
+        if let Some((maybe_id, suffix)) = rest.split_once('/') {
+            if let Some(ws) = registry.get(maybe_id) {
+                return Some((ws.root_clone(), format!("workspace://{suffix}")));
+            }
+        }
+    }
+    let default = registry.default()?;
+    Some((default.root_clone(), uri.to_string()))
 }
 
 /// Canonicalises a JSON-RPC request id (string, number, or null) into a stable

@@ -8,7 +8,41 @@ pub fn tools_list_result() -> &'static Value {
     TOOLS_JSON.get_or_init(|| json!({ "tools": build_tools() }))
 }
 
+/// Names of tools whose semantics are workspace-scoped (i.e. they accept an
+/// optional `workspace_id` to target a non-default registered workspace).
+/// Workspace-management tools (`set_workspace`/`add_workspace`/etc.) operate
+/// on the registry itself and are intentionally excluded.
+const WORKSPACE_MANAGEMENT_TOOLS: &[&str] = &[
+    "rust_analyzer_set_workspace",
+    "rust_analyzer_add_workspace",
+    "rust_analyzer_remove_workspace",
+    "rust_analyzer_list_workspaces",
+];
+
 fn build_tools() -> Vec<ToolDefinition> {
+    let mut tools = build_tools_raw();
+    for tool in &mut tools {
+        if !WORKSPACE_MANAGEMENT_TOOLS.contains(&tool.name.as_str()) {
+            inject_workspace_id(&mut tool.input_schema);
+        }
+    }
+    tools
+}
+
+fn inject_workspace_id(schema: &mut Value) {
+    let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) else {
+        return;
+    };
+    props.insert(
+        "workspace_id".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional workspace id (from rust_analyzer_list_workspaces). Defaults to the first registered workspace."
+        }),
+    );
+}
+
+fn build_tools_raw() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "rust_analyzer_hover".to_string(),
@@ -297,6 +331,36 @@ fn build_tools() -> Vec<ToolDefinition> {
                     "character": { "type": "number", "description": "Character position (0-based)" }
                 },
                 "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_add_workspace".to_string(),
+            description: "Register an additional rust-analyzer workspace. Each workspace runs its own rust-analyzer subprocess and is addressed by an opaque `workspace_id`. The first registered workspace stays the default — every tool call without a `workspace_id` resolves there. Returns `{ workspace_id, root }`.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute or relative path to the new workspace root" }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_remove_workspace".to_string(),
+            description: "Unregister a workspace and shut down its rust-analyzer subprocess. The default workspace can be removed; subsequent tool calls without an explicit `workspace_id` will fail with 'No default workspace registered' until a new one is added.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": { "type": "string", "description": "Id returned by rust_analyzer_add_workspace or rust_analyzer_list_workspaces" }
+                },
+                "required": ["workspace_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_list_workspaces".to_string(),
+            description: "List every registered workspace with its id, root path, and whether it is the default. Output: { workspaces: [{ workspace_id, root, default }] }.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
             }),
         },
     ]

@@ -15,6 +15,7 @@ use super::{
         truncate_completion, truncate_hover, COMPLETION_DEFAULT_LIMIT, HOVER_MAX_BYTES,
         WORKSPACE_DIAGNOSTICS_DEFAULT_LIMIT, WORKSPACE_SYMBOL_DEFAULT_LIMIT,
     },
+    workspace::WorkspaceEntry,
 };
 
 /// Helper struct for extracting common tool parameters.
@@ -75,7 +76,8 @@ fn wrap(value: Value) -> Result<ToolResult> {
     })
 }
 
-/// Common path: extract file_path, ensure the document is open, then run the LSP call.
+/// Common path: resolve workspace from args, extract file_path, ensure the
+/// document is open, then run the LSP call.
 async fn with_doc<F, Fut>(
     server: &Arc<RustAnalyzerMCPServer>,
     args: &Value,
@@ -85,9 +87,10 @@ where
     F: FnOnce(Arc<RustAnalyzerClient>, String) -> Fut,
     Fut: std::future::Future<Output = Result<Value>>,
 {
+    let ws = server.resolve_workspace(args).await?;
     let file_path = ToolParams::extract_file_path(args)?;
-    let uri = server.open_document_if_needed(&file_path).await?;
-    let client = server.current_client().await?;
+    let uri = ws.open_document_if_needed(&file_path).await?;
+    let client = ws.current_client().await?;
     let value = f(client, uri).await?;
     wrap(value)
 }
@@ -97,15 +100,14 @@ pub async fn handle_tool_call(
     tool_name: &str,
     args: Value,
 ) -> Result<ToolResult> {
-    server.ensure_client_started().await?;
-
     match tool_name {
         "rust_analyzer_hover" => {
             let (line, ch) = ToolParams::extract_position(&args)?;
             let verbose = ToolParams::extract_verbose(&args);
             let file_path = ToolParams::extract_file_path(&args)?;
-            let uri = server.open_document_if_needed(&file_path).await?;
-            let client = server.current_client().await?;
+            let ws = server.resolve_workspace(&args).await?;
+            let uri = ws.open_document_if_needed(&file_path).await?;
+            let client = ws.current_client().await?;
             let value = client.hover(&uri, line, ch).await?;
             wrap(truncate_hover(value, HOVER_MAX_BYTES, verbose))
         }
@@ -132,8 +134,9 @@ pub async fn handle_tool_call(
                 COMPLETION_DEFAULT_LIMIT,
             );
             let file_path = ToolParams::extract_file_path(&args)?;
-            let uri = server.open_document_if_needed(&file_path).await?;
-            let client = server.current_client().await?;
+            let ws = server.resolve_workspace(&args).await?;
+            let uri = ws.open_document_if_needed(&file_path).await?;
+            let client = ws.current_client().await?;
             let value = client.completion(&uri, line, ch).await?;
             wrap(truncate_completion(value, limit, verbose))
         }
@@ -241,6 +244,9 @@ pub async fn handle_tool_call(
             })
             .await
         }
+        "rust_analyzer_add_workspace" => handle_add_workspace(server, args).await,
+        "rust_analyzer_remove_workspace" => handle_remove_workspace(server, args).await,
+        "rust_analyzer_list_workspaces" => handle_list_workspaces(server, args).await,
         _ => Err(anyhow!("Unknown tool: {}", tool_name)),
     }
 }
@@ -259,7 +265,8 @@ async fn handle_workspace_symbol(
         verbose,
         WORKSPACE_SYMBOL_DEFAULT_LIMIT,
     );
-    let client = server.current_client().await?;
+    let ws = server.resolve_workspace(&args).await?;
+    let client = ws.ensure_client_started().await?;
     let value = client.workspace_symbol(query).await?;
     wrap(paginate_workspace_symbol(value, cursor, limit, verbose))
 }
@@ -276,10 +283,11 @@ async fn handle_set_workspace(
         .set_workspace_root(std::path::PathBuf::from(workspace_path))
         .await?;
 
-    // Start the new client automatically.
-    server.ensure_client_started().await?;
+    // Start the new default client automatically.
+    let ws = server.default_workspace().await?;
+    ws.ensure_client_started().await?;
 
-    let new_root = server.workspace_root_clone().await;
+    let new_root = ws.root_clone();
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -294,8 +302,9 @@ async fn handle_diagnostics(
     args: Value,
 ) -> Result<ToolResult> {
     let file_path = ToolParams::extract_file_path(&args)?;
-    let uri = server.open_document_if_needed(&file_path).await?;
-    let client = server.current_client().await?;
+    let ws = server.resolve_workspace(&args).await?;
+    let uri = ws.open_document_if_needed(&file_path).await?;
+    let client = ws.current_client().await?;
 
     // Poll briefly for diagnostics — rust-analyzer needs time to run cargo check after didSave.
     // Stop early as soon as we see any diagnostics; otherwise return whatever's available
@@ -333,13 +342,67 @@ async fn handle_workspace_diagnostics(
         verbose,
         WORKSPACE_DIAGNOSTICS_DEFAULT_LIMIT,
     );
-    let client = server.current_client().await?;
+    let ws = server.resolve_workspace(&args).await?;
+    let client = ws.ensure_client_started().await?;
     let result = client.workspace_diagnostics().await?;
-    let workspace_root = server.workspace_root_clone().await;
+    let workspace_root = ws.root_clone();
     let formatted = format_workspace_diagnostics(&workspace_root, &result);
     wrap(paginate_workspace_diagnostics(
         formatted, cursor, limit, verbose,
     ))
+}
+
+async fn handle_add_workspace(
+    server: &Arc<RustAnalyzerMCPServer>,
+    args: Value,
+) -> Result<ToolResult> {
+    let Some(path) = args["path"].as_str() else {
+        return Err(anyhow!("Missing path"));
+    };
+
+    let ws = server.add_workspace(std::path::PathBuf::from(path)).await;
+    // Start the client eagerly so the next tool call doesn't pay the boot cost.
+    ws.ensure_client_started().await?;
+
+    wrap(json!({
+        "workspace_id": ws.id(),
+        "root": ws.root_clone().display().to_string(),
+    }))
+}
+
+async fn handle_remove_workspace(
+    server: &Arc<RustAnalyzerMCPServer>,
+    args: Value,
+) -> Result<ToolResult> {
+    let Some(id) = args["workspace_id"].as_str() else {
+        return Err(anyhow!("Missing workspace_id"));
+    };
+    let removed = server.remove_workspace(id).await;
+    if !removed {
+        return Err(anyhow!("Unknown workspace_id: {}", id));
+    }
+    wrap(json!({ "removed": id }))
+}
+
+async fn handle_list_workspaces(
+    server: &Arc<RustAnalyzerMCPServer>,
+    _args: Value,
+) -> Result<ToolResult> {
+    let entries = server.list_workspaces().await;
+    let default_id = entries.first().map(|e| e.id().to_string());
+    let list: Vec<Value> = entries
+        .iter()
+        .map(|e| describe_workspace(e, default_id.as_deref()))
+        .collect();
+    wrap(json!({ "workspaces": list }))
+}
+
+fn describe_workspace(ws: &Arc<WorkspaceEntry>, default_id: Option<&str>) -> Value {
+    json!({
+        "workspace_id": ws.id(),
+        "root": ws.root_clone().display().to_string(),
+        "default": default_id == Some(ws.id()),
+    })
 }
 
 fn format_workspace_diagnostics(workspace_root: &Path, result: &Value) -> Value {

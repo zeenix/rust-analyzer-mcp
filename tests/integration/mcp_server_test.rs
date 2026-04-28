@@ -531,6 +531,195 @@ async fn test_phase3_resources() -> Result<()> {
     Ok(())
 }
 
+/// Phase 3.2 — Multi-Workspace: register a second isolated workspace, run a
+/// tool against it via `workspace_id`, and verify list/remove. The shared
+/// daemon's default workspace must remain untouched so subsequent tests still
+/// find their files.
+#[tokio::test]
+async fn test_phase3_multi_workspace() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    // Snapshot defaults so we can sanity-check non-interference at the end.
+    let list_before = client
+        .call_tool("rust_analyzer_list_workspaces", json!({}))
+        .await?;
+    let before_text = extract_tool_text(&list_before)?;
+    let before: Value = serde_json::from_str(&before_text)?;
+    let before_count = before["workspaces"].as_array().unwrap().len();
+    let default_id_before = before["workspaces"][0]["workspace_id"]
+        .as_str()
+        .expect("default has id")
+        .to_string();
+    assert_eq!(before["workspaces"][0]["default"], true);
+
+    // Add a second isolated workspace.
+    let second = test_support::IsolatedProject::new()?;
+    let add_resp = client
+        .call_tool(
+            "rust_analyzer_add_workspace",
+            json!({ "path": second.path().to_str().unwrap() }),
+        )
+        .await?;
+    let add_text = extract_tool_text(&add_resp)?;
+    let added: Value = serde_json::from_str(&add_text)?;
+    let new_id = added["workspace_id"]
+        .as_str()
+        .expect("added id")
+        .to_string();
+    assert!(
+        new_id.starts_with("ws-") && new_id != default_id_before,
+        "new id should differ from default: {new_id} vs {default_id_before}"
+    );
+
+    // List now contains both, default unchanged.
+    let list_resp = client
+        .call_tool("rust_analyzer_list_workspaces", json!({}))
+        .await?;
+    let list: Value = serde_json::from_str(&extract_tool_text(&list_resp)?)?;
+    let entries = list["workspaces"].as_array().unwrap();
+    assert_eq!(entries.len(), before_count + 1);
+    assert_eq!(entries[0]["workspace_id"], default_id_before);
+    assert_eq!(entries[0]["default"], true);
+    assert!(entries.iter().any(|e| e["workspace_id"] == new_id));
+
+    // Run a tool targeted at the new workspace. workspace_symbol with empty
+    // query is null-tolerant; we just need the call to route to the right
+    // backend without erroring.
+    let ws_sym = client
+        .call_tool(
+            "rust_analyzer_workspace_symbol",
+            json!({ "query": "main", "workspace_id": new_id }),
+        )
+        .await?;
+    let _ = extract_tool_text(&ws_sym)?;
+
+    // Unknown workspace_id surfaces as a tool error, not a panic.
+    let bogus = client
+        .call_tool(
+            "rust_analyzer_workspace_symbol",
+            json!({ "query": "x", "workspace_id": "ws-does-not-exist" }),
+        )
+        .await;
+    assert!(
+        bogus.is_err(),
+        "unknown workspace_id should error, got {bogus:?}"
+    );
+
+    // Remove the second workspace; default stays.
+    let remove_resp = client
+        .call_tool(
+            "rust_analyzer_remove_workspace",
+            json!({ "workspace_id": new_id }),
+        )
+        .await?;
+    let removed_text = extract_tool_text(&remove_resp)?;
+    let removed: Value = serde_json::from_str(&removed_text)?;
+    assert_eq!(removed["removed"], new_id);
+
+    let list_after = client
+        .call_tool("rust_analyzer_list_workspaces", json!({}))
+        .await?;
+    let after: Value = serde_json::from_str(&extract_tool_text(&list_after)?)?;
+    assert_eq!(after["workspaces"].as_array().unwrap().len(), before_count);
+    assert_eq!(after["workspaces"][0]["workspace_id"], default_id_before);
+    assert_eq!(after["workspaces"][0]["default"], true);
+
+    // Removing again must error cleanly.
+    let twice = client
+        .call_tool(
+            "rust_analyzer_remove_workspace",
+            json!({ "workspace_id": new_id }),
+        )
+        .await;
+    assert!(
+        twice.is_err(),
+        "removing an unknown workspace should error, got {twice:?}"
+    );
+
+    Ok(())
+}
+
+/// Phase 3.2 — Multi-workspace MCP resources: prefixed URIs route to the
+/// right workspace, default keeps unprefixed aliases for backward compat.
+#[tokio::test]
+async fn test_phase3_multi_workspace_resources() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    // Add a second isolated workspace so we can verify per-id routing.
+    let second = test_support::IsolatedProject::new()?;
+    let add_resp = client
+        .call_tool(
+            "rust_analyzer_add_workspace",
+            json!({ "path": second.path().to_str().unwrap() }),
+        )
+        .await?;
+    let added: Value = serde_json::from_str(&extract_tool_text(&add_resp)?)?;
+    let new_id = added["workspace_id"].as_str().unwrap().to_string();
+
+    // resources/list now includes BOTH prefixed and unprefixed (default-alias)
+    // URIs. The prefixed URI for the second workspace must appear.
+    let list = client.send_request("resources/list", None).await?;
+    let resources = list["resources"].as_array().expect("resources array");
+    let uris: Vec<&str> = resources.iter().filter_map(|r| r["uri"].as_str()).collect();
+    let expected_prefixed = format!("workspace://{new_id}/files");
+    assert!(
+        uris.contains(&expected_prefixed.as_str()),
+        "expected {expected_prefixed} in {uris:?}"
+    );
+    // Backward-compat alias for the default workspace must still be there.
+    assert!(
+        uris.contains(&"workspace://files"),
+        "expected unprefixed default alias, got {uris:?}"
+    );
+
+    // Reading the prefixed URI returns the second workspace's tree, and the
+    // response URI round-trips the caller's input verbatim.
+    let read_resp = client
+        .send_request("resources/read", Some(json!({ "uri": expected_prefixed })))
+        .await?;
+    let contents = read_resp["contents"].as_array().expect("contents");
+    assert_eq!(contents[0]["uri"], expected_prefixed);
+    let tree: Value = serde_json::from_str(contents[0]["text"].as_str().unwrap())?;
+    let tree_root = tree["root"].as_str().unwrap();
+    // The second workspace's tree root must point at the IsolatedProject path,
+    // not at the test-project default.
+    let expected_root = second.path().canonicalize()?;
+    assert!(
+        tree_root.contains(&expected_root.display().to_string())
+            || expected_root.display().to_string().contains(tree_root),
+        "tree root {tree_root} should match second workspace {}",
+        expected_root.display()
+    );
+
+    // Unknown workspace id in URI falls back to the default workspace (legacy
+    // behavior — `workspace://crate/...` must keep working). We assert this by
+    // reading `workspace://files` after the new workspace exists: it should
+    // still return the default's tree.
+    let default_read = client
+        .send_request(
+            "resources/read",
+            Some(json!({ "uri": "workspace://files" })),
+        )
+        .await?;
+    let default_tree: Value =
+        serde_json::from_str(default_read["contents"][0]["text"].as_str().unwrap())?;
+    let default_tree_root = default_tree["root"].as_str().unwrap();
+    assert!(
+        !default_tree_root.contains(&expected_root.display().to_string()),
+        "unprefixed URI must not route to second workspace"
+    );
+
+    // Cleanup so other tests aren't perturbed.
+    client
+        .call_tool(
+            "rust_analyzer_remove_workspace",
+            json!({ "workspace_id": new_id }),
+        )
+        .await?;
+
+    Ok(())
+}
+
 fn extract_tool_text(response: &Value) -> Result<String> {
     let content = response
         .get("content")
