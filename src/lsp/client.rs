@@ -29,7 +29,7 @@ use crate::{
 /// Shared state for an LSP client. All methods take `&self` so the client can be wrapped in
 /// `Arc<RustAnalyzerClient>` and reused concurrently across spawned MCP request handlers.
 pub struct RustAnalyzerClient {
-    pub(super) process: Mutex<Option<Child>>,
+    pub(super) process: Arc<Mutex<Option<Child>>>,
     pub(super) request_id: AtomicU64,
     pub(super) workspace_root: PathBuf,
     pub(super) stdin: SharedStdin,
@@ -38,6 +38,9 @@ pub struct RustAnalyzerClient {
     pub(super) open_documents: Mutex<HashSet<String>>,
     pub(super) diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     pub(super) progress: ProgressMap,
+    /// Set by the monitor task when rust-analyzer's process has exited. The MCP
+    /// server polls this to decide whether to restart the client.
+    pub(super) process_died: Arc<AtomicBool>,
 }
 
 impl RustAnalyzerClient {
@@ -54,7 +57,7 @@ impl RustAnalyzerClient {
         });
 
         Self {
-            process: Mutex::new(None),
+            process: Arc::new(Mutex::new(None)),
             request_id: AtomicU64::new(1),
             workspace_root,
             stdin: Arc::new(Mutex::new(None)),
@@ -63,11 +66,18 @@ impl RustAnalyzerClient {
             open_documents: Mutex::new(HashSet::new()),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             progress: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            process_died: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn workspace_root(&self) -> &std::path::Path {
         &self.workspace_root
+    }
+
+    /// Returns `true` once the monitor has detected that rust-analyzer's
+    /// process exited. The MCP server uses this to decide when to restart.
+    pub fn is_dead(&self) -> bool {
+        self.process_died.load(Ordering::Acquire)
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -131,6 +141,14 @@ impl RustAnalyzerClient {
         );
 
         *self.process.lock().await = Some(child);
+
+        // Spawn monitor task — flips `process_died` and drains pending requests
+        // when rust-analyzer exits unexpectedly.
+        super::connection::spawn_process_monitor(
+            Arc::clone(&self.process),
+            Arc::clone(&self.process_died),
+            Arc::clone(&self.pending_requests),
+        );
 
         // Initialize LSP.
         self.initialize().await?;

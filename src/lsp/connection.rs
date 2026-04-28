@@ -1,13 +1,22 @@
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-    process::ChildStdin,
+    process::{Child, ChildStdin},
     sync::{oneshot, watch, Mutex},
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{lsp::error::LspError, protocol::lsp::LSPResponse};
+use crate::{
+    config::PROCESS_MONITOR_INTERVAL_MILLIS, lsp::error::LspError, protocol::lsp::LSPResponse,
+};
 
 pub type ResponseSender = oneshot::Sender<Result<Value, LspError>>;
 pub type PendingRequests = Arc<parking_lot::Mutex<HashMap<u64, PendingEntry>>>;
@@ -260,6 +269,58 @@ fn handle_progress(json_value: &Value, progress: &ProgressMap) {
             info!("Progress {} ended", token);
         }
         _ => {}
+    }
+}
+
+/// Watches the rust-analyzer subprocess. When the process exits — for any
+/// reason other than an explicit shutdown that already removed it from the
+/// mutex — flips `process_died`, clears the `Child` slot, and fails every
+/// pending request with `LspError::ProcessDied` so callers don't hang on a
+/// dead transport.
+pub fn spawn_process_monitor(
+    process: Arc<Mutex<Option<Child>>>,
+    process_died: Arc<AtomicBool>,
+    pending: PendingRequests,
+) {
+    tokio::spawn(async move {
+        let interval = Duration::from_millis(PROCESS_MONITOR_INTERVAL_MILLIS);
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let mut guard = process.lock().await;
+            let Some(child) = guard.as_mut() else {
+                // Either never started or shutdown() took it. Either way, our
+                // job is done.
+                return;
+            };
+
+            match child.try_wait() {
+                Ok(None) => {} // still running
+                Ok(Some(status)) => {
+                    warn!("rust-analyzer process exited: {:?}", status);
+                    *guard = None;
+                    drop(guard);
+                    process_died.store(true, Ordering::Release);
+                    drain_pending_with_process_died(&pending);
+                    return;
+                }
+                Err(e) => {
+                    warn!("Error polling rust-analyzer status: {}", e);
+                    *guard = None;
+                    drop(guard);
+                    process_died.store(true, Ordering::Release);
+                    drain_pending_with_process_died(&pending);
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn drain_pending_with_process_died(pending: &PendingRequests) {
+    let drained: Vec<_> = pending.lock().drain().collect();
+    for (_id, entry) in drained {
+        let _ = entry.sender.send(Err(LspError::ProcessDied));
     }
 }
 

@@ -1,13 +1,19 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde_json::json;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     sync::{Mutex, RwLock},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
+    config::{MAX_RESTART_COUNT, RESTART_WINDOW_SECS},
     lsp::RustAnalyzerClient,
     protocol::mcp::{MCPError, MCPRequest, MCPResponse},
 };
@@ -15,6 +21,9 @@ use crate::{
 pub struct RustAnalyzerMCPServer {
     pub(super) client: RwLock<Option<Arc<RustAnalyzerClient>>>,
     pub(super) workspace_root: RwLock<PathBuf>,
+    /// Timestamps of recent automatic restarts, oldest first. Used to back off
+    /// when rust-analyzer keeps crashing (see `MAX_RESTART_COUNT`).
+    restart_history: parking_lot::Mutex<VecDeque<Instant>>,
 }
 
 impl Default for RustAnalyzerMCPServer {
@@ -30,6 +39,7 @@ impl RustAnalyzerMCPServer {
             workspace_root: RwLock::new(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             ),
+            restart_history: parking_lot::Mutex::new(VecDeque::new()),
         }
     }
 
@@ -47,24 +57,73 @@ impl RustAnalyzerMCPServer {
         Self {
             client: RwLock::new(None),
             workspace_root: RwLock::new(workspace_root),
+            restart_history: parking_lot::Mutex::new(VecDeque::new()),
         }
     }
 
+    /// Returns a healthy `RustAnalyzerClient`, starting it if missing or
+    /// restarting it if the previous one's process has exited. Restarts are
+    /// rate-limited via `restart_history` to avoid hot-loops on a process that
+    /// keeps crashing.
     pub(super) async fn ensure_client_started(&self) -> Result<Arc<RustAnalyzerClient>> {
+        // Fast path: existing healthy client.
         if let Some(c) = self.client.read().await.as_ref() {
-            return Ok(Arc::clone(c));
+            if !c.is_dead() {
+                return Ok(Arc::clone(c));
+            }
         }
 
-        // Upgrade: nobody has a client; start one and store it.
+        // Slow path: take write lock and (re)start.
         let mut guard = self.client.write().await;
+
+        // Re-check under write lock.
         if let Some(c) = guard.as_ref() {
-            return Ok(Arc::clone(c));
+            if !c.is_dead() {
+                return Ok(Arc::clone(c));
+            }
         }
+
+        // If we're replacing a dead client, that counts as a restart.
+        if guard.as_ref().is_some_and(|c| c.is_dead()) {
+            self.record_restart()?;
+            warn!("rust-analyzer process died; restarting");
+            if let Some(old) = guard.take() {
+                // Best-effort cleanup in the background — the process is gone,
+                // but stdin/document state still needs to be dropped.
+                tokio::spawn(async move {
+                    let _ = old.shutdown().await;
+                });
+            }
+        }
+
         let workspace_root = self.workspace_root.read().await.clone();
         let client = Arc::new(RustAnalyzerClient::new(workspace_root));
         client.start().await?;
         *guard = Some(Arc::clone(&client));
         Ok(client)
+    }
+
+    /// Records a restart attempt; errors out if too many crashes happened
+    /// within the rolling window. Synchronous (parking_lot) lock — held only
+    /// long enough to push/pop a small VecDeque.
+    fn record_restart(&self) -> Result<()> {
+        let mut hist = self.restart_history.lock();
+        let now = Instant::now();
+        let cutoff = now
+            .checked_sub(Duration::from_secs(RESTART_WINDOW_SECS))
+            .unwrap_or(now);
+        while hist.front().is_some_and(|t| *t < cutoff) {
+            hist.pop_front();
+        }
+        if hist.len() >= MAX_RESTART_COUNT {
+            return Err(anyhow!(
+                "rust-analyzer crashed {} times in the last {}s; refusing to restart again",
+                hist.len(),
+                RESTART_WINDOW_SECS
+            ));
+        }
+        hist.push_back(now);
+        Ok(())
     }
 
     pub(super) async fn set_workspace_root(&self, workspace_root: PathBuf) -> Result<()> {
