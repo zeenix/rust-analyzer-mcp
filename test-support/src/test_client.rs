@@ -237,6 +237,49 @@ impl MCPTestClient {
         Ok(())
     }
 
+    /// PID of the spawned `rust-analyzer-mcp` process. Returns `None` if the
+    /// process has been shut down.
+    pub async fn server_pid(&self) -> Option<u32> {
+        self.process.lock().await.as_ref().and_then(|p| p.id())
+    }
+
+    /// Send a JSON-RPC notification (no `id`, no response expected). Used for
+    /// MCP-side notifications like `notifications/cancelled`.
+    pub async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<()> {
+        let mut request = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+        });
+        if let Some(params) = params {
+            request["params"] = params;
+        }
+        let request_str = serde_json::to_string(&request)?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(request_str.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Send a tools/call request without consuming the response. Returns the
+    /// id used so the caller can match it later. Useful for cancellation
+    /// tests where we want to fire-and-not-wait.
+    pub async fn send_tool_call_raw(&self, name: &str, arguments: Value) -> Result<u64> {
+        let id = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        let request_str = serde_json::to_string(&request)?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(request_str.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        Ok(id)
+    }
+
     /// Send a request and wait for response with timeout
     pub async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value> {
         self.send_request_with_timeout(method, params, timeouts::request())
