@@ -18,7 +18,7 @@ use tokio::{
 use tracing::info;
 
 use crate::{
-    config::{DOCUMENT_OPEN_DELAY_MILLIS, LSP_REQUEST_TIMEOUT_SECS},
+    config::{INDEXING_WAIT_TIMEOUT_SECS, LSP_REQUEST_TIMEOUT_SECS},
     lsp::{
         connection::{PendingEntry, PendingRequests, ProgressMap, SharedStdin},
         error::LspError,
@@ -398,8 +398,17 @@ impl RustAnalyzerClient {
         self.send_notification("textDocument/didSave", Some(save_params))
             .await?;
 
-        // Give rust-analyzer time to process the document and run cargo check.
-        tokio::time::sleep(Duration::from_millis(DOCUMENT_OPEN_DELAY_MILLIS)).await;
+        // Wait until rust-analyzer has finished priming its symbol cache. This is
+        // the modern equivalent of the old "Indexing" token — once `cachePriming`
+        // ends, hover/definition/references see resolved symbols. Best-effort:
+        // on timeout we fall through, individual tool handlers already cope with
+        // null responses during indexing.
+        let _ = self
+            .wait_for_progress_end(
+                "rustAnalyzer/cachePriming",
+                Duration::from_secs(INDEXING_WAIT_TIMEOUT_SECS),
+            )
+            .await;
 
         Ok(())
     }
