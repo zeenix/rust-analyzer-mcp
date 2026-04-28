@@ -421,14 +421,26 @@ impl MCPTestClient {
             return false;
         };
 
-        // Check if we got null or empty response
-        if text_str == "null" || text_str == "[]" {
+        // Null = not ready yet.
+        if text_str == "null" {
             return false;
         }
 
-        // Try to parse symbols
-        let Ok(symbols) = serde_json::from_str::<Vec<Value>>(text_str) else {
+        // The symbols tool returns either the new wrapper
+        // `{ symbols, total_top_level, verbose }` or, in legacy mode (older
+        // server binary), a flat array. Accept both so this readiness probe
+        // works against any in-tree daemon.
+        let Ok(parsed) = serde_json::from_str::<Value>(text_str) else {
             return false;
+        };
+        let symbols = match &parsed {
+            Value::Array(items) => items.as_slice(),
+            Value::Object(_) => parsed
+                .get("symbols")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            _ => &[],
         };
 
         !symbols.is_empty()
