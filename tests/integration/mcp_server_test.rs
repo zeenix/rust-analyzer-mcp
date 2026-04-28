@@ -101,6 +101,7 @@ async fn test_all_lsp_tools() -> Result<()> {
 #[tokio::test]
 async fn test_workspace_change() -> Result<()> {
     let mut client = IpcClient::get_or_create("test-project").await?;
+    let original_workspace = client.workspace_path().to_path_buf();
 
     // Create a second isolated project to switch to
     let second_project = test_support::IsolatedProject::new()?;
@@ -124,6 +125,17 @@ async fn test_workspace_change() -> Result<()> {
         }
     }
 
+    // Restore the shared daemon's workspace so other tests on this IpcClient still find their
+    // files.
+    client
+        .call_tool(
+            "rust_analyzer_set_workspace",
+            json!({
+                "workspace_path": original_workspace.to_str().unwrap()
+            }),
+        )
+        .await?;
+
     Ok(())
 }
 
@@ -146,7 +158,7 @@ async fn test_new_lsp_tools() -> Result<()> {
         serde_json::from_str::<Value>(&text)?;
     }
 
-    // 2. prepare_rename — at the `greet` definition (line 13, char 3).
+    // 2. prepare_rename — accept either a renamable target or null (no symbol at position).
     let response = client
         .call_tool(
             "rust_analyzer_prepare_rename",
