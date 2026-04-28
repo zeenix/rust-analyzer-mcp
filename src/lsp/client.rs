@@ -16,16 +16,23 @@ use tokio::{
     process::{Child, Command},
     sync::{oneshot, Mutex},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     config::{INDEXING_WAIT_TIMEOUT_SECS, LSP_REQUEST_TIMEOUT_SECS},
     lsp::{
-        connection::{PendingEntry, PendingRequests, ProgressMap, SharedStdin},
+        connection::{PendingEntry, PendingRequests, PendingTracker, ProgressMap, SharedStdin},
         error::LspError,
     },
     protocol::lsp::LSPRequest,
 };
+
+tokio::task_local! {
+    /// MCP request id (canonical key form) of the request handler that owns
+    /// the current task. `send_request` reads this so each LSP call can be
+    /// indexed back to the originating MCP call for cancellation.
+    pub(crate) static CURRENT_MCP_REQUEST_ID: String;
+}
 
 /// Tracks state of a document opened in rust-analyzer so we can avoid
 /// redundant disk reads and emit `didChange` only when content actually
@@ -74,7 +81,7 @@ impl RustAnalyzerClient {
             request_id: AtomicU64::new(1),
             workspace_root,
             stdin: Arc::new(Mutex::new(None)),
-            pending_requests: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            pending_requests: Arc::new(PendingTracker::default()),
             initialized: AtomicBool::new(false),
             open_documents: Mutex::new(HashMap::new()),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
@@ -234,12 +241,15 @@ impl RustAnalyzerClient {
         info!("Sending LSP request: {} with params: {:?}", method, params);
 
         // Register the pending request *before* writing, so a fast response can't race past us.
+        // Inherit the current MCP request id (if any) so cancel_mcp can find this LSP call later.
+        let mcp_request_id = CURRENT_MCP_REQUEST_ID.try_with(|s| s.clone()).ok();
         let (tx, rx) = oneshot::channel();
-        self.pending_requests.lock().insert(
+        self.pending_requests.insert(
             id,
             PendingEntry {
                 method: method.to_string(),
                 sender: tx,
+                mcp_request_id,
             },
         );
 
@@ -247,15 +257,15 @@ impl RustAnalyzerClient {
         {
             let mut stdin_lock = self.stdin.lock().await;
             let Some(stdin) = stdin_lock.as_mut() else {
-                self.pending_requests.lock().remove(&id);
+                self.pending_requests.take(id);
                 return Err(LspError::Transport("no stdin available".to_string()));
             };
             if let Err(e) = stdin.write_all(message.as_bytes()).await {
-                self.pending_requests.lock().remove(&id);
+                self.pending_requests.take(id);
                 return Err(LspError::Transport(format!("write: {}", e)));
             }
             if let Err(e) = stdin.flush().await {
-                self.pending_requests.lock().remove(&id);
+                self.pending_requests.take(id);
                 return Err(LspError::Transport(format!("flush: {}", e)));
             }
         }
@@ -265,8 +275,39 @@ impl RustAnalyzerClient {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(LspError::Cancelled),
             Err(_) => {
-                self.pending_requests.lock().remove(&id);
+                self.pending_requests.take(id);
                 Err(LspError::Timeout(method.to_string()))
+            }
+        }
+    }
+
+    /// Cancel every LSP request that was issued under the given MCP request id.
+    /// For each outstanding LSP call we (a) resolve its waiting sender with
+    /// `LspError::Cancelled` so the in-flight handler unblocks immediately, and
+    /// (b) send `$/cancelRequest` to rust-analyzer so it can stop the work
+    /// instead of computing a result we'll throw away. Any late response
+    /// rust-analyzer eventually delivers finds no entry in the tracker and is
+    /// silently dropped.
+    pub async fn cancel_mcp(&self, mcp_request_id: &str) {
+        let entries = self.pending_requests.take_for_mcp(mcp_request_id);
+        if entries.is_empty() {
+            return;
+        }
+
+        info!(
+            "Cancelling {} LSP requests for MCP request {}",
+            entries.len(),
+            mcp_request_id
+        );
+
+        for (lsp_id, entry) in entries {
+            let _ = entry.sender.send(Err(LspError::Cancelled));
+            let params = json!({ "id": lsp_id });
+            if let Err(e) = self
+                .send_notification("$/cancelRequest", Some(params))
+                .await
+            {
+                warn!("Failed to send $/cancelRequest for {}: {}", lsp_id, e);
             }
         }
     }

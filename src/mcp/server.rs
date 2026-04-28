@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::{MAX_RESTART_COUNT, RESTART_WINDOW_SECS},
-    lsp::RustAnalyzerClient,
+    lsp::{client::CURRENT_MCP_REQUEST_ID, RustAnalyzerClient},
     protocol::mcp::{MCPError, MCPRequest, MCPResponse},
 };
 
@@ -243,7 +243,11 @@ impl RustAnalyzerMCPServer {
                     // race against the spawn that would otherwise run the
                     // (already-cancelled) request.
                     if request.method == "notifications/cancelled" {
-                        self.handle_cancellation(request.params.as_ref());
+                        let server = Arc::clone(&self);
+                        let params = request.params.clone();
+                        tokio::spawn(async move {
+                            server.handle_cancellation(params.as_ref()).await;
+                        });
                         continue;
                     }
 
@@ -252,9 +256,14 @@ impl RustAnalyzerMCPServer {
                     let in_flight = Arc::clone(&self.in_flight);
                     let id_key = request.id.as_ref().map(canonical_id_key);
 
-                    let handle = tokio::spawn(async move {
-                        server.handle_one_request(request, stdout).await;
-                    });
+                    let handle = match id_key.clone() {
+                        Some(key) => tokio::spawn(CURRENT_MCP_REQUEST_ID.scope(key, async move {
+                            server.handle_one_request(request, stdout).await;
+                        })),
+                        None => tokio::spawn(async move {
+                            server.handle_one_request(request, stdout).await;
+                        }),
+                    };
 
                     if let Some(key) = id_key {
                         let abort = handle.abort_handle();
@@ -280,7 +289,7 @@ impl RustAnalyzerMCPServer {
         Ok(())
     }
 
-    fn handle_cancellation(&self, params: Option<&Value>) {
+    async fn handle_cancellation(self: Arc<Self>, params: Option<&Value>) {
         let Some(params) = params else {
             debug!("notifications/cancelled without params, ignoring");
             return;
@@ -290,6 +299,15 @@ impl RustAnalyzerMCPServer {
             return;
         };
         let key = canonical_id_key(request_id);
+
+        // Forward `$/cancelRequest` to rust-analyzer for any LSP calls this
+        // MCP request had in flight, so the upstream work actually stops
+        // instead of being abandoned. Do this before aborting the spawn so the
+        // tracker still has the LSP ids registered.
+        if let Some(client) = self.client.read().await.as_ref().map(Arc::clone) {
+            client.cancel_mcp(&key).await;
+        }
+
         let abort = self.in_flight.lock().remove(&key);
         match abort {
             Some(handle) => {

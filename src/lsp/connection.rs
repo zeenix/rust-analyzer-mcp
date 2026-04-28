@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -19,7 +19,6 @@ use crate::{
 };
 
 pub type ResponseSender = oneshot::Sender<Result<Value, LspError>>;
-pub type PendingRequests = Arc<parking_lot::Mutex<HashMap<u64, PendingEntry>>>;
 /// Per-token watch channels keyed by `$/progress` token. The bool payload is
 /// `true` when the work-done sequence has reported `end`. Stored as
 /// `watch::Sender` so late subscribers see the latest value (level-triggered).
@@ -29,7 +28,76 @@ pub type SharedStdin = Arc<Mutex<Option<BufWriter<ChildStdin>>>>;
 pub struct PendingEntry {
     pub method: String,
     pub sender: ResponseSender,
+    /// MCP request id (canonical key form) that originated this LSP call, when
+    /// available. Used so a `notifications/cancelled` for that MCP id can find
+    /// every LSP request it spawned and forward `$/cancelRequest` for each.
+    pub mcp_request_id: Option<String>,
 }
+
+/// Two-way index over LSP requests we've sent but haven't received a response
+/// for: by LSP id (the standard lookup) and by the originating MCP request id
+/// (so we can fan out `$/cancelRequest` on `notifications/cancelled`). Both
+/// maps live behind a single mutex so they can never disagree.
+#[derive(Default)]
+pub struct PendingTracker {
+    inner: parking_lot::Mutex<PendingTrackerInner>,
+}
+
+#[derive(Default)]
+struct PendingTrackerInner {
+    by_lsp_id: HashMap<u64, PendingEntry>,
+    by_mcp_id: HashMap<String, HashSet<u64>>,
+}
+
+impl PendingTracker {
+    pub fn insert(&self, lsp_id: u64, entry: PendingEntry) {
+        let mut inner = self.inner.lock();
+        if let Some(mcp_id) = entry.mcp_request_id.clone() {
+            inner.by_mcp_id.entry(mcp_id).or_default().insert(lsp_id);
+        }
+        inner.by_lsp_id.insert(lsp_id, entry);
+    }
+
+    pub fn take(&self, lsp_id: u64) -> Option<PendingEntry> {
+        let mut inner = self.inner.lock();
+        let entry = inner.by_lsp_id.remove(&lsp_id)?;
+        if let Some(mcp_id) = &entry.mcp_request_id {
+            let drop_outer = match inner.by_mcp_id.get_mut(mcp_id) {
+                Some(set) => {
+                    set.remove(&lsp_id);
+                    set.is_empty()
+                }
+                None => false,
+            };
+            if drop_outer {
+                inner.by_mcp_id.remove(mcp_id);
+            }
+        }
+        Some(entry)
+    }
+
+    /// Drains every pending entry. Used when rust-analyzer dies — every
+    /// outstanding sender needs to be released before callers time out.
+    pub fn drain(&self) -> Vec<(u64, PendingEntry)> {
+        let mut inner = self.inner.lock();
+        inner.by_mcp_id.clear();
+        inner.by_lsp_id.drain().collect()
+    }
+
+    /// Atomically remove every LSP request that belongs to the given MCP
+    /// request id. Returned in (lsp_id, entry) pairs so the caller can both
+    /// notify rust-analyzer (`$/cancelRequest`) and resolve the senders.
+    pub fn take_for_mcp(&self, mcp_id: &str) -> Vec<(u64, PendingEntry)> {
+        let mut inner = self.inner.lock();
+        let lsp_ids = inner.by_mcp_id.remove(mcp_id).unwrap_or_default();
+        lsp_ids
+            .into_iter()
+            .filter_map(|lsp_id| inner.by_lsp_id.remove(&lsp_id).map(|e| (lsp_id, e)))
+            .collect()
+    }
+}
+
+pub type PendingRequests = Arc<PendingTracker>;
 
 pub fn start_handlers(
     stdout: tokio::process::ChildStdout,
@@ -172,8 +240,13 @@ async fn handle_lsp_message(
         return;
     };
 
-    let entry = pending.lock().remove(&id);
-    let Some(PendingEntry { method, sender }) = entry else {
+    let entry = pending.take(id);
+    let Some(PendingEntry {
+        method,
+        sender,
+        mcp_request_id: _,
+    }) = entry
+    else {
         return;
     };
 
@@ -318,8 +391,7 @@ pub fn spawn_process_monitor(
 }
 
 fn drain_pending_with_process_died(pending: &PendingRequests) {
-    let drained: Vec<_> = pending.lock().drain().collect();
-    for (_id, entry) in drained {
+    for (_id, entry) in pending.drain() {
         let _ = entry.sender.send(Err(LspError::ProcessDied));
     }
 }
@@ -364,5 +436,88 @@ async fn handle_server_request(json_value: Value, stdin: &SharedStdin) {
     }
     if let Err(e) = writer.flush().await {
         warn!("Failed to flush server-request response: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(
+        method: &str,
+        mcp: Option<&str>,
+    ) -> (PendingEntry, oneshot::Receiver<Result<Value, LspError>>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            PendingEntry {
+                method: method.to_string(),
+                sender: tx,
+                mcp_request_id: mcp.map(str::to_string),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn take_for_mcp_evicts_every_lsp_id_for_that_mcp_only() {
+        let tracker = PendingTracker::default();
+
+        let (e1, _r1) = entry("textDocument/hover", Some("n:1"));
+        let (e2, _r2) = entry("textDocument/definition", Some("n:1"));
+        let (e3, _r3) = entry("textDocument/hover", Some("n:2"));
+        let (e4, _r4) = entry("workspace/symbol", None);
+
+        tracker.insert(10, e1);
+        tracker.insert(11, e2);
+        tracker.insert(12, e3);
+        tracker.insert(13, e4);
+
+        let cancelled = tracker.take_for_mcp("n:1");
+        let cancelled_ids: Vec<u64> = cancelled.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            cancelled.len(),
+            2,
+            "both LSP calls under n:1 must come back"
+        );
+        assert!(cancelled_ids.contains(&10));
+        assert!(cancelled_ids.contains(&11));
+
+        // Other MCP requests and unscoped calls survive.
+        assert!(tracker.take(12).is_some());
+        assert!(tracker.take(13).is_some());
+        assert!(tracker.take(10).is_none(), "n:1 entries already evicted");
+        assert!(tracker.take(11).is_none());
+
+        // Asking for n:1 again yields nothing.
+        assert!(tracker.take_for_mcp("n:1").is_empty());
+    }
+
+    #[test]
+    fn take_keeps_the_two_indexes_consistent() {
+        let tracker = PendingTracker::default();
+        let (e1, _r1) = entry("textDocument/hover", Some("n:7"));
+        let (e2, _r2) = entry("textDocument/references", Some("n:7"));
+        tracker.insert(20, e1);
+        tracker.insert(21, e2);
+
+        // Removing one LSP id by lsp_id must not strand the mcp -> lsp side.
+        assert!(tracker.take(20).is_some());
+        let leftover = tracker.take_for_mcp("n:7");
+        assert_eq!(leftover.len(), 1);
+        assert_eq!(leftover[0].0, 21);
+    }
+
+    #[test]
+    fn drain_clears_both_indexes() {
+        let tracker = PendingTracker::default();
+        let (e1, _r1) = entry("textDocument/hover", Some("n:1"));
+        let (e2, _r2) = entry("workspace/symbol", None);
+        tracker.insert(30, e1);
+        tracker.insert(31, e2);
+
+        let drained = tracker.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(tracker.take(30).is_none());
+        assert!(tracker.take_for_mcp("n:1").is_empty());
     }
 }
