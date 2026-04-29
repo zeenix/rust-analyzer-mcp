@@ -449,7 +449,7 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
         ),
         tool(
             "rust_analyzer_add_workspace",
-            "Register an additional rust-analyzer workspace. Each workspace runs its own rust-analyzer subprocess and is addressed by an opaque `workspace_id`. The first registered workspace stays the default — every tool call without a `workspace_id` resolves there. Returns `{ workspace_id, root }`.",
+            "Register an additional rust-analyzer workspace. Each workspace runs its own rust-analyzer subprocess and is addressed by an opaque `workspace_id`. The first registered workspace stays the default — every tool call without a `workspace_id` resolves there. Returns `{ workspace_id, root }`. Workspace roots are mirrored to disk (`$RUST_ANALYZER_MCP_STATE_DIR` / `$XDG_STATE_HOME/rust-analyzer-mcp` / `$HOME/.local/state/rust-analyzer-mcp/workspaces.json`) and replayed on the next server boot, *if* the MCP host's spawn command preserves those env vars; setting `RUST_ANALYZER_MCP_STATE_DIR=\"\"` (empty) disables persistence.",
             json!({
                 "type": "object",
                 "properties": {

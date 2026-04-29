@@ -90,6 +90,22 @@ Add an MCP server configuration to one of these locations:
 source, use the full path to the binary. You can also configure servers using Claude Code's CLI
 wizard too.
 
+### Workspace Persistence
+
+When `rust_analyzer_add_workspace` registers a new workspace, the root path is mirrored to
+`workspaces.json` so the next server boot replays it automatically. The state directory is
+chosen in this order:
+
+1. `$RUST_ANALYZER_MCP_STATE_DIR` if set (empty value disables persistence entirely).
+2. `$XDG_STATE_HOME/rust-analyzer-mcp/` if `XDG_STATE_HOME` is set.
+3. `$HOME/.local/state/rust-analyzer-mcp/` otherwise.
+
+If the MCP host (Claude Code, Claude Desktop, etc.) spawns the server with a sanitized
+environment that drops `HOME` / `XDG_STATE_HOME`, persistence silently no-ops — verify by
+running `add_workspace` once and checking that `workspaces.json` exists in the chosen
+directory. Set `RUST_ANALYZER_MCP_STATE_DIR` explicitly in the host config if your spawn
+environment doesn't preserve `HOME`.
+
 ### Claude Desktop Configuration
 
 Add this to your Claude Desktop configuration (`claude_desktop_config.json`):
