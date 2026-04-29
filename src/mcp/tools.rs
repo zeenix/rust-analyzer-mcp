@@ -93,12 +93,26 @@ fn file_path_prop() -> Value {
     json!({ "type": "string", "description": "Path to the Rust file" })
 }
 
+/// Suffix appended to every line/character description so position-tool callers
+/// see the 0-based-vs-1-based reminder at the schema level. The most common
+/// failure mode is copying line numbers from a `Read` output (1-based) directly
+/// into a position tool (0-based) without subtracting 1, which produces null
+/// or misleading results.
+const ZERO_BASED_HINT: &str =
+    " — 0-based per LSP. If copied from a `Read`-style 1-based output, subtract 1.";
+
 fn line_prop(desc: &str) -> Value {
-    json!({ "type": "number", "description": desc })
+    json!({
+        "type": "number",
+        "description": format!("{desc}{ZERO_BASED_HINT}")
+    })
 }
 
 fn char_prop(desc: &str) -> Value {
-    json!({ "type": "number", "description": desc })
+    json!({
+        "type": "number",
+        "description": format!("{desc}{ZERO_BASED_HINT}")
+    })
 }
 
 /// Schema with just a file_path (e.g. document_symbols, format).
@@ -116,8 +130,8 @@ fn position_schema() -> Value {
         "type": "object",
         "properties": {
             "file_path": file_path_prop(),
-            "line": line_prop("Line number (0-based)"),
-            "character": char_prop("Character position (0-based)")
+            "line": line_prop("Line number"),
+            "character": char_prop("Character position")
         },
         "required": ["file_path", "line", "character"]
     })
@@ -129,10 +143,10 @@ fn range_schema() -> Value {
         "type": "object",
         "properties": {
             "file_path": file_path_prop(),
-            "line": line_prop("Start line number (0-based)"),
-            "character": char_prop("Start character position (0-based)"),
-            "end_line": line_prop("End line number (0-based)"),
-            "end_character": char_prop("End character position (0-based)")
+            "line": line_prop("Start line number"),
+            "character": char_prop("Start character position"),
+            "end_line": line_prop("End line number"),
+            "end_character": char_prop("End character position")
         },
         "required": ["file_path", "line", "character", "end_line", "end_character"]
     })
@@ -155,8 +169,8 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "file_path": file_path_prop(),
-                    "line": line_prop("Line number (0-based)"),
-                    "character": char_prop("Character position (0-based)"),
+                    "line": line_prop("Line number"),
+                    "character": char_prop("Character position"),
                     "verbose": { "type": "boolean", "description": "If true, return the full hover content without truncation. Default: false." }
                 },
                 "required": ["file_path", "line", "character"]
@@ -179,8 +193,8 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "file_path": file_path_prop(),
-                    "line": line_prop("Line number (0-based)"),
-                    "character": char_prop("Character position (0-based)"),
+                    "line": line_prop("Line number"),
+                    "character": char_prop("Character position"),
                     "verbose": { "type": "boolean", "description": "If true, return all completion items without truncation. Default: false." },
                     "limit": { "type": "number", "description": "Maximum number of items to return. Default: 50, cap: 1000." }
                 },
@@ -244,8 +258,8 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "file_path": file_path_prop(),
-                    "line": line_prop("Line number (0-based)"),
-                    "character": char_prop("Character position (0-based)"),
+                    "line": line_prop("Line number"),
+                    "character": char_prop("Character position"),
                     "new_name": { "type": "string", "description": "The new symbol name" }
                 },
                 "required": ["file_path", "line", "character", "new_name"]
@@ -307,8 +321,8 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "file_path": file_path_prop(),
-                    "line": { "type": "number", "description": "Optional line number (0-based) to limit runnables to a specific position" },
-                    "character": { "type": "number", "description": "Optional character position (0-based)" }
+                    "line": line_prop("Optional line number to limit runnables to a specific position"),
+                    "character": char_prop("Optional character position")
                 },
                 "required": ["file_path"]
             }),
@@ -349,10 +363,10 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "file_path": file_path_prop(),
-                    "line": { "type": "number", "description": "Optional range-start line (0-based). Provide all four range coords or none." },
-                    "character": { "type": "number", "description": "Optional range-start character (0-based)." },
-                    "end_line": { "type": "number", "description": "Optional range-end line (0-based)." },
-                    "end_character": { "type": "number", "description": "Optional range-end character (0-based)." }
+                    "line": line_prop("Optional range-start line. Provide all four range coords or none."),
+                    "character": char_prop("Optional range-start character."),
+                    "end_line": line_prop("Optional range-end line."),
+                    "end_character": char_prop("Optional range-end character.")
                 },
                 "required": ["file_path"]
             }),
@@ -389,8 +403,8 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "file_path": file_path_prop(),
-                    "line": line_prop("Line number (0-based)"),
-                    "character": char_prop("Character position (0-based)"),
+                    "line": line_prop("Line number"),
+                    "character": char_prop("Character position"),
                     "direction": {
                         "type": "string",
                         "enum": ["supertypes", "subtypes", "both"],
