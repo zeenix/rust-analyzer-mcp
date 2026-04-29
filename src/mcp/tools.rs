@@ -203,12 +203,14 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
         ),
         tool(
             "rust_analyzer_symbols",
-            "Get document symbols (functions, structs, etc.) for a Rust file. By default returns only top-level symbols with `child_count` per item; nested members (struct fields, enum variants, methods inside impls) are collapsed to keep the response token cost predictable. Pass verbose=true to receive the full hierarchical tree (`children` arrays preserved). Output: { symbols, total_top_level, verbose }.",
+            "Get document symbols (functions, structs, etc.) for a Rust file. By default returns only top-level symbols with `child_count` per item; nested members (struct fields, enum variants, methods inside impls) are collapsed to keep the response token cost predictable. Pass verbose=true to receive the full hierarchical tree (`children` arrays preserved). The top-level list is paginated (default page size 100) — files with hundreds of top-level constants/items return successive pages via `cursor`. Output: { symbols, total_top_level, returned, verbose, next_cursor? }.",
             json!({
                 "type": "object",
                 "properties": {
                     "file_path": file_path_prop(),
-                    "verbose": { "type": "boolean", "description": "If true, return the full nested DocumentSymbol tree. Default: false (top-level only with child_count)." }
+                    "verbose": { "type": "boolean", "description": "If true, return the full nested DocumentSymbol tree for the page (children arrays preserved). Default: false (top-level only with child_count)." },
+                    "cursor": { "type": "string", "description": "Opaque pagination cursor returned by a previous call. Omit to start from the beginning." },
+                    "limit": { "type": "number", "description": "Top-level page size. Default: 100, cap: 1000." }
                 },
                 "required": ["file_path"]
             }),

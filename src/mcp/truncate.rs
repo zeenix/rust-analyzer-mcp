@@ -14,6 +14,7 @@ pub const HOVER_MAX_BYTES: usize = 5000;
 pub const COMPLETION_DEFAULT_LIMIT: usize = 50;
 pub const WORKSPACE_SYMBOL_DEFAULT_LIMIT: usize = 100;
 pub const WORKSPACE_DIAGNOSTICS_DEFAULT_LIMIT: usize = 50;
+pub const DOCUMENT_SYMBOLS_DEFAULT_LIMIT: usize = 100;
 
 /// Maximum value an LLM-supplied `limit` can take, regardless of `verbose`.
 /// Acts as a guardrail against accidental enormous responses.
@@ -180,13 +181,17 @@ fn completion_sort_key(item: &Value) -> String {
 }
 
 /// Shape a `textDocument/documentSymbol` response. rust-analyzer returns
-/// hierarchical `DocumentSymbol[]` and the nested `children` arrays explode
-/// into the response: a single struct with many typed fields (or an enum with
-/// many variants holding tuple types) can produce tens of kilobytes for one
-/// file. Default: keep top-level symbols only, replace each `children` array
-/// with a `child_count` integer. Verbose: pass the tree through unchanged.
-/// Wrapper: `{ symbols, total_top_level, verbose }`.
-pub fn shape_document_symbols(value: Value, verbose: bool) -> Value {
+/// hierarchical `DocumentSymbol[]` and even with collapsed `children` a file
+/// with hundreds of top-level constants/items (e.g. eza's `theme/mod.rs`,
+/// which serializes to ~70 KB) blows past the MCP host's token cap. Paginate
+/// over the top-level list and collapse children by default.
+///
+/// Default (`verbose=false`): keep top-level only, replace each `children`
+/// array with a `child_count` integer. `verbose=true`: pass the subtree of
+/// the page through unchanged. The page is defined by `cursor` (start index)
+/// and `limit` (page size). Output: `{ symbols, total_top_level, returned,
+/// verbose, next_cursor? }`.
+pub fn shape_document_symbols(value: Value, cursor: usize, limit: usize, verbose: bool) -> Value {
     if value.is_null() {
         return value;
     }
@@ -195,17 +200,25 @@ pub fn shape_document_symbols(value: Value, verbose: bool) -> Value {
     };
 
     let total_top_level = items.len();
-    let symbols: Vec<Value> = if verbose {
-        items
-    } else {
-        items.into_iter().map(strip_children).collect()
-    };
+    let start = cursor.min(total_top_level);
+    let end = start.saturating_add(limit).min(total_top_level);
+    let next_cursor = (end < total_top_level).then(|| end.to_string());
 
-    json!({
-        "symbols": symbols,
+    let mut page: Vec<Value> = items.into_iter().skip(start).take(end - start).collect();
+    if !verbose {
+        page = page.into_iter().map(strip_children).collect();
+    }
+
+    let mut out = json!({
+        "symbols": page,
         "total_top_level": total_top_level,
+        "returned": end - start,
         "verbose": verbose,
-    })
+    });
+    if let Some(c) = next_cursor {
+        out["next_cursor"] = json!(c);
+    }
+    out
 }
 
 /// Replace the `children` array on a single DocumentSymbol with a numeric
@@ -545,9 +558,11 @@ mod tests {
                 "children": []
             }
         ]);
-        let out = shape_document_symbols(raw, false);
+        let out = shape_document_symbols(raw, 0, 100, false);
         assert_eq!(out["total_top_level"], 2);
+        assert_eq!(out["returned"], 2);
         assert_eq!(out["verbose"], false);
+        assert!(out.get("next_cursor").is_none());
         let syms = out["symbols"].as_array().unwrap();
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[0]["name"], "UiStyles");
@@ -566,8 +581,9 @@ mod tests {
                 "children": [{ "name": "f", "kind": 8, "range": {}, "selectionRange": {} }]
             }
         ]);
-        let out = shape_document_symbols(raw, true);
+        let out = shape_document_symbols(raw, 0, 100, true);
         assert_eq!(out["total_top_level"], 1);
+        assert_eq!(out["returned"], 1);
         assert_eq!(out["verbose"], true);
         let s0 = &out["symbols"][0];
         assert!(s0.get("children").is_some());
@@ -577,7 +593,7 @@ mod tests {
 
     #[test]
     fn doc_symbols_null_passthrough() {
-        let out = shape_document_symbols(json!(null), false);
+        let out = shape_document_symbols(json!(null), 0, 100, false);
         assert!(out.is_null());
     }
 
@@ -587,8 +603,45 @@ mod tests {
         let raw = json!([
             { "name": "foo", "kind": 12, "location": { "uri": "file:///x.rs", "range": {} } }
         ]);
-        let out = shape_document_symbols(raw, false);
+        let out = shape_document_symbols(raw, 0, 100, false);
         assert_eq!(out["symbols"][0]["child_count"], 0);
+    }
+
+    #[test]
+    fn doc_symbols_paginates_top_level() {
+        let raw = json!((0..250)
+            .map(|i| json!({
+                "name": format!("item_{i}"),
+                "kind": 13,
+                "range": {}, "selectionRange": {},
+            }))
+            .collect::<Vec<_>>());
+        let page1 = shape_document_symbols(raw.clone(), 0, 100, false);
+        assert_eq!(page1["total_top_level"], 250);
+        assert_eq!(page1["returned"], 100);
+        assert_eq!(page1["next_cursor"], "100");
+        assert_eq!(page1["symbols"][0]["name"], "item_0");
+        assert_eq!(page1["symbols"][99]["name"], "item_99");
+
+        let cursor: usize = page1["next_cursor"].as_str().unwrap().parse().unwrap();
+        let page2 = shape_document_symbols(raw.clone(), cursor, 100, false);
+        assert_eq!(page2["returned"], 100);
+        assert_eq!(page2["next_cursor"], "200");
+        assert_eq!(page2["symbols"][0]["name"], "item_100");
+
+        let page3 = shape_document_symbols(raw, 200, 100, false);
+        assert_eq!(page3["returned"], 50);
+        assert!(page3.get("next_cursor").is_none());
+    }
+
+    #[test]
+    fn doc_symbols_cursor_past_end_returns_empty_page() {
+        let raw = json!([{"name": "only", "kind": 23, "range": {}, "selectionRange": {}}]);
+        let out = shape_document_symbols(raw, 99, 100, false);
+        assert_eq!(out["total_top_level"], 1);
+        assert_eq!(out["returned"], 0);
+        assert_eq!(out["symbols"].as_array().unwrap().len(), 0);
+        assert!(out.get("next_cursor").is_none());
     }
 
     #[test]
