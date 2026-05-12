@@ -258,11 +258,19 @@ impl RustAnalyzerMCPServer {
             }
         }
 
-        // Cleanup: shutdown every workspace's client.
+        // Cleanup: shutdown every workspace's client. Parallel + tight budget
+        // so we can complete inside the MCP client's ~100ms SIGINT window
+        // before it escalates to SIGTERM. `kill_on_drop` on the spawned
+        // rust-analyzer processes is the backstop if the deadline expires.
         info!("Shutting down");
         let entries = self.workspaces.read().await.list();
-        for entry in entries {
-            entry.shutdown_client().await;
+        let shutdown_all =
+            futures::future::join_all(entries.iter().map(|e| e.shutdown_client()));
+        if tokio::time::timeout(std::time::Duration::from_millis(80), shutdown_all)
+            .await
+            .is_err()
+        {
+            debug!("Workspace shutdown exceeded budget; relying on kill_on_drop");
         }
 
         Ok(())
