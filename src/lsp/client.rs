@@ -16,6 +16,7 @@ use tokio::{
 
 use crate::{
     config::{DOCUMENT_OPEN_DELAY_MILLIS, LSP_REQUEST_TIMEOUT_SECS},
+    paths::{absolute_path, directory_uri},
     protocol::lsp::LSPRequest,
 };
 
@@ -32,16 +33,7 @@ pub struct RustAnalyzerClient {
 
 impl RustAnalyzerClient {
     pub fn new(workspace_root: PathBuf) -> Self {
-        // Ensure the workspace root is absolute.
-        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-            if workspace_root.is_absolute() {
-                workspace_root.clone()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(&workspace_root)
-            }
-        });
+        let workspace_root = absolute_path(workspace_root);
 
         Self {
             process: None,
@@ -204,9 +196,10 @@ impl RustAnalyzerClient {
     }
 
     async fn initialize(&mut self) -> Result<()> {
+        let root_uri = directory_uri(&self.workspace_root)?;
         let init_params = json!({
             "processId": std::process::id(),
-            "rootUri": format!("file://{}", self.workspace_root.display()),
+            "rootUri": root_uri,
             "initializationOptions": {
                 "cargo": {
                     "buildScripts": {

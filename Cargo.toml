@@ -26,6 +26,7 @@ env_logger = "0.10"
 log = "0.4"
 futures = "0.3"
 which = "6.0"
+url = "2.5"
 
 [dev-dependencies]
 # Test support library
@@ -65,4 +66,3 @@ panic = "abort"
 [[bench]]
 name = "concurrent_requests"
 harness = false
-
