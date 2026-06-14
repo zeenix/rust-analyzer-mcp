@@ -48,6 +48,10 @@ pub async fn handle_tool_call(
     tool_name: &str,
     args: Value,
 ) -> Result<ToolResult> {
+    if tool_name == "rust_analyzer_set_workspace" {
+        return handle_set_workspace(server, args).await;
+    }
+
     server.ensure_client_started().await?;
 
     match tool_name {
@@ -58,7 +62,6 @@ pub async fn handle_tool_call(
         "rust_analyzer_symbols" => handle_symbols(server, args).await,
         "rust_analyzer_format" => handle_format(server, args).await,
         "rust_analyzer_code_actions" => handle_code_actions(server, args).await,
-        "rust_analyzer_set_workspace" => handle_set_workspace(server, args).await,
         "rust_analyzer_diagnostics" => handle_diagnostics(server, args).await,
         "rust_analyzer_workspace_diagnostics" => handle_workspace_diagnostics(server, args).await,
         _ => Err(anyhow!("Unknown tool: {}", tool_name)),
