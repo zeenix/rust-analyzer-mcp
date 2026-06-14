@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     diagnostics::format_diagnostics,
+    paths::absolute_path,
     protocol::mcp::{ContentItem, ToolResult},
 };
 
@@ -227,15 +228,7 @@ async fn handle_set_workspace(
 
     // Set new workspace with proper absolute path handling.
     let workspace_root = PathBuf::from(workspace_path);
-    server.workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-        if workspace_root.is_absolute() {
-            workspace_root.clone()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(&workspace_root)
-        }
-    });
+    server.workspace_root = absolute_path(workspace_root);
 
     // Start the new client automatically.
     server.ensure_client_started().await?;

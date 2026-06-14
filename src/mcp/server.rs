@@ -9,6 +9,7 @@ use tokio::{
 
 use crate::{
     lsp::RustAnalyzerClient,
+    paths::{absolute_path, file_uri},
     protocol::mcp::{MCPError, MCPRequest, MCPResponse},
 };
 
@@ -32,17 +33,7 @@ impl RustAnalyzerMCPServer {
     }
 
     pub fn with_workspace(workspace_root: PathBuf) -> Self {
-        // Ensure the workspace root is absolute.
-        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-            // If canonicalize fails, try to make it absolute.
-            if workspace_root.is_absolute() {
-                workspace_root.clone()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(&workspace_root)
-            }
-        });
+        let workspace_root = absolute_path(workspace_root);
 
         Self {
             client: None,
@@ -60,15 +51,18 @@ impl RustAnalyzerMCPServer {
     }
 
     pub(super) async fn open_document_if_needed(&mut self, file_path: &str) -> Result<String> {
-        let absolute_path = self.workspace_root.join(file_path);
-        // Ensure we have an absolute path for the URI.
-        let absolute_path = absolute_path
-            .canonicalize()
-            .unwrap_or_else(|_| absolute_path.clone());
-        let uri = format!("file://{}", absolute_path.display());
+        let file_path = PathBuf::from(file_path);
+        let absolute_path = if file_path.is_absolute() {
+            absolute_path(file_path)
+        } else {
+            absolute_path(self.workspace_root.join(file_path))
+        };
+        let uri = file_uri(&absolute_path)?;
         let content = tokio::fs::read_to_string(&absolute_path)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path, e))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to read file {}: {}", absolute_path.display(), e)
+            })?;
 
         let Some(client) = &mut self.client else {
             return Err(anyhow::anyhow!("Client not initialized"));
