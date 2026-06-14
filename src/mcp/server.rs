@@ -51,6 +51,13 @@ impl RustAnalyzerMCPServer {
     }
 
     pub(super) async fn ensure_client_started(&mut self) -> Result<()> {
+        if let Some(client) = &mut self.client {
+            if !client.is_running() {
+                let _ = client.shutdown().await;
+                self.client = None;
+            }
+        }
+
         if self.client.is_none() {
             let mut client = RustAnalyzerClient::new(self.workspace_root.clone());
             client.start().await?;

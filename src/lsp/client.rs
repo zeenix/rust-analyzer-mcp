@@ -23,7 +23,7 @@ pub struct RustAnalyzerClient {
     pub(super) process: Option<Child>,
     pub(super) request_id: Arc<Mutex<u64>>,
     pub(super) workspace_root: PathBuf,
-    pub(super) stdin: Option<BufWriter<tokio::process::ChildStdin>>,
+    pub(super) stdin: Option<Arc<Mutex<BufWriter<tokio::process::ChildStdin>>>>,
     pub(super) pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     pub(super) initialized: bool,
     pub(super) open_documents: Arc<Mutex<HashSet<String>>>,
@@ -102,12 +102,14 @@ impl RustAnalyzerClient {
             .take()
             .ok_or_else(|| anyhow!("Failed to get stderr"))?;
 
-        self.stdin = Some(BufWriter::new(stdin));
+        let stdin = Arc::new(Mutex::new(BufWriter::new(stdin)));
+        self.stdin = Some(Arc::clone(&stdin));
 
         // Start connection handlers.
         super::connection::start_handlers(
             stdout,
             stderr,
+            stdin,
             Arc::clone(&self.pending_requests),
             Arc::clone(&self.diagnostics),
         );
@@ -138,6 +140,14 @@ impl RustAnalyzerClient {
         Ok(())
     }
 
+    pub fn is_running(&mut self) -> bool {
+        let Some(process) = &mut self.process else {
+            return false;
+        };
+
+        matches!(process.try_wait(), Ok(None))
+    }
+
     pub(super) async fn send_notification(
         &mut self,
         method: &str,
@@ -154,10 +164,11 @@ impl RustAnalyzerClient {
 
         info!("Sending LSP notification: {}", method);
 
-        let Some(stdin) = &mut self.stdin else {
+        let Some(stdin) = &self.stdin else {
             return Err(anyhow!("No stdin available"));
         };
 
+        let mut stdin = stdin.lock().await;
         stdin.write_all(message.as_bytes()).await?;
         stdin.flush().await?;
         Ok(())
@@ -185,22 +196,50 @@ impl RustAnalyzerClient {
 
         info!("Sending LSP request: {} with params: {:?}", method, params);
 
-        let Some(stdin) = &mut self.stdin else {
-            return Err(anyhow!("No stdin available"));
-        };
-
-        stdin.write_all(message.as_bytes()).await?;
-        stdin.flush().await?;
-
-        // Set up response channel.
+        // Register the pending response before writing the request. Some LSP
+        // requests (especially shutdown and small file-level queries) can be
+        // answered immediately; registering afterwards races the reader task.
         let (tx, rx) = oneshot::channel();
         self.pending_requests.lock().await.insert(id, tx);
 
-        // Wait for response with timeout.
-        tokio::time::timeout(Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS), rx)
+        let Some(stdin) = &self.stdin else {
+            self.pending_requests.lock().await.remove(&id);
+            return Err(anyhow!("No stdin available"));
+        };
+
+        {
+            let mut stdin = stdin.lock().await;
+            if let Err(err) = stdin.write_all(message.as_bytes()).await {
+                self.pending_requests.lock().await.remove(&id);
+                return Err(err.into());
+            }
+            if let Err(err) = stdin.flush().await {
+                self.pending_requests.lock().await.remove(&id);
+                return Err(err.into());
+            }
+        }
+
+        self.receive_response(id, rx, Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS))
             .await
-            .map_err(|_| anyhow!("Request timeout"))?
-            .map_err(|_| anyhow!("Request cancelled"))
+    }
+
+    async fn receive_response(
+        &mut self,
+        id: u64,
+        rx: oneshot::Receiver<Value>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => {
+                self.pending_requests.lock().await.remove(&id);
+                Err(anyhow!("Request cancelled"))
+            }
+            Err(_) => {
+                self.pending_requests.lock().await.remove(&id);
+                Err(anyhow!("Request timeout"))
+            }
+        }
     }
 
     async fn initialize(&mut self) -> Result<()> {
@@ -281,11 +320,6 @@ impl RustAnalyzerClient {
         self.send_notification("initialized", Some(json!({})))
             .await?;
 
-        // Request workspace reload to trigger cargo check.
-        self.send_request("rust-analyzer/reloadWorkspace", None)
-            .await
-            .ok();
-
         Ok(())
     }
 
@@ -341,7 +375,9 @@ impl RustAnalyzerClient {
 
     pub async fn shutdown(&mut self) -> Result<()> {
         if self.initialized {
-            let _ = self.send_request("shutdown", None).await;
+            let _ = self
+                .send_request_with_timeout("shutdown", None, Duration::from_secs(1))
+                .await;
             let _ = self.send_notification("exit", None).await;
         }
 
@@ -356,6 +392,52 @@ impl RustAnalyzerClient {
         self.diagnostics.lock().await.clear();
         self.initialized = false;
         Ok(())
+    }
+
+    async fn send_request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let mut request_id_lock = self.request_id.lock().await;
+        let id = *request_id_lock;
+        *request_id_lock += 1;
+        drop(request_id_lock);
+
+        let request = LSPRequest {
+            jsonrpc: "2.0".to_string(),
+            id,
+            method: method.to_string(),
+            params: params.clone(),
+        };
+
+        let content = serde_json::to_string(&request)?;
+        let message = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
+
+        info!("Sending LSP request: {} with params: {:?}", method, params);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_requests.lock().await.insert(id, tx);
+
+        let Some(stdin) = &self.stdin else {
+            self.pending_requests.lock().await.remove(&id);
+            return Err(anyhow!("No stdin available"));
+        };
+
+        {
+            let mut stdin = stdin.lock().await;
+            if let Err(err) = stdin.write_all(message.as_bytes()).await {
+                self.pending_requests.lock().await.remove(&id);
+                return Err(err.into());
+            }
+            if let Err(err) = stdin.flush().await {
+                self.pending_requests.lock().await.remove(&id);
+                return Err(err.into());
+            }
+        }
+
+        self.receive_response(id, rx, timeout).await
     }
 }
 
