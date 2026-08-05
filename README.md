@@ -443,12 +443,22 @@ Two consequences worth knowing:
 - A file the server has **already touched** is always answered from current disk content — this
   holds for workspace-wide tools and for cross-file resolution, not just for the file named in
   the request.
-- A file the server has **never opened** is left to rust-analyzer's own watcher, which typically
-  needs 5–10 seconds to notice a change. If you edited such a file and need the answer
-  immediately, name it in any positional tool call (`symbols` is cheapest) to pull it in.
+- A file the server has **never opened** is left to rust-analyzer's own watcher, which picks such
+  changes up promptly: a function added to a never-opened file shows up in `workspace_symbol`
+  right away.
 
 Detection relies on mtime changing. On filesystems with coarse (1-second) timestamp granularity
 an edit made within the same tick as the previous sync can be missed.
+
+One caveat that is **not** about file syncing, but is easy to mistake for it: after a file
+changes on disk, reference-style queries (`references`, and the tools built on it) keep
+returning the pre-edit answer for roughly 5 seconds. That delay is internal to rust-analyzer —
+no protocol traffic happens during it, and the VFS is demonstrably already current, since
+`workspace_symbol` sees the change immediately. It cannot be shortened from the client side:
+sending `workspace/didChangeWatchedFiles` for the path makes no difference (measured: 5.01s
+either way), and opening the file explicitly makes it *worse* (10s), because the open path waits
+on cache priming. If you need a certain answer right after an edit, `cargo check` remains the
+ground truth.
 
 ## Contributing
 
@@ -456,9 +466,10 @@ The 36-tool surface covers the LSP standards plus rust-analyzer's specials, serv
 composites (`explore_symbol`, `impact`, `get_type_by_name`, `move_file`), and a multi-workspace
 registry. Contributions welcome for:
 
-- An FS watcher (plus `workspace/didChangeWatchedFiles`) so that files the server has never
-  opened also reflect external edits immediately, instead of waiting out rust-analyzer's own
-  watcher — see [External edits](#external-edits).
+- Finding out where rust-analyzer's ~5s lag on reference-style queries after an on-disk edit
+  comes from, and whether a client can influence it at all. A `notify`-based watcher sending
+  `workspace/didChangeWatchedFiles` was tried and made no measurable difference — see
+  [External edits](#external-edits) before reaching for that again.
 - A null-result hint for position tools when the position points at whitespace/a keyword
   rather than an identifier.
 - More configuration knobs (snippet context lines per workspace, additional `cargo` subcommand

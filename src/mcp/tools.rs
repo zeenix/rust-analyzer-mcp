@@ -183,7 +183,7 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
         ),
         tool(
             "rust_analyzer_references",
-            "Find all references to a symbol at a specific position",
+            "Find all references to a symbol at a specific position. Immediately after a file changes on disk, this can keep returning the pre-edit answer for ~5s — a rust-analyzer-internal delay that the server cannot shorten. If you just edited a file and the result looks stale, retry rather than concluding there are no references.",
             position_schema(),
         ),
         tool(
@@ -238,7 +238,7 @@ fn build_tools_raw() -> Vec<ToolDefinition> {
         ),
         tool(
             "rust_analyzer_diagnostics",
-            "Get compiler diagnostics (errors, warnings, hints) for a Rust file. Each diagnostic carries the LSP fields plus rust-analyzer extensions: `data.rendered` (the cargo-formatted error block with ASCII pointers — read this first when fixing a bug), `codeDescription.href` (link to the error-index doc page), and `tags` (LSP DiagnosticTag, e.g. [1] for unused code). Fields are null when upstream omits them. Files this server has already opened are re-synced from disk before every tool call, so edits made outside rust-analyzer (Edit tool, git checkout) are reflected. A file the server has never opened depends on rust-analyzer's own file watcher, which can lag ~5-10s behind a change on disk.",
+            "Get compiler diagnostics (errors, warnings, hints) for a Rust file. Each diagnostic carries the LSP fields plus rust-analyzer extensions: `data.rendered` (the cargo-formatted error block with ASCII pointers — read this first when fixing a bug), `codeDescription.href` (link to the error-index doc page), and `tags` (LSP DiagnosticTag, e.g. [1] for unused code). Fields are null when upstream omits them. Files this server has already opened are re-synced from disk before every tool call, so edits made outside rust-analyzer (Edit tool, git checkout) are reflected, as are changes to files it has never opened.",
             file_only_schema(),
         ),
         tool(
