@@ -28,10 +28,20 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
     let release_binary = project_root.join("target/release/rust-analyzer-mcp");
     let debug_binary = project_root.join("target/debug/rust-analyzer-mcp");
 
-    let binary = if release_binary.exists() {
-        release_binary
-    } else if debug_binary.exists() {
-        debug_binary
+    // Match the daemon's own build profile so we don't accidentally spawn a
+    // stale release binary when the developer is iterating in debug mode (or
+    // vice versa). Fall back to whatever exists if the preferred profile
+    // hasn't been built yet.
+    let (preferred, fallback) = if cfg!(debug_assertions) {
+        (debug_binary.clone(), release_binary.clone())
+    } else {
+        (release_binary.clone(), debug_binary.clone())
+    };
+
+    let binary = if preferred.exists() {
+        preferred
+    } else if fallback.exists() {
+        fallback
     } else {
         return Err(anyhow::anyhow!("rust-analyzer-mcp binary not found"));
     };
@@ -41,6 +51,9 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Disable workspace-registry persistence — tests must not write to
+        // the user's real ~/.local/state/rust-analyzer-mcp/.
+        .env("RUST_ANALYZER_MCP_STATE_DIR", "")
         .spawn()?;
 
     let mut stdin = rust_analyzer.stdin.take().unwrap();

@@ -123,6 +123,8 @@ impl MCPTestClient {
             .env("RUST_ANALYZER_CONFIG", "")
             // Disable cargo target directory sharing
             .env("CARGO_TARGET_DIR", format!("{}/target", temp_dir))
+            // Disable workspace-registry persistence in tests.
+            .env("RUST_ANALYZER_MCP_STATE_DIR", "")
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
@@ -177,7 +179,7 @@ impl MCPTestClient {
         std::fs::create_dir_all(format!("{}/target", temp_dir)).ok();
 
         let mut process = Command::new("cargo")
-            .args(&["run", "--", workspace.to_str().unwrap()])
+            .args(["run", "--", workspace.to_str().unwrap()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -188,6 +190,8 @@ impl MCPTestClient {
             .env("RUST_ANALYZER_CONFIG", "")
             // Disable cargo target directory sharing
             .env("CARGO_TARGET_DIR", format!("{}/target", temp_dir))
+            // Disable workspace-registry persistence in tests.
+            .env("RUST_ANALYZER_MCP_STATE_DIR", "")
             .spawn()?;
 
         let stdin = process.stdin.take().unwrap();
@@ -235,6 +239,49 @@ impl MCPTestClient {
             let _ = process.wait().await;
         }
         Ok(())
+    }
+
+    /// PID of the spawned `rust-analyzer-mcp` process. Returns `None` if the
+    /// process has been shut down.
+    pub async fn server_pid(&self) -> Option<u32> {
+        self.process.lock().await.as_ref().and_then(|p| p.id())
+    }
+
+    /// Send a JSON-RPC notification (no `id`, no response expected). Used for
+    /// MCP-side notifications like `notifications/cancelled`.
+    pub async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<()> {
+        let mut request = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+        });
+        if let Some(params) = params {
+            request["params"] = params;
+        }
+        let request_str = serde_json::to_string(&request)?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(request_str.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Send a tools/call request without consuming the response. Returns the
+    /// id used so the caller can match it later. Useful for cancellation
+    /// tests where we want to fire-and-not-wait.
+    pub async fn send_tool_call_raw(&self, name: &str, arguments: Value) -> Result<u64> {
+        let id = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        let request_str = serde_json::to_string(&request)?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(request_str.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        Ok(id)
     }
 
     /// Send a request and wait for response with timeout
@@ -378,14 +425,26 @@ impl MCPTestClient {
             return false;
         };
 
-        // Check if we got null or empty response
-        if text_str == "null" || text_str == "[]" {
+        // Null = not ready yet.
+        if text_str == "null" {
             return false;
         }
 
-        // Try to parse symbols
-        let Ok(symbols) = serde_json::from_str::<Vec<Value>>(text_str) else {
+        // The symbols tool returns either the new wrapper
+        // `{ symbols, total_top_level, verbose }` or, in legacy mode (older
+        // server binary), a flat array. Accept both so this readiness probe
+        // works against any in-tree daemon.
+        let Ok(parsed) = serde_json::from_str::<Value>(text_str) else {
             return false;
+        };
+        let symbols = match &parsed {
+            Value::Array(items) => items.as_slice(),
+            Value::Object(_) => parsed
+                .get("symbols")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            _ => &[],
         };
 
         !symbols.is_empty()
