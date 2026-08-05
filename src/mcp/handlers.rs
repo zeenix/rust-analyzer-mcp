@@ -160,6 +160,17 @@ pub async fn handle_tool_call(
     tool_name: &str,
     args: Value,
 ) -> Result<ToolResult> {
+    // Before dispatching: reconcile every document rust-analyzer already holds
+    // open with what is actually on disk. Files are edited behind our back
+    // (Edit tool, another editor, git checkout) and rust-analyzer ignores its
+    // own file watcher for anything it considers client-owned, so a document we
+    // opened three tool calls ago would otherwise keep answering from stale
+    // content — for workspace-wide queries and for cross-file resolution alike.
+    // An unresolvable workspace_id is left to the individual arm to report.
+    if let Ok(ws) = server.resolve_workspace(&args).await {
+        ws.resync_open_documents().await;
+    }
+
     match tool_name {
         "rust_analyzer_hover" => {
             let (line, ch) = params::position(&args)?;

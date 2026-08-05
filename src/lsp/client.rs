@@ -613,6 +613,87 @@ impl RustAnalyzerClient {
         Ok(())
     }
 
+    /// Re-sync every already-open document whose on-disk state moved since we
+    /// last pushed it.
+    ///
+    /// rust-analyzer keeps `didOpen`ed files as in-memory overlays and
+    /// deliberately discards its own file-watcher events for them — the client
+    /// is assumed to own their content. Our "client" is an MCP tool call, which
+    /// owns nothing: every edit happens on disk, behind our back. Without this
+    /// sweep, any file we ever opened stays frozen at the content we last sent,
+    /// which silently corrupts workspace-wide queries *and* the cross-file
+    /// resolution of the one file a request does re-read.
+    ///
+    /// Cheap in the common case: one `stat` per open document, no reads. Files
+    /// that vanished from disk are closed so rust-analyzer falls back to its own
+    /// view of them. Returns the number of documents that were re-read or closed.
+    pub async fn resync_open_documents(&self) -> usize {
+        // Snapshot first — the disk I/O and the `update_document` /
+        // `close_document` calls below all re-take this lock.
+        let snapshot: Vec<(String, Option<SystemTime>)> = self
+            .open_documents
+            .lock()
+            .await
+            .iter()
+            .map(|(uri, state)| (uri.clone(), state.mtime))
+            .collect();
+
+        if snapshot.is_empty() {
+            return 0;
+        }
+
+        let checks = snapshot.into_iter().map(|(uri, known_mtime)| async move {
+            let path = uri_to_local_path(&uri)?;
+            let current_mtime = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok());
+
+            // Unchanged mtime is the overwhelmingly common case — skip the read.
+            if let (Some(known), Some(current)) = (known_mtime, current_mtime) {
+                if known == current {
+                    return None;
+                }
+            }
+
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => Some(Resync::Changed {
+                    uri,
+                    content,
+                    mtime: current_mtime,
+                }),
+                // Gone or unreadable: drop the overlay rather than keep serving
+                // content that no longer exists on disk.
+                Err(_) => Some(Resync::Vanished { uri }),
+            }
+        });
+
+        let mut resynced = 0;
+        for action in futures::future::join_all(checks)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            let outcome = match &action {
+                Resync::Changed {
+                    uri,
+                    content,
+                    mtime,
+                } => self.update_document(uri, content, *mtime).await,
+                Resync::Vanished { uri } => self.close_document(uri).await,
+            };
+            match outcome {
+                Ok(()) => resynced += 1,
+                Err(e) => warn!("Failed to re-sync {} from disk: {}", action.uri(), e),
+            }
+        }
+
+        if resynced > 0 {
+            debug!("Re-synced {} externally modified document(s)", resynced);
+        }
+        resynced
+    }
+
     /// Send `textDocument/didClose` and forget the document. No-op if the
     /// URI was not open. Used after a file move so rust-analyzer drops its
     /// stale view of the old path.
@@ -680,6 +761,33 @@ impl Drop for RustAnalyzerClient {
             }
         }
     }
+}
+
+/// What `resync_open_documents` decided to do with one open document.
+enum Resync {
+    Changed {
+        uri: String,
+        content: String,
+        mtime: Option<SystemTime>,
+    },
+    Vanished {
+        uri: String,
+    },
+}
+
+impl Resync {
+    fn uri(&self) -> &str {
+        match self {
+            Resync::Changed { uri, .. } | Resync::Vanished { uri } => uri,
+        }
+    }
+}
+
+/// Inverse of the `format!("file://{}", path.display())` we use everywhere to
+/// build document URIs. Deliberately not a general URI parser — we only ever
+/// resolve URIs we minted ourselves, which are never percent-encoded.
+fn uri_to_local_path(uri: &str) -> Option<PathBuf> {
+    uri.strip_prefix("file://").map(PathBuf::from)
 }
 
 fn hash_content(content: &str) -> u64 {

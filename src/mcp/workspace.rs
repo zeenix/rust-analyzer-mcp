@@ -161,6 +161,16 @@ impl WorkspaceEntry {
         Ok(uri)
     }
 
+    /// Bring rust-analyzer's view of every already-open document back in line
+    /// with the disk. No-op when no client is running — this must never be the
+    /// thing that boots rust-analyzer.
+    pub async fn resync_open_documents(&self) {
+        let Some(client) = self.maybe_client().await else {
+            return;
+        };
+        client.resync_open_documents().await;
+    }
+
     /// Replace the workspace root in place: shut down the existing client (if
     /// any) so the next `ensure_client_started` boots rust-analyzer in the new
     /// directory.

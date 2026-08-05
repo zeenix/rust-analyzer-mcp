@@ -153,10 +153,11 @@ In a multi-workspace setup every tool accepts an optional `workspace_id` argumen
 - **`diagnostics`** — Per-file compiler diagnostics. Each item carries the LSP fields plus
   rust-analyzer's extensions: `data.rendered` (cargo-formatted error block with ASCII pointers,
   read this first when fixing a bug), `codeDescription.href` (link to the error-index doc),
-  and `tags` (e.g. `[1]` for unused code). Reflects rust-analyzer's in-memory state — files
-  edited outside rust-analyzer may be stale; treat `cargo check` as ground truth.
+  and `tags` (e.g. `[1]` for unused code). Every file the server has already opened is re-synced
+  from disk before each tool call, so edits made outside rust-analyzer (Edit tool, git checkout)
+  are reflected; see [External edits](#external-edits).
 - **`workspace_diagnostics`** — All diagnostics workspace-wide. Files paginated (default 50 per
-  page); `summary` totals always cover the full workspace. Same staleness caveat as above.
+  page); `summary` totals always cover the full workspace.
 - **`hover`** — Hover documentation/type info. Markdown capped at ~5 KB by default,
   `verbose=true` removes the cap.
 - **`inlay_hints`** — Inferred-type and parameter-name hints for a range.
@@ -428,15 +429,36 @@ cargo run --release
 - Subsequent requests should be much faster
 - Consider excluding large target/ directories if needed
 
+### External edits
+
+rust-analyzer keeps every file an LSP client opens as an in-memory overlay and deliberately
+ignores its own file-watcher events for it — the client is assumed to own that buffer. An MCP
+tool call owns nothing: every edit lands on disk, from the Edit tool, another editor, or a git
+checkout. So before dispatching a tool call the server compares each open document's mtime
+against disk and pushes a `didChange` for anything that moved (and a `didClose` for anything
+that vanished). Cost in the steady state is one `stat` per open document.
+
+Two consequences worth knowing:
+
+- A file the server has **already touched** is always answered from current disk content — this
+  holds for workspace-wide tools and for cross-file resolution, not just for the file named in
+  the request.
+- A file the server has **never opened** is left to rust-analyzer's own watcher, which typically
+  needs 5–10 seconds to notice a change. If you edited such a file and need the answer
+  immediately, name it in any positional tool call (`symbols` is cheapest) to pull it in.
+
+Detection relies on mtime changing. On filesystems with coarse (1-second) timestamp granularity
+an edit made within the same tick as the previous sync can be missed.
+
 ## Contributing
 
 The 36-tool surface covers the LSP standards plus rust-analyzer's specials, server-side
 composites (`explore_symbol`, `impact`, `get_type_by_name`, `move_file`), and a multi-workspace
 registry. Contributions welcome for:
 
-- An `update_document` tool / FS watcher that closes the gap between external edits and
-  rust-analyzer's in-memory state (currently `cargo check` is the ground truth after external
-  edits — see the diagnostics staleness caveat).
+- An FS watcher (plus `workspace/didChangeWatchedFiles`) so that files the server has never
+  opened also reflect external edits immediately, instead of waiting out rust-analyzer's own
+  watcher — see [External edits](#external-edits).
 - A null-result hint for position tools when the position points at whitespace/a keyword
   rather than an identifier.
 - More configuration knobs (snippet context lines per workspace, additional `cargo` subcommand
