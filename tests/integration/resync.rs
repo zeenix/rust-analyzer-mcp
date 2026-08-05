@@ -92,10 +92,15 @@ async fn wait_until(
     panic!("timed out waiting for {what}; last payload was: {last}");
 }
 
-/// The cross-file case: a stale overlay on file A corrupts the answer for a
-/// query about file B, even though B itself is re-read on every call.
+/// All three re-sync behaviours, in one test against one rust-analyzer
+/// instance. Kept together deliberately: each `MCPTestClient` spawns its own
+/// rust-analyzer, and at full `cargo test` parallelism the suite already sits
+/// close to the box's limit for concurrent instances (`inotify`
+/// `max_user_instances` is 128 on a stock Linux, and each instance indexes the
+/// standard library). Three separate tests here pushed it over, and
+/// rust-analyzer would occasionally die mid-run.
 #[tokio::test]
-async fn test_external_edit_to_open_file_is_visible_across_files() -> Result<()> {
+async fn test_external_edits_are_picked_up() -> Result<()> {
     let project = IsolatedProject::new()?;
     let workspace = project.path().to_path_buf();
     let client = MCPTestClient::start(&workspace).await?;
@@ -103,14 +108,17 @@ async fn test_external_edit_to_open_file_is_visible_across_files() -> Result<()>
 
     let utils = workspace.join("src/utils.rs");
     let lib = workspace.join("src/lib.rs");
+    let main_rs = workspace.join("src/main.rs");
     // `+ 7` skips past `pub fn ` onto the identifier itself.
     let (add_line, add_char) = position_of(&lib, "pub fn add");
     let add_char = add_char + 7;
     let (process_line, process_char) = position_of(&utils, "pub fn process");
     let process_char = process_char + 7;
 
-    // Warm-up: querying utils.rs both opens it (making it an overlay) and, once
-    // it resolves the call sites in lib.rs, proves rust-analyzer is ready.
+    // ── Warm-up ──────────────────────────────────────────────────────────────
+    // Querying utils.rs both opens it (making it an overlay on rust-analyzer's
+    // side) and, once it resolves the call sites over in lib.rs, proves
+    // rust-analyzer is done indexing.
     wait_until(
         &client,
         "rust_analyzer_references",
@@ -124,7 +132,9 @@ async fn test_external_edit_to_open_file_is_visible_across_files() -> Result<()>
     )
     .await;
 
-    // Baseline: nothing references `lib::add` yet.
+    // ── 1. Cross-file ────────────────────────────────────────────────────────
+    // A stale overlay on file A corrupts the answer for a query about file B,
+    // even though B itself is re-read on every call.
     let before = payload_text(
         &client
             .call_tool(
@@ -142,7 +152,6 @@ async fn test_external_edit_to_open_file_is_visible_across_files() -> Result<()>
         "baseline should not reference utils.rs yet, got: {before}"
     );
 
-    // Add a call to `lib::add` from the already-open utils.rs, on disk.
     append_on_disk(&utils, "\npub fn calls_add() -> i32 { crate::add(1, 2) }\n")?;
 
     wait_until(
@@ -158,25 +167,11 @@ async fn test_external_edit_to_open_file_is_visible_across_files() -> Result<()>
     )
     .await;
 
-    client.shutdown().await?;
-    Ok(())
-}
-
-/// The workspace-wide case: `workspace_symbol` never goes through the
-/// per-file open path, so it used to see whatever content the overlay froze.
-#[tokio::test]
-async fn test_external_edit_is_visible_to_workspace_symbol() -> Result<()> {
-    let project = IsolatedProject::new()?;
-    let workspace = project.path().to_path_buf();
-    let client = MCPTestClient::start(&workspace).await?;
-    client.initialize_and_wait().await?;
-
-    let main_rs = workspace.join("src/main.rs");
+    // ── 2. Workspace-wide ────────────────────────────────────────────────────
+    // workspace_symbol never goes through the per-file open path, so it used to
+    // see whatever content the overlay had frozen.
     let (greet_line, greet_char) = position_of(&main_rs, "fn greet");
     let greet_char = greet_char + 3;
-
-    // Warm-up: open main.rs as an overlay and wait until the symbol index is
-    // actually populated.
     client
         .call_tool(
             "rust_analyzer_hover",
@@ -187,14 +182,6 @@ async fn test_external_edit_is_visible_to_workspace_symbol() -> Result<()> {
             }),
         )
         .await?;
-    wait_until(
-        &client,
-        "rust_analyzer_workspace_symbol",
-        json!({ "query": "greet" }),
-        |text| text.contains("greet"),
-        "the workspace symbol index to be populated",
-    )
-    .await;
 
     append_on_disk(&main_rs, "\npub fn zzz_resync_marker() -> u32 { 42 }\n")?;
 
@@ -207,21 +194,10 @@ async fn test_external_edit_is_visible_to_workspace_symbol() -> Result<()> {
     )
     .await;
 
-    client.shutdown().await?;
-    Ok(())
-}
-
-/// A file that disappears while open must not wedge the server: the re-sync
-/// closes it instead of serving content that no longer exists.
-#[tokio::test]
-async fn test_deleted_open_file_does_not_break_later_calls() -> Result<()> {
-    let project = IsolatedProject::new()?;
-    let workspace = project.path().to_path_buf();
-    let client = MCPTestClient::start(&workspace).await?;
-    client.initialize_and_wait().await?;
-
-    // A standalone file, not wired into the crate — deleting it later must not
-    // turn the workspace into a build failure.
+    // ── 3. Deletion ──────────────────────────────────────────────────────────
+    // A file that disappears while open must not wedge the server: the re-sync
+    // closes it instead of serving content that no longer exists. Standalone,
+    // so deleting it can't turn the workspace into a build failure.
     let scratch = workspace.join("src/scratch_resync.rs");
     std::fs::write(&scratch, "pub fn scratch_fn() -> u32 { 7 }\n")?;
     client
@@ -234,10 +210,8 @@ async fn test_deleted_open_file_does_not_break_later_calls() -> Result<()> {
             }),
         )
         .await?;
-
     std::fs::remove_file(&scratch)?;
 
-    // Any subsequent call triggers the re-sync sweep over the now-missing file.
     let response = client
         .call_tool(
             "rust_analyzer_workspace_symbol",
