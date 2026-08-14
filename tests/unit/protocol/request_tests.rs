@@ -104,6 +104,14 @@ fn test_notification_without_id() {
 }
 
 #[test]
+fn test_mcp_notifications_initialized() {
+    let raw = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    let request: MCPRequest = from_str(raw).unwrap();
+    assert_eq!(request.method, "notifications/initialized");
+    assert!(request.id.is_none());
+}
+
+#[test]
 fn test_tool_call_request() {
     let tool_call = MCPRequest {
         jsonrpc: "2.0".to_string(),

@@ -126,11 +126,14 @@ impl RustAnalyzerMCPServer {
             };
 
             debug!("Received request: {}", request.method);
-            let response = self.handle_request(request).await;
-            let response_json = serde_json::to_string(&response)?;
-            writer.write_all(response_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+            // Only send a response if handle_request returned Some(response) (notifications return None).
+            // See handle_request() for details on how notifications are handled.
+            if let Some(response) = self.handle_request(request).await {
+                let response_json = serde_json::to_string(&response)?;
+                writer.write_all(response_json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+            }
         }
 
         // Cleanup.
@@ -142,8 +145,15 @@ impl RustAnalyzerMCPServer {
         Ok(())
     }
 
-    async fn handle_request(&mut self, request: MCPRequest) -> MCPResponse {
-        match request.method.as_str() {
+    async fn handle_request(&mut self, request: MCPRequest) -> Option<MCPResponse> {
+        // Handle MCP notifications (e.g. notifications/initialized, notifications/cancelled).
+        // Per JSON-RPC 2.0 and MCP spec, notifications do not contain an id and MUST NOT produce a response.
+        if request.id.is_none() || request.method.starts_with("notifications/") {
+            debug!("Silently handled notification: {}", request.method);
+            return None;
+        }
+
+        let response = match request.method.as_str() {
             "initialize" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,
@@ -167,7 +177,7 @@ impl RustAnalyzerMCPServer {
             },
             "tools/call" => {
                 let Some(params) = request.params else {
-                    return MCPResponse::Error {
+                    return Some(MCPResponse::Error {
                         jsonrpc: "2.0".to_string(),
                         id: request.id,
                         error: MCPError {
@@ -175,11 +185,11 @@ impl RustAnalyzerMCPServer {
                             message: "Invalid params".to_string(),
                             data: None,
                         },
-                    };
+                    });
                 };
 
                 let Some(tool_name) = params["name"].as_str() else {
-                    return MCPResponse::Error {
+                    return Some(MCPResponse::Error {
                         jsonrpc: "2.0".to_string(),
                         id: request.id,
                         error: MCPError {
@@ -187,7 +197,7 @@ impl RustAnalyzerMCPServer {
                             message: "Missing tool name".to_string(),
                             data: None,
                         },
-                    };
+                    });
                 };
 
                 let args = params
@@ -224,6 +234,8 @@ impl RustAnalyzerMCPServer {
                     data: None,
                 },
             },
-        }
+        };
+
+        Some(response)
     }
 }
