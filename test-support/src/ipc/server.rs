@@ -14,6 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Shared handle to the MCP server's stdio, keeping each request write paired with its
+/// response read.
+type SharedPipes = Arc<Mutex<(ChildStdin, BufReader<ChildStdout>)>>;
+
 /// Start a standalone MCP server process that listens on Unix socket
 pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
     let socket_path = socket_path(project_type);
@@ -188,7 +192,7 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
 /// Serve one client connection until it disconnects.
 fn handle_client(
     mut stream: UnixStream,
-    pipes: Arc<Mutex<(ChildStdin, BufReader<ChildStdout>)>>,
+    pipes: SharedPipes,
     last_activity: Arc<Mutex<Instant>>,
     request_id: Arc<AtomicU64>,
     shutdown: &AtomicBool,
@@ -264,8 +268,34 @@ fn handle_client(
             Ok(_) => {}
         }
 
-        // Forward response to client.
-        stream.write_all(response_line.as_bytes())?;
+        // An unparseable frame means the shared pipe is corrupt; every client on it would be
+        // affected, so retire the whole daemon rather than just this connection.
+        let mut response: Value = match serde_json::from_str(&response_line) {
+            Ok(response) => response,
+            Err(e) => {
+                shutdown.store(true, Ordering::SeqCst);
+                anyhow::bail!("Unparseable MCP response on the shared pipe: {e}");
+            }
+        };
+
+        // Refuse to relabel a frame that is not the response to the request just forwarded: a
+        // stale or unsolicited frame means the pipe is desynced, and relabeling it would hand
+        // this client (and everyone after it) someone else's answers.
+        if response["id"] != json!(id) {
+            shutdown.store(true, Ordering::SeqCst);
+            anyhow::bail!(
+                "MCP response id {} does not match forwarded id {}; shutting down desynced pipe",
+                response["id"],
+                id
+            );
+        }
+
+        // Forward the response to the client with its original request id restored: the daemon
+        // rewrites ids on the shared pipe, and the client correlates responses by the id it
+        // sent.
+        response["id"] = request["id"].clone();
+        stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+        stream.write_all(b"\n")?;
         stream.flush()?;
 
         // Update activity.
@@ -360,4 +390,95 @@ pub fn socket_path(project_type: &str) -> PathBuf {
     let socket_dir = std::env::temp_dir().join("rust-analyzer-mcp-sockets");
     let _ = fs::create_dir_all(&socket_dir);
     socket_dir.join(format!("{}.sock", project_type))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::Read, process::Child};
+
+    /// Spawn a shell standing in for the MCP server on the shared pipe: `script` reads request
+    /// lines on stdin and writes response lines on stdout.
+    fn fake_mcp_server(script: &str) -> (Child, SharedPipes) {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        (child, Arc::new(Mutex::new((stdin, stdout))))
+    }
+
+    /// Run one request through `handle_client` against the given fake MCP server script and
+    /// return the handler's result, the shutdown flag, and what the client received.
+    fn forward_one_request(script: &str) -> (Result<()>, bool, String) {
+        let (mut child, pipes) = fake_mcp_server(script);
+        let (daemon_side, client_side) = UnixStream::pair().unwrap();
+
+        // Write the request up front and close the write half so the handler sees a client
+        // that sends one request and disconnects.
+        (&client_side)
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{}}\n")
+            .unwrap();
+        client_side.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let shutdown = AtomicBool::new(false);
+        let result = handle_client(
+            daemon_side,
+            pipes,
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::new(AtomicU64::new(100)),
+            &shutdown,
+        );
+
+        let mut received = String::new();
+        BufReader::new(client_side)
+            .read_to_string(&mut received)
+            .unwrap();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        (result, shutdown.load(Ordering::SeqCst), received)
+    }
+
+    #[test]
+    fn restores_client_id_on_forwarded_response() {
+        // The echo server answers with the forwarded request itself, so the response carries
+        // the daemon's rewritten id; the client must get its own id back.
+        let (result, shutdown, received) =
+            forward_one_request(r#"while IFS= read -r line; do printf '%s\n' "$line"; done"#);
+
+        result.unwrap();
+        assert!(!shutdown);
+        let response: Value = serde_json::from_str(&received).unwrap();
+        assert_eq!(response["id"], json!(7));
+    }
+
+    #[test]
+    fn shuts_down_on_desynced_response_id() {
+        // A frame that is not the response to the forwarded request must not be relabeled as
+        // one; the daemon has to treat the pipe as desynced and retire itself.
+        let (result, shutdown, received) = forward_one_request(
+            r#"while IFS= read -r line; do printf '{"jsonrpc":"2.0","id":424242,"result":null}\n'; done"#,
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("does not match forwarded id"));
+        assert!(shutdown);
+        assert!(received.is_empty());
+    }
+
+    #[test]
+    fn shuts_down_on_unparseable_response() {
+        let (result, shutdown, received) =
+            forward_one_request(r#"while IFS= read -r line; do printf 'not json\n'; done"#);
+
+        assert!(result.is_err());
+        assert!(shutdown);
+        assert!(received.is_empty());
+    }
 }
