@@ -75,6 +75,12 @@ impl RustAnalyzerMCPServer {
         Ok(uri)
     }
 
+    /// Runs the server until its stdin reaches EOF or a shutdown signal arrives.
+    ///
+    /// Installs process-wide signal handlers that remain in effect after this returns. Reads
+    /// stdin through [`tokio::io::stdin`], whose parked blocking read cannot be cancelled: after
+    /// a signal-triggered exit the caller must not wait for the runtime to shut down on its own.
+    /// See this crate's `main.rs`, which uses [`tokio::runtime::Runtime::shutdown_background`].
     pub async fn run(&mut self) -> Result<()> {
         info!("Starting rust-analyzer MCP server");
 
@@ -295,12 +301,21 @@ impl RustAnalyzerMCPServer {
 
 /// Merged stream of the signals that request server shutdown.
 ///
-/// SIGINT and SIGTERM on Unix, Ctrl+C events elsewhere.
+/// SIGINT, SIGTERM and SIGHUP on Unix; Ctrl+C and console-close events on Windows. The streams
+/// are persistent, so signals delivered while no `recv()` is pending stay latched instead of
+/// falling through to the default disposition. Note that registering SIGHUP also overrides an
+/// inherited SIG_IGN disposition (e.g. from nohup), so a hangup always shuts the server down.
 struct ShutdownSignal {
     #[cfg(unix)]
     sigint: tokio::signal::unix::Signal,
     #[cfg(unix)]
     sigterm: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    sighup: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    ctrl_close: tokio::signal::windows::CtrlClose,
 }
 
 impl ShutdownSignal {
@@ -312,9 +327,19 @@ impl ShutdownSignal {
             Ok(Self {
                 sigint: signal(SignalKind::interrupt())?,
                 sigterm: signal(SignalKind::terminate())?,
+                sighup: signal(SignalKind::hangup())?,
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows;
+
+            Ok(Self {
+                ctrl_c: windows::ctrl_c()?,
+                ctrl_close: windows::ctrl_close()?,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
         Ok(Self {})
     }
 
@@ -325,11 +350,20 @@ impl ShutdownSignal {
             tokio::select! {
                 _ = self.sigint.recv() => {}
                 _ = self.sigterm.recv() => {}
+                _ = self.sighup.recv() => {}
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = self.ctrl_c.recv() => {}
+                _ = self.ctrl_close.recv() => {}
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            // No signal support; only a stdin EOF stops the server.
+            std::future::pending::<()>().await;
         }
     }
 }

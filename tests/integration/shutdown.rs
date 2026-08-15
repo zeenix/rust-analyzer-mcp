@@ -30,6 +30,12 @@ async fn exits_on_sigterm() -> Result<()> {
     assert_signal_exit("-TERM").await
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn exits_on_sighup() -> Result<()> {
+    assert_signal_exit("-HUP").await
+}
+
 #[tokio::test]
 async fn exits_on_stdin_close() -> Result<()> {
     let mut server = Server::spawn(std::env::temp_dir()).await?;
