@@ -187,22 +187,36 @@ impl RustAnalyzerClient {
 
         info!("Sending LSP request: {} with params: {:?}", method, params);
 
+        // Register the response channel before writing the request: a response arriving
+        // between the write and the registration would be dropped by the reader task,
+        // turning into a spurious request timeout.
+        let (tx, rx) = oneshot::channel();
+        let pending_requests = self.pending_requests.clone();
+        pending_requests.lock().await.insert(id, tx);
+
         let Some(stdin) = &mut self.stdin else {
+            pending_requests.lock().await.remove(&id);
             return Err(anyhow!("No stdin available"));
         };
 
-        stdin.write_all(message.as_bytes()).await?;
-        stdin.flush().await?;
-
-        // Set up response channel.
-        let (tx, rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(id, tx);
+        let mut written = stdin.write_all(message.as_bytes()).await;
+        if written.is_ok() {
+            written = stdin.flush().await;
+        }
+        if let Err(e) = written {
+            pending_requests.lock().await.remove(&id);
+            return Err(e.into());
+        }
 
         // Wait for response with timeout.
-        tokio::time::timeout(Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS), rx)
-            .await
-            .map_err(|_| anyhow!("Request timeout"))?
-            .map_err(|_| anyhow!("Request cancelled"))
+        match tokio::time::timeout(Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS), rx).await {
+            Ok(response) => response.map_err(|_| anyhow!("Request cancelled")),
+            Err(_) => {
+                // Unregister so an abandoned request cannot leak its pending entry.
+                pending_requests.lock().await.remove(&id);
+                Err(anyhow!("Request timeout"))
+            }
+        }
     }
 
     async fn initialize(&mut self) -> Result<()> {
