@@ -1,11 +1,8 @@
 use anyhow::Result;
 use log::{debug, error, info};
 use serde_json::json;
-use std::{path::PathBuf, sync::Arc};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
-    sync::Mutex,
-};
+use std::path::PathBuf;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 use crate::{
     lsp::RustAnalyzerClient,
@@ -78,6 +75,12 @@ impl RustAnalyzerMCPServer {
         Ok(uri)
     }
 
+    /// Runs the server until its stdin reaches EOF or a shutdown signal arrives.
+    ///
+    /// Installs process-wide signal handlers that remain in effect after this returns. Reads
+    /// stdin through [`tokio::io::stdin`], whose parked blocking read cannot be cancelled: after
+    /// a signal-triggered exit the caller must not wait for the runtime to shut down on its own.
+    /// See this crate's `main.rs`, which uses [`tokio::runtime::Runtime::shutdown_background`].
     pub async fn run(&mut self) -> Result<()> {
         info!("Starting rust-analyzer MCP server");
 
@@ -86,29 +89,37 @@ impl RustAnalyzerMCPServer {
         let mut reader = BufReader::new(stdin);
         let mut writer = BufWriter::new(stdout);
 
-        // Handle shutdown signals.
-        let running = Arc::new(Mutex::new(true));
-        let running_clone = Arc::clone(&running);
-
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Received shutdown signal");
-            *running_clone.lock().await = false;
-        });
+        // Created once, up front: the streams buffer signals delivered while a request is being
+        // handled, and installing a handler permanently replaces the default disposition, so
+        // every signal must be consumed here to have an effect.
+        let mut shutdown = ShutdownSignal::new()?;
+        // How many shutdown signals were consumed; the second one escalates the cleanup below.
+        let mut signals_seen = 0u32;
+        // The first fatal I/O error, reported only after the cleanup ran.
+        let mut result = Ok(());
 
         loop {
-            // Check if we should stop.
-            if !*running.lock().await {
-                break;
-            }
-
             let mut line = String::new();
-            let bytes_read = match reader.read_line(&mut line).await {
-                Ok(n) => n,
-                Err(e) => {
-                    error!("Error reading from stdin: {}", e);
+            // read_line() is not cancellation-safe, but the partially read line is only lost when
+            // we shut down and discard it anyway.
+            let bytes_read = tokio::select! {
+                // Biased with the signal arm first: a signal that latched while a request was
+                // being handled must win over lines already buffered on stdin, so that no new
+                // request is accepted after shutdown was requested.
+                biased;
+                _ = shutdown.recv() => {
+                    info!("Received shutdown signal");
+                    signals_seen += 1;
                     break;
                 }
+                read = reader.read_line(&mut line) => match read {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!("Error reading from stdin: {}", e);
+                        result = Err(e.into());
+                        break;
+                    }
+                },
             };
 
             if bytes_read == 0 {
@@ -126,20 +137,80 @@ impl RustAnalyzerMCPServer {
             };
 
             debug!("Received request: {}", request.method);
-            let response = self.handle_request(request).await;
-            let response_json = serde_json::to_string(&response)?;
-            writer.write_all(response_json.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+            // A shutdown signal must not wait for the request to finish: a tool call that
+            // cold-starts rust-analyzer can run for minutes.
+            let response = tokio::select! {
+                biased;
+                _ = shutdown.recv() => {
+                    info!("Received shutdown signal");
+                    signals_seen += 1;
+                    break;
+                }
+                response = self.handle_request(request) => response,
+            };
+            // Break on errors instead of returning so rust-analyzer still gets cleaned up.
+            let response_json = match serde_json::to_string(&response) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!("Failed to serialize response: {}", e);
+                    result = Err(e.into());
+                    break;
+                }
+            };
+            // Also raced against the signals: if the host stops reading stdout, a response that
+            // fills the pipe would otherwise block here forever with the signals unpolled.
+            let written = async {
+                writer.write_all(response_json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await
+            };
+            let written = tokio::select! {
+                biased;
+                _ = shutdown.recv() => {
+                    info!("Received shutdown signal");
+                    signals_seen += 1;
+                    break;
+                }
+                written = written => written,
+            };
+            if let Err(e) = written {
+                error!("Error writing to stdout: {}", e);
+                result = Err(e.into());
+                break;
+            }
         }
 
-        // Cleanup.
+        // Cleanup. client.shutdown() bounds its own graceful handshake and always ends up
+        // killing the process, so this cannot stall. A second signal — counting the one that may
+        // have triggered the exit — skips the handshake and kills rust-analyzer immediately.
         info!("Shutting down");
         if let Some(client) = &mut self.client {
-            let _ = client.shutdown().await;
+            let graceful = {
+                let shutting_down = client.shutdown();
+                tokio::pin!(shutting_down);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.recv() => {
+                            signals_seen += 1;
+                            if signals_seen >= 2 {
+                                info!("Received another shutdown signal, killing rust-analyzer");
+                                break false;
+                            }
+                        }
+                        res = &mut shutting_down => {
+                            let _ = res;
+                            break true;
+                        }
+                    }
+                }
+            };
+            if !graceful {
+                client.force_kill().await;
+            }
         }
 
-        Ok(())
+        result
     }
 
     async fn handle_request(&mut self, request: MCPRequest) -> MCPResponse {
@@ -151,7 +222,7 @@ impl RustAnalyzerMCPServer {
                     "protocolVersion": "2024-11-05",
                     "serverInfo": {
                         "name": "rust-analyzer-mcp",
-                        "version": "0.1.0"
+                        "version": env!("CARGO_PKG_VERSION")
                     },
                     "capabilities": {
                         "tools": {}
@@ -224,6 +295,75 @@ impl RustAnalyzerMCPServer {
                     data: None,
                 },
             },
+        }
+    }
+}
+
+/// Merged stream of the signals that request server shutdown.
+///
+/// SIGINT, SIGTERM and SIGHUP on Unix; Ctrl+C and console-close events on Windows. The streams
+/// are persistent, so signals delivered while no `recv()` is pending stay latched instead of
+/// falling through to the default disposition. Note that registering SIGHUP also overrides an
+/// inherited SIG_IGN disposition (e.g. from nohup), so a hangup always shuts the server down.
+struct ShutdownSignal {
+    #[cfg(unix)]
+    sigint: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    sigterm: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    sighup: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    ctrl_close: tokio::signal::windows::CtrlClose,
+}
+
+impl ShutdownSignal {
+    fn new() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            Ok(Self {
+                sigint: signal(SignalKind::interrupt())?,
+                sigterm: signal(SignalKind::terminate())?,
+                sighup: signal(SignalKind::hangup())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows;
+
+            Ok(Self {
+                ctrl_c: windows::ctrl_c()?,
+                ctrl_close: windows::ctrl_close()?,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        Ok(Self {})
+    }
+
+    /// Completes when the next shutdown signal arrives. Cancellation-safe.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.sigint.recv() => {}
+                _ = self.sigterm.recv() => {}
+                _ = self.sighup.recv() => {}
+            }
+        }
+        #[cfg(windows)]
+        {
+            tokio::select! {
+                _ = self.ctrl_c.recv() => {}
+                _ = self.ctrl_close.recv() => {}
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            // No signal support; only a stdin EOF stops the server.
+            std::future::pending::<()>().await;
         }
     }
 }

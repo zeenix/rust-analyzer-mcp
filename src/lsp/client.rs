@@ -15,7 +15,9 @@ use tokio::{
 };
 
 use crate::{
-    config::{DOCUMENT_OPEN_DELAY_MILLIS, LSP_REQUEST_TIMEOUT_SECS},
+    config::{
+        DOCUMENT_OPEN_DELAY_MILLIS, GRACEFUL_SHUTDOWN_TIMEOUT_SECS, LSP_REQUEST_TIMEOUT_SECS,
+    },
     protocol::lsp::LSPRequest,
 };
 
@@ -339,12 +341,29 @@ impl RustAnalyzerClient {
         Ok(())
     }
 
+    /// Shuts rust-analyzer down, attempting the graceful LSP handshake first.
     pub async fn shutdown(&mut self) -> Result<()> {
         if self.initialized {
-            let _ = self.send_request("shutdown", None).await;
-            let _ = self.send_notification("exit", None).await;
+            // Bound the handshake so a wedged rust-analyzer cannot stall the shutdown.
+            let handshake = async {
+                let _ = self.send_request("shutdown", None).await;
+                let _ = self.send_notification("exit", None).await;
+            };
+            let timeout = Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS);
+            if tokio::time::timeout(timeout, handshake).await.is_err() {
+                info!("Graceful shutdown timed out");
+            }
         }
 
+        self.force_kill().await;
+        Ok(())
+    }
+
+    /// Kills rust-analyzer immediately, without the LSP shutdown handshake.
+    ///
+    /// Meant for when a graceful [`Self::shutdown`] was aborted, so the process must not be left
+    /// behind.
+    pub async fn force_kill(&mut self) {
         if let Some(mut process) = self.process.take() {
             // Kill the process and wait for it to actually exit.
             let _ = process.kill().await;
@@ -355,7 +374,6 @@ impl RustAnalyzerClient {
         self.open_documents.lock().await.clear();
         self.diagnostics.lock().await.clear();
         self.initialized = false;
-        Ok(())
     }
 }
 
