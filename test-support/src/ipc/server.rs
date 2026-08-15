@@ -3,11 +3,11 @@ use serde_json::{json, Value};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixListener,
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{ChildStdin, ChildStdout, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -18,8 +18,23 @@ use std::{
 pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
     let socket_path = socket_path(project_type);
 
-    // Remove old socket if exists
-    let _ = fs::remove_file(&socket_path);
+    // Bind before the expensive rust-analyzer startup: the bound socket is what arbitrates
+    // between daemons racing to serve the same project type. Losers exit quietly, and clients'
+    // connect attempts simply queue in the backlog until the accept loop starts.
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            if UnixStream::connect(&socket_path).is_ok() {
+                // Another daemon already serves this project type.
+                return Ok(());
+            }
+            // Stale socket left behind by a dead daemon.
+            fs::remove_file(&socket_path)?;
+            UnixListener::bind(&socket_path)?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    eprintln!("MCP server listening on {:?}", socket_path);
 
     // Start rust-analyzer process
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
@@ -36,8 +51,17 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
         return Err(anyhow::anyhow!("rust-analyzer-mcp binary not found"));
     };
 
+    // Isolate cargo state per project type: several daemons (and other tests) share the same
+    // workspace, and serializing on one target-directory lock starves them into LSP timeouts on
+    // slow CI runners.
+    let isolation_dir = std::env::temp_dir().join(format!("rust-analyzer-mcp-ipc-{project_type}"));
+    fs::create_dir_all(isolation_dir.join("target"))?;
+    fs::create_dir_all(isolation_dir.join("cache"))?;
+
     let mut rust_analyzer = Command::new(&binary)
         .arg(workspace_path.to_str().unwrap())
+        .env("CARGO_TARGET_DIR", isolation_dir.join("target"))
+        .env("XDG_CACHE_HOME", isolation_dir.join("cache"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -88,17 +112,17 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
     // Wait for rust-analyzer to be ready
     wait_for_ready(&mut stdin, &mut stdout, workspace_path)?;
 
-    // Create Unix socket listener
-    let listener = UnixListener::bind(&socket_path)?;
-    eprintln!("MCP server listening on {:?}", socket_path);
-
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let request_id = Arc::new(AtomicU64::new(100)); // Start at 100 to avoid conflicts
+    let pipes = Arc::new(Mutex::new((stdin, stdout)));
+    let active_clients = Arc::new(AtomicUsize::new(0));
 
-    // Spawn idle timeout checker
+    // Spawn idle timeout checker. Only shut down while no client is connected, so a slow
+    // in-flight request or a briefly quiet client cannot get the server killed under them.
     let timeout_activity = last_activity.clone();
     let timeout_shutdown = shutdown.clone();
+    let timeout_active = active_clients.clone();
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(1));
 
@@ -107,7 +131,7 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
         }
 
         let last = timeout_activity.lock().unwrap();
-        if last.elapsed() > Duration::from_secs(15) {
+        if last.elapsed() > Duration::from_secs(15) && timeout_active.load(Ordering::SeqCst) == 0 {
             eprintln!("Server idle for 15 seconds, shutting down");
             timeout_shutdown.store(true, Ordering::SeqCst);
             break;
@@ -120,52 +144,26 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
         listener.set_nonblocking(true)?;
 
         match listener.accept() {
-            Ok((mut stream, _)) => {
+            Ok((stream, _)) => {
                 // Update last activity
                 *last_activity.lock().unwrap() = Instant::now();
 
-                // Handle client connection
-                let mut stream_reader = BufReader::new(stream.try_clone()?);
-
-                loop {
-                    let mut request_line = String::new();
-                    let bytes = stream_reader.read_line(&mut request_line)?;
-
-                    if bytes == 0 {
-                        break; // Client disconnected
+                // Handle each client on its own thread: a client keeps its connection open for
+                // as long as it lives, so serving it inline would starve every later client.
+                let pipes = Arc::clone(&pipes);
+                let last_activity = Arc::clone(&last_activity);
+                let request_id = Arc::clone(&request_id);
+                let shutdown = Arc::clone(&shutdown);
+                let active_clients = Arc::clone(&active_clients);
+                active_clients.fetch_add(1, Ordering::SeqCst);
+                thread::spawn(move || {
+                    if let Err(e) =
+                        handle_client(stream, pipes, last_activity, request_id, &shutdown)
+                    {
+                        eprintln!("Client connection error: {}", e);
                     }
-
-                    // Parse request
-                    let request: Value = serde_json::from_str(&request_line)?;
-
-                    // Forward to rust-analyzer
-                    let id = request_id.fetch_add(1, Ordering::SeqCst);
-                    let mut forward_request = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "method": request["method"],
-                    });
-
-                    if let Some(params) = request.get("params") {
-                        forward_request["params"] = params.clone();
-                    }
-
-                    let forward_str = serde_json::to_string(&forward_request)?;
-                    stdin.write_all(forward_str.as_bytes())?;
-                    stdin.write_all(b"\n")?;
-                    stdin.flush()?;
-
-                    // Read response from rust-analyzer
-                    let mut response_line = String::new();
-                    stdout.read_line(&mut response_line)?;
-
-                    // Forward response to client
-                    stream.write_all(response_line.as_bytes())?;
-                    stream.flush()?;
-
-                    // Update activity
-                    *last_activity.lock().unwrap() = Instant::now();
-                }
+                    active_clients.fetch_sub(1, Ordering::SeqCst);
+                });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // No connection, check if we should shutdown
@@ -178,12 +176,101 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
         }
     }
 
-    // Cleanup
-    let _ = rust_analyzer.kill();
+    // Cleanup. Remove the socket first so a retrying client spawns a fresh daemon instead of
+    // reaching this dying one.
     let _ = fs::remove_file(&socket_path);
+    let _ = rust_analyzer.kill();
     eprintln!("MCP server shutdown");
 
     Ok(())
+}
+
+/// Serve one client connection until it disconnects.
+fn handle_client(
+    mut stream: UnixStream,
+    pipes: Arc<Mutex<(ChildStdin, BufReader<ChildStdout>)>>,
+    last_activity: Arc<Mutex<Instant>>,
+    request_id: Arc<AtomicU64>,
+    shutdown: &AtomicBool,
+) -> Result<()> {
+    let mut stream_reader = BufReader::new(stream.try_clone()?);
+
+    loop {
+        let mut request_line = String::new();
+        let bytes = stream_reader.read_line(&mut request_line)?;
+
+        if bytes == 0 {
+            return Ok(()); // Client disconnected.
+        }
+
+        // Update last activity.
+        *last_activity.lock().unwrap() = Instant::now();
+
+        // Parse request.
+        let request: Value = serde_json::from_str(&request_line)?;
+
+        // Refuse requests the MCP server would not answer, instead of wedging the shared pipe
+        // waiting for a response that never comes.
+        if !request["method"].is_string() {
+            let error = json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": { "code": -32600, "message": "Invalid request: missing method" }
+            });
+            stream.write_all(serde_json::to_string(&error)?.as_bytes())?;
+            stream.write_all(b"\n")?;
+            stream.flush()?;
+            continue;
+        }
+
+        // Forward to rust-analyzer.
+        let id = request_id.fetch_add(1, Ordering::SeqCst);
+        let mut forward_request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": request["method"],
+        });
+
+        if let Some(params) = request.get("params") {
+            forward_request["params"] = params.clone();
+        }
+
+        let forward_str = serde_json::to_string(&forward_request)?;
+
+        // All clients share the single rust-analyzer-mcp pipe, so the request write and the
+        // response read must stay paired under one critical section.
+        let mut response_line = String::new();
+        let forwarded = {
+            let mut pipes = pipes.lock().unwrap();
+            let (stdin, stdout) = &mut *pipes;
+            stdin
+                .write_all(forward_str.as_bytes())
+                .and_then(|_| stdin.write_all(b"\n"))
+                .and_then(|_| stdin.flush())
+                .and_then(|_| stdout.read_line(&mut response_line))
+        };
+
+        // A pipe failure or EOF means the MCP server is gone; shut the whole IPC server down so
+        // it cannot linger as a zombie accepting clients it can no longer serve.
+        match forwarded {
+            Ok(0) => {
+                shutdown.store(true, Ordering::SeqCst);
+                anyhow::bail!("MCP server closed its stdout");
+            }
+            Err(e) => {
+                shutdown.store(true, Ordering::SeqCst);
+                return Err(anyhow::anyhow!("MCP server pipe error: {}", e));
+            }
+            Ok(_) => {}
+        }
+
+        // Forward response to client.
+        stream.write_all(response_line.as_bytes())?;
+        stream.flush()?;
+
+        // Update activity.
+        *last_activity.lock().unwrap() = Instant::now();
+    }
 }
 
 fn wait_for_ready(
@@ -197,7 +284,9 @@ fn wait_for_ready(
     }
 
     let start = Instant::now();
-    let timeout = Duration::from_secs(10);
+    // Cold rust-analyzer starts routinely exceed 10 seconds in CI, especially with several
+    // instances contending for the same target directory.
+    let timeout = Duration::from_secs(60);
     let mut request_id = 10;
 
     loop {

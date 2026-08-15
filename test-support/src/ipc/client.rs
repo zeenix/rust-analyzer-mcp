@@ -101,7 +101,14 @@ impl IpcClient {
 
         let binary = binary_path;
 
-        // Start the server in background
+        // Start the server in background, keeping its stderr in a log file next to the socket
+        // for post-mortem debugging. Append so racing daemon generations don't truncate each
+        // other's logs.
+        let log_path = sock_path.with_extension("log");
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
         Command::new(&binary)
             .arg("--workspace")
             .arg(workspace_path.to_str().unwrap())
@@ -109,7 +116,7 @@ impl IpcClient {
             .arg(project_type)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(log_file))
             .spawn()?;
 
         // Wait for server to start
@@ -127,9 +134,12 @@ impl IpcClient {
             }
 
             attempts += 1;
-            if attempts > 50 {
+            // The server only binds its socket once rust-analyzer is fully initialized, which
+            // can take well over 5 seconds on a cold start, so be patient.
+            if attempts > 600 {
                 return Err(anyhow::anyhow!(
-                    "Failed to connect to MCP server after starting"
+                    "Failed to connect to MCP server after starting; see {}",
+                    log_path.display()
                 ));
             }
 

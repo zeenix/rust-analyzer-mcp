@@ -1,12 +1,12 @@
 use anyhow::Result;
 use serde_json::json;
-use test_support::SharedMCPClient;
+use test_support::IpcClient;
 
 #[tokio::test]
 async fn test_shared_singleton() -> Result<()> {
     // Create two clients for the same project - use unique ID for this test
-    let client1 = SharedMCPClient::get_or_create("test-project-singleton").await?;
-    let client2 = SharedMCPClient::get_or_create("test-project-singleton").await?;
+    let mut client1 = IpcClient::get_or_create("test-project-singleton").await?;
+    let mut client2 = IpcClient::get_or_create("test-project-singleton").await?;
 
     // Both should work
     let lib_path = client1.workspace_path().join("src/lib.rs");
@@ -38,27 +38,30 @@ async fn test_shared_singleton() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 5)]
 async fn test_shared_concurrent() -> Result<()> {
     use futures::future::join_all;
 
-    // Create multiple clients concurrently - use unique ID for this test
+    // Create multiple clients concurrently - use unique ID for this test. The clients do
+    // blocking I/O, so each task needs its own worker thread to actually overlap.
     let tasks: Vec<_> = (0..5)
-        .map(|i| async move {
-            let client = SharedMCPClient::get_or_create("test-project-concurrent").await?;
-            let lib_path = client.workspace_path().join("src/lib.rs");
+        .map(|i| {
+            tokio::spawn(async move {
+                let mut client = IpcClient::get_or_create("test-project-concurrent").await?;
+                let lib_path = client.workspace_path().join("src/lib.rs");
 
-            let response = client
-                .call_tool(
-                    "rust_analyzer_symbols",
-                    json!({
-                        "file_path": lib_path.to_str().unwrap()
-                    }),
-                )
-                .await?;
+                let response = client
+                    .call_tool(
+                        "rust_analyzer_symbols",
+                        json!({
+                            "file_path": lib_path.to_str().unwrap()
+                        }),
+                    )
+                    .await?;
 
-            println!("Client {} got response", i);
-            Ok::<_, anyhow::Error>(response)
+                println!("Client {} got response", i);
+                Ok::<_, anyhow::Error>(response)
+            })
         })
         .collect();
 
@@ -66,7 +69,7 @@ async fn test_shared_concurrent() -> Result<()> {
 
     // All should succeed
     for result in results {
-        assert!(result?.get("content").is_some());
+        assert!(result??.get("content").is_some());
     }
 
     println!("✓ Concurrent access works!");
