@@ -251,6 +251,13 @@ impl RustAnalyzerMCPServer {
                     }
                 }),
             },
+            // A liveness check the client may send at any point, including before `initialize`.
+            // Its result is empty; what matters is that it comes back at all.
+            "ping" => MCPResponse::Success {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: json!({}),
+            },
             "tools/list" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
                 id: request.id,

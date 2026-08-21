@@ -44,6 +44,30 @@ async fn notifications_are_not_answered() -> Result<()> {
 }
 
 #[tokio::test]
+async fn ping_is_answered() -> Result<()> {
+    // The client's liveness check, which it may send before `initialize` and at any point after.
+    let responses = talk_to_server(&[r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#]).await?;
+
+    assert_eq!(responses.len(), 1, "got: {responses:?}");
+    assert_eq!(responses[0]["id"], 3);
+    assert_eq!(responses[0]["result"], serde_json::json!({}));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_null_id_is_not_a_request() -> Result<()> {
+    // `id: null` is a request in JSON-RPC but malformed in MCP, where the id "MUST NOT be null".
+    // Answering it would mean sending a response with an id no client can match up.
+    let responses =
+        talk_to_server(&[r#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#]).await?;
+
+    assert!(responses.is_empty(), "got: {responses:?}");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn unknown_requests_still_get_an_error() -> Result<()> {
     let responses =
         talk_to_server(&[r#"{"jsonrpc":"2.0","id":7,"method":"no/such/method"}"#]).await?;
