@@ -42,6 +42,25 @@ jobs:
         run: |
           cargo --locked clippy -- -D warnings
 
+  # The integration tests need a Unix socket and rust-analyzer, so Windows only gets the unit
+  # tests. Those cover the path and URI handling, which is what Windows gets wrong.
+  windows:
+    runs-on: windows-latest
+    needs: [fmt, clippy]
+    env:
+      RUSTFLAGS: -D warnings
+      RUST_BACKTRACE: full
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and run the unit tests
+        run: |
+          cargo --locked build
+          cargo --locked test --lib
+
   test:
     runs-on: ubuntu-latest
     needs: [fmt, clippy]

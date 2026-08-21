@@ -28,10 +28,11 @@ log = "0.4"
 futures = "0.3"
 which = "6.0"
 
-[dev-dependencies]
-# Test support library
+# The test support library, and the integration tests that use it, talk over a Unix socket.
+[target.'cfg(unix)'.dev-dependencies]
 test-support = { path = "test-support" }
 
+[dev-dependencies]
 # Core testing
 tokio-test = "0.4"
 assert_cmd = "2.0"          # For testing CLI behavior

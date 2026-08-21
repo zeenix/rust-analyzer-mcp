@@ -450,10 +450,16 @@ fn find_rust_analyzer() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Some of these stand a real process up in rust-analyzer's place, which takes shell tooling
+    // this repository only assumes on Unix.
+    #[cfg(unix)]
     use tokio::io::AsyncReadExt;
 
+    #[cfg(unix)]
     const URI: &str = "file:///tmp/lib.rs";
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn did_save_is_held_back_while_rust_analyzer_is_busy() {
         let (mut client, mut child) = client_with_fake_stdin();
@@ -466,6 +472,7 @@ mod tests {
         assert_eq!(sent.matches("textDocument/didSave").count(), 0, "{sent}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn held_back_did_save_is_sent_once_rust_analyzer_is_quiescent() {
         let (mut client, mut child) = client_with_fake_stdin();
@@ -480,6 +487,7 @@ mod tests {
         assert_eq!(sent.matches("textDocument/didSave").count(), 1, "{sent}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn did_save_follows_did_open_while_rust_analyzer_is_quiescent() {
         let (mut client, mut child) = client_with_fake_stdin();
@@ -493,6 +501,7 @@ mod tests {
         assert_eq!(sent.matches("textDocument/didSave").count(), 1, "{sent}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn exit_status_reflects_whether_rust_analyzer_is_alive() {
         let mut client = RustAnalyzerClient::new(PathBuf::from("."));
@@ -551,6 +560,7 @@ mod tests {
     /// A client whose "rust-analyzer" is a `cat` process, so that everything the client writes
     /// to its stdin can be read back from the child's stdout. Starts out non-quiescent, like a
     /// freshly started rust-analyzer.
+    #[cfg(unix)]
     fn client_with_fake_stdin() -> (RustAnalyzerClient, Child) {
         let mut child = Command::new("cat")
             .stdin(Stdio::piped())
@@ -562,11 +572,13 @@ mod tests {
         (client, child)
     }
 
+    #[cfg(unix)]
     async fn open(client: &mut RustAnalyzerClient) {
         client.open_document(URI, "fn main() {}").await.unwrap();
     }
 
     /// Closes the client's stdin and returns everything it wrote.
+    #[cfg(unix)]
     async fn written(client: &mut RustAnalyzerClient, child: &mut Child) -> String {
         client.stdin.take();
         let mut output = String::new();
