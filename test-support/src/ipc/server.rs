@@ -68,22 +68,12 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
         .env("XDG_CACHE_HOME", isolation_dir.join("cache"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Keep the MCP server's logs in this daemon's log file for post-mortem debugging.
+        .stderr(Stdio::inherit())
         .spawn()?;
 
     let mut stdin = rust_analyzer.stdin.take().unwrap();
     let mut stdout = BufReader::new(rust_analyzer.stdout.take().unwrap());
-    let stderr = rust_analyzer.stderr.take().unwrap();
-
-    // Consume stderr in background
-    thread::spawn(move || {
-        let stderr_reader = BufReader::new(stderr);
-        for line in stderr_reader.lines() {
-            if line.is_err() {
-                break;
-            }
-        }
-    });
 
     // Initialize rust-analyzer
     let request = json!({
