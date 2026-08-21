@@ -30,21 +30,9 @@ impl RustAnalyzerMCPServer {
     }
 
     pub fn with_workspace(workspace_root: PathBuf) -> Self {
-        // Ensure the workspace root is absolute.
-        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-            // If canonicalize fails, try to make it absolute.
-            if workspace_root.is_absolute() {
-                workspace_root.clone()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(&workspace_root)
-            }
-        });
-
         Self {
             client: None,
-            workspace_root,
+            workspace_root: uri::absolute(&workspace_root),
         }
     }
 
@@ -96,7 +84,7 @@ impl RustAnalyzerMCPServer {
             None => self.workspace_root.join(file_path),
         };
 
-        path.canonicalize().unwrap_or(path)
+        uri::absolute(&path)
     }
 
     /// Runs the server until its stdin reaches EOF or a shutdown signal arrives.
@@ -402,12 +390,14 @@ mod tests {
         let absolute = server.workspace_root.join("src/lib.rs");
         let uri = uri::path_to_uri(&absolute).unwrap();
 
-        assert_eq!(server.resolve_path("src/lib.rs"), absolute);
-        assert_eq!(
-            server.resolve_path(&absolute.display().to_string()),
-            absolute
-        );
-        assert_eq!(server.resolve_path(&uri), absolute);
+        for spelling in ["src/lib.rs", &absolute.display().to_string(), &uri] {
+            let resolved = server.resolve_path(spelling);
+
+            assert_eq!(resolved, absolute, "{spelling}");
+            // Equality alone would not catch the Windows extended-length form, which compares
+            // equal to the path meant while being unusable.
+            assert!(std::fs::read_to_string(&resolved).is_ok(), "{spelling}");
+        }
     }
 
     #[test]

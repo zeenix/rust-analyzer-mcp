@@ -43,16 +43,7 @@ pub struct RustAnalyzerClient {
 
 impl RustAnalyzerClient {
     pub fn new(workspace_root: PathBuf) -> Self {
-        // Ensure the workspace root is absolute.
-        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-            if workspace_root.is_absolute() {
-                workspace_root.clone()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(&workspace_root)
-            }
-        });
+        let workspace_root = uri::absolute(&workspace_root);
 
         Self {
             process: None,

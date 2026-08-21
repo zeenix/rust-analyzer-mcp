@@ -10,7 +10,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
                 },
@@ -23,7 +23,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
                 },
@@ -36,7 +36,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
                 },
@@ -49,7 +49,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
                 },
@@ -63,7 +63,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Path to the Rust file" }
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" }
                 },
                 "required": ["file_path"]
             }),
@@ -74,7 +74,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Path to the Rust file" }
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" }
                 },
                 "required": ["file_path"]
             }),
@@ -85,7 +85,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Path to the Rust file" },
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Start line number (0-based)" },
                     "character": { "type": "number", "description": "Start character position (0-based)" },
                     "end_line": { "type": "number", "description": "End line number (0-based)" },
@@ -100,7 +100,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "workspace_path": { "type": "string", "description": "Path to the workspace root" }
+                    "workspace_path": { "type": "string", "description": "Path to the workspace root: relative to the current directory, absolute, or a file:// URI" }
                 },
                 "required": ["workspace_path"]
             }),
@@ -112,7 +112,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "Path to the Rust file" }
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" }
                 },
                 "required": ["file_path"]
             }),
