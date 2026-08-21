@@ -1,7 +1,10 @@
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::{
     io::{
         AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
@@ -11,6 +14,56 @@ use tokio::{
 };
 
 use crate::{protocol::lsp::LSPResponse, uri};
+
+/// What rust-analyzer has published about each document, by normalized URI.
+pub type Diagnostics = Arc<Mutex<HashMap<String, Vec<Value>>>>;
+
+/// The cargo checks rust-analyzer has run, as reported by its progress notifications.
+///
+/// A check is the only thing that produces the diagnostics rustc gives, so knowing whether one
+/// has run since a file changed is the difference between reporting on the code as it is and
+/// reporting on the code as it was.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Flycheck {
+    /// The checks in flight, by the progress token each reports under. There can be several:
+    /// rust-analyzer runs one per workspace.
+    running: HashSet<String>,
+    /// How many checks have begun, counted so that a check started after some point in time can
+    /// be told from one that was already running.
+    started: u64,
+}
+
+impl Flycheck {
+    /// Records a check beginning under `token`.
+    pub fn begin(&mut self, token: &str) {
+        self.running.insert(token.to_string());
+        self.started += 1;
+    }
+
+    /// Records the check under `token` ending, whether it ran out or was cancelled to make way
+    /// for another.
+    pub fn end(&mut self, token: &str) {
+        self.running.remove(token);
+    }
+
+    /// Whether a check begun since `earlier` has run to completion, with none still going.
+    pub fn caught_up_with(&self, earlier: &Self) -> bool {
+        self.started > earlier.started && self.running.is_empty()
+    }
+
+    /// Whether a check has begun since `earlier`.
+    pub fn started_since(&self, earlier: &Self) -> bool {
+        self.started > earlier.started
+    }
+
+    /// Whether rust-analyzer has yet to report a single check.
+    pub fn never_ran_one(&self) -> bool {
+        self.started == 0
+    }
+}
+
+/// The progress token prefix rust-analyzer reports its cargo checks under.
+const FLYCHECK_TOKEN: &str = "rust-analyzer/flycheck/";
 
 /// The writing half of the connection to rust-analyzer.
 ///
@@ -33,29 +86,35 @@ pub async fn send_message<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// What the tasks reading rust-analyzer's output work on: everything they hand a message to,
+/// and everything they answer one with.
+pub struct Connection<W> {
+    /// The requests waiting for an answer, by the id each was sent under.
+    pub pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    /// The last diagnostics published for each document.
+    pub diagnostics: Diagnostics,
+    /// Whether rust-analyzer has any background work in flight.
+    pub quiescent: watch::Sender<bool>,
+    /// The cargo checks rust-analyzer has run.
+    pub flycheck: watch::Sender<Flycheck>,
+    /// The writing half, for answering rust-analyzer's own requests.
+    pub outgoing: Outgoing<W>,
+    /// The settings to answer rust-analyzer's configuration requests with.
+    pub settings: Value,
+}
+
 /// Spawns the tasks reading rust-analyzer's stdout and stderr, returning the stdout reader's
 /// handle: it finishes once rust-analyzer's stdout closes, i.e. once rust-analyzer is gone.
 pub fn start_handlers<W: AsyncWrite + Unpin + Send + 'static>(
     stdout: impl AsyncRead + Unpin + Send + 'static,
     stderr: impl AsyncRead + Unpin + Send + 'static,
-    pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
-    quiescent: watch::Sender<bool>,
-    outgoing: Outgoing<W>,
-    settings: Value,
+    connection: Connection<W>,
 ) -> JoinHandle<()> {
     // Log stderr in background.
     tokio::spawn(handle_stderr(stderr));
 
     // Start response handler task.
-    tokio::spawn(handle_stdout(
-        stdout,
-        pending_requests,
-        diagnostics,
-        quiescent,
-        outgoing,
-        settings,
-    ))
+    tokio::spawn(handle_stdout(stdout, connection))
 }
 
 async fn handle_stderr(stderr: impl AsyncRead + Unpin + Send + 'static) {
@@ -87,11 +146,7 @@ async fn handle_stderr(stderr: impl AsyncRead + Unpin + Send + 'static) {
 
 async fn handle_stdout<W: AsyncWrite + Unpin>(
     stdout: impl AsyncRead + Unpin + Send + 'static,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
-    quiescent: watch::Sender<bool>,
-    outgoing: Outgoing<W>,
-    settings: Value,
+    connection: Connection<W>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut buffer = String::new();
@@ -132,20 +187,12 @@ async fn handle_stdout<W: AsyncWrite + Unpin>(
         let response_str = String::from_utf8_lossy(&json_buffer);
         debug!("Received LSP message: {}", response_str);
 
-        handle_lsp_message(
-            &json_buffer,
-            &pending,
-            &diagnostics,
-            &quiescent,
-            &outgoing,
-            &settings,
-        )
-        .await;
+        handle_lsp_message(&json_buffer, &connection).await;
     }
 
     // rust-analyzer is gone, so no pending request will ever be answered: fail them now rather
     // than letting each run into the request timeout.
-    pending.lock().await.clear();
+    connection.pending_requests.lock().await.clear();
 }
 
 fn parse_content_length(header: &str) -> Option<usize> {
@@ -154,14 +201,7 @@ fn parse_content_length(header: &str) -> Option<usize> {
         .and_then(|s| s.trim().parse().ok())
 }
 
-async fn handle_lsp_message<W: AsyncWrite + Unpin>(
-    json_buffer: &[u8],
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    diagnostics: &Arc<Mutex<HashMap<String, Vec<Value>>>>,
-    quiescent: &watch::Sender<bool>,
-    outgoing: &Outgoing<W>,
-    settings: &Value,
-) {
+async fn handle_lsp_message<W: AsyncWrite + Unpin>(json_buffer: &[u8], connection: &Connection<W>) {
     let Ok(json_value) = serde_json::from_slice::<Value>(json_buffer) else {
         error!(
             "Failed to parse LSP message: {}",
@@ -178,10 +218,10 @@ async fn handle_lsp_message<W: AsyncWrite + Unpin>(
     match (json_value.get("method"), json_value.get("id")) {
         (Some(method), Some(id)) => {
             let method = method.as_str().unwrap_or_default().to_string();
-            answer_request(&method, id.clone(), &json_value, outgoing, settings).await;
+            answer_request(&method, id.clone(), &json_value, connection).await;
         }
-        (Some(_), None) => handle_notification(json_value, diagnostics, quiescent).await,
-        (None, Some(_)) => handle_response(json_value, pending).await,
+        (Some(_), None) => handle_notification(json_value, connection).await,
+        (None, Some(_)) => handle_response(json_value, &connection.pending_requests).await,
         (None, None) => debug!("Ignoring LSP message that is neither request nor response"),
     }
 }
@@ -222,8 +262,7 @@ async fn answer_request<W: AsyncWrite + Unpin>(
     method: &str,
     id: Value,
     request: &Value,
-    outgoing: &Outgoing<W>,
-    settings: &Value,
+    connection: &Connection<W>,
 ) {
     debug!("Received request from rust-analyzer: {}", method);
 
@@ -239,7 +278,7 @@ async fn answer_request<W: AsyncWrite + Unpin>(
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": vec![settings.clone(); sections],
+                "result": vec![connection.settings.clone(); sections],
             })
         }
         // A progress report is about to start under a token of rust-analyzer's choosing. There
@@ -265,16 +304,12 @@ async fn answer_request<W: AsyncWrite + Unpin>(
         }
     };
 
-    if let Err(e) = send_message(outgoing, &response).await {
+    if let Err(e) = send_message(&connection.outgoing, &response).await {
         error!("Failed to answer rust-analyzer's {} request: {}", method, e);
     }
 }
 
-async fn handle_notification(
-    json_value: Value,
-    diagnostics: &Arc<Mutex<HashMap<String, Vec<Value>>>>,
-    quiescent: &watch::Sender<bool>,
-) {
+async fn handle_notification<W: AsyncWrite + Unpin>(json_value: Value, connection: &Connection<W>) {
     let Some(method) = json_value.get("method").and_then(|m| m.as_str()) else {
         return;
     };
@@ -295,7 +330,7 @@ async fn handle_notification(
                 return;
             };
 
-            let mut diag_lock = diagnostics.lock().await;
+            let mut diag_lock = connection.diagnostics.lock().await;
             // Keyed the same way the lookups spell it, see `uri::normalize()`.
             diag_lock.insert(uri::normalize(uri), diags.clone());
             info!("Stored {} diagnostics for {}", diags.len(), uri);
@@ -313,25 +348,54 @@ async fn handle_notification(
             if let Some(message) = params.get("message").and_then(|m| m.as_str()) {
                 warn!("rust-analyzer status: {}", message);
             }
-            quiescent.send_replace(is_quiescent);
+            connection.quiescent.send_replace(is_quiescent);
+        }
+        // Progress on whatever rust-analyzer has running. The only ones worth following are the
+        // cargo checks, whose token names the workspace being checked.
+        "$/progress" => {
+            let Some(token) = params.get("token").and_then(|t| t.as_str()) else {
+                return;
+            };
+            if !token.starts_with(FLYCHECK_TOKEN) {
+                return;
+            }
+
+            match params.pointer("/value/kind").and_then(|k| k.as_str()) {
+                Some("begin") => {
+                    info!("cargo check started: {}", token);
+                    connection
+                        .flycheck
+                        .send_modify(|flycheck| flycheck.begin(token));
+                }
+                // Sent when a check finishes and when one is cancelled, which is what a restart
+                // does to the check it replaces.
+                Some("end") => {
+                    info!("cargo check finished: {}", token);
+                    connection
+                        .flycheck
+                        .send_modify(|flycheck| flycheck.end(token));
+                }
+                _ => {}
+            }
         }
         _ => {}
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::DuplexStream;
 
     #[tokio::test]
     async fn server_status_tracks_quiescence() {
-        let (quiescent, status) = watch::channel(false);
+        let (connection, _rust_analyzer) = connection();
+        let status = connection.quiescent.subscribe();
 
         notify(
             "experimental/serverStatus",
             json!({ "health": "ok", "quiescent": true }),
-            &quiescent,
+            &connection,
         )
         .await;
         assert!(*status.borrow());
@@ -339,7 +403,7 @@ mod tests {
         notify(
             "experimental/serverStatus",
             json!({ "health": "warning", "quiescent": false, "message": "Loading" }),
-            &quiescent,
+            &connection,
         )
         .await;
         assert!(!*status.borrow());
@@ -347,58 +411,108 @@ mod tests {
 
     #[tokio::test]
     async fn server_status_without_quiescent_flag_is_ignored() {
-        let (quiescent, status) = watch::channel(true);
+        let (connection, _rust_analyzer) = connection();
+        connection.quiescent.send_replace(true);
+        let status = connection.quiescent.subscribe();
+
         notify(
             "experimental/serverStatus",
             json!({ "health": "ok" }),
-            &quiescent,
+            &connection,
         )
         .await;
+
         assert!(*status.borrow());
     }
 
     #[tokio::test]
     async fn publish_diagnostics_are_stored() {
-        let (quiescent, _status) = watch::channel(false);
-        let diagnostics = notify(
+        let (connection, _rust_analyzer) = connection();
+
+        notify(
             "textDocument/publishDiagnostics",
             json!({ "uri": "file:///a.rs", "diagnostics": [{ "message": "boom" }] }),
-            &quiescent,
+            &connection,
         )
         .await;
-        assert_eq!(diagnostics.lock().await["file:///a.rs"].len(), 1);
+
+        assert_eq!(connection.diagnostics.lock().await["file:///a.rs"].len(), 1);
     }
 
     #[tokio::test]
     async fn closed_stdout_fails_pending_requests() {
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (connection, _rust_analyzer) = connection();
         let (sender, response) = oneshot::channel();
+        let pending = Arc::clone(&connection.pending_requests);
         pending.lock().await.insert(1, sender);
-        let (quiescent, _status) = watch::channel(false);
 
         // An already-closed stdout stands in for a rust-analyzer that died mid-request.
-        handle_stdout(
-            tokio::io::empty(),
-            Arc::clone(&pending),
-            Arc::new(Mutex::new(HashMap::new())),
-            quiescent,
-            Arc::new(Mutex::new(BufWriter::new(tokio::io::sink()))),
-            json!({}),
-        )
-        .await;
+        handle_stdout(tokio::io::empty(), connection).await;
 
         assert!(response.await.is_err());
         assert!(pending.lock().await.is_empty());
     }
 
     #[tokio::test]
+    async fn cargo_checks_are_followed_from_start_to_finish() {
+        let (connection, _rust_analyzer) = connection();
+        let idle = connection.flycheck.borrow().clone();
+
+        progress("rust-analyzer/flycheck/0", "begin", &connection).await;
+        assert!(connection.flycheck.borrow().started_since(&idle));
+        assert!(!connection.flycheck.borrow().caught_up_with(&idle));
+
+        // rust-analyzer runs a check per workspace, and one of them finishing is not the end of
+        // the checking.
+        progress("rust-analyzer/flycheck/1", "begin", &connection).await;
+        progress("rust-analyzer/flycheck/0", "end", &connection).await;
+        assert!(!connection.flycheck.borrow().caught_up_with(&idle));
+
+        progress("rust-analyzer/flycheck/1", "end", &connection).await;
+        assert!(connection.flycheck.borrow().caught_up_with(&idle));
+    }
+
+    #[tokio::test]
+    async fn a_check_cancelled_for_a_restart_is_not_a_check_that_ran() {
+        // Asking for a check while one is running cancels it, and a cancelled check ends the
+        // same way a finished one does. What tells them apart is that the restart begins another.
+        let (connection, _rust_analyzer) = connection();
+        progress("rust-analyzer/flycheck/0", "begin", &connection).await;
+        let when_we_asked = connection.flycheck.borrow().clone();
+
+        progress("rust-analyzer/flycheck/0", "end", &connection).await;
+        assert!(!connection.flycheck.borrow().caught_up_with(&when_we_asked));
+
+        progress("rust-analyzer/flycheck/0", "begin", &connection).await;
+        assert!(!connection.flycheck.borrow().caught_up_with(&when_we_asked));
+
+        progress("rust-analyzer/flycheck/0", "end", &connection).await;
+        assert!(connection.flycheck.borrow().caught_up_with(&when_we_asked));
+    }
+
+    #[tokio::test]
+    async fn progress_on_anything_else_is_not_a_cargo_check() {
+        let (connection, _rust_analyzer) = connection();
+
+        for token in [
+            "rustAnalyzer/cachePriming",
+            "rustAnalyzer/Fetching",
+            "rustAnalyzer/Indexing",
+        ] {
+            progress(token, "begin", &connection).await;
+            progress(token, "end", &connection).await;
+        }
+
+        assert_eq!(*connection.flycheck.borrow(), Flycheck::default());
+    }
+
+    #[tokio::test]
     async fn a_request_from_rust_analyzer_is_not_taken_for_an_answer() {
         // rust-analyzer numbers its own requests from zero, in the same space as ours, so one of
         // these landing on a pending id would answer a question nobody asked with nothing.
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let (sender, response) = oneshot::channel();
-        pending.lock().await.insert(3, sender);
-        let (outgoing, mut rust_analyzer) = outgoing();
+        let (connection, mut rust_analyzer) = connection();
+        let (sender, mut response) = oneshot::channel();
+        connection.pending_requests.lock().await.insert(3, sender);
 
         deliver(
             json!({
@@ -407,14 +521,11 @@ mod tests {
                 "method": "window/workDoneProgress/create",
                 "params": { "token": "rust-analyzer/flycheck/0" }
             }),
-            &pending,
-            &outgoing,
-            &json!({}),
+            &connection,
         )
         .await;
 
-        assert!(pending.lock().await.contains_key(&3));
-        let mut response = response;
+        assert!(connection.pending_requests.lock().await.contains_key(&3));
         assert!(response.try_recv().is_err(), "nothing may have been sent");
         let answer = framed(&mut rust_analyzer).await;
         assert_eq!(answer["id"], 3);
@@ -424,9 +535,10 @@ mod tests {
     #[tokio::test]
     async fn configuration_requests_are_answered_with_the_settings_we_asked_for() {
         // What comes back replaces the configuration rust-analyzer was started with, so a bare
-        // "no configuration here" would quietly undo the initialization options.
+        // "nothing here" would quietly undo the initialization options.
+        let (mut connection, mut rust_analyzer) = connection();
         let settings = json!({ "checkOnSave": { "enable": true } });
-        let (outgoing, mut rust_analyzer) = outgoing();
+        connection.settings = settings.clone();
 
         deliver(
             json!({
@@ -438,9 +550,7 @@ mod tests {
                     { "section": "rust-analyzer", "scopeUri": "file:///ws" }
                 ] }
             }),
-            &Arc::new(Mutex::new(HashMap::new())),
-            &outgoing,
-            &settings,
+            &connection,
         )
         .await;
 
@@ -451,15 +561,13 @@ mod tests {
 
     #[tokio::test]
     async fn requests_we_cannot_serve_are_declined_rather_than_dropped() {
-        // Left unanswered they pile up in rust-analyzer's queue of requests it is still waiting
-        // on, and it is not the client's place to decide when one no longer matters.
-        let (outgoing, mut rust_analyzer) = outgoing();
+        // Left unanswered they pile up in rust-analyzer's queue of requests it is waiting on,
+        // and it is not the client's place to decide when one no longer matters.
+        let (connection, mut rust_analyzer) = connection();
 
         deliver(
             json!({ "jsonrpc": "2.0", "id": 7, "method": "client/registerCapability" }),
-            &Arc::new(Mutex::new(HashMap::new())),
-            &outgoing,
-            &json!({}),
+            &connection,
         )
         .await;
 
@@ -470,50 +578,61 @@ mod tests {
 
     #[tokio::test]
     async fn answers_still_reach_whoever_is_waiting() {
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (connection, _rust_analyzer) = connection();
         let (sender, response) = oneshot::channel();
-        pending.lock().await.insert(1, sender);
-        let (outgoing, _rust_analyzer) = outgoing();
+        connection.pending_requests.lock().await.insert(1, sender);
 
         deliver(
             json!({ "jsonrpc": "2.0", "id": 1, "result": { "contents": "docs" } }),
-            &pending,
-            &outgoing,
-            &json!({}),
+            &connection,
         )
         .await;
 
         assert_eq!(response.await.unwrap(), json!({ "contents": "docs" }));
-        assert!(pending.lock().await.is_empty());
+        assert!(connection.pending_requests.lock().await.is_empty());
+    }
+
+    /// A connection with nothing going on yet, along with the end rust-analyzer would read from.
+    fn connection() -> (Connection<DuplexStream>, DuplexStream) {
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let connection = Connection {
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            quiescent: watch::channel(false).0,
+            flycheck: watch::channel(Flycheck::default()).0,
+            outgoing: Arc::new(Mutex::new(BufWriter::new(ours))),
+            settings: json!({}),
+        };
+
+        (connection, theirs)
     }
 
     /// Feed one message through the classifier.
-    async fn deliver(
-        message: Value,
-        pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-        outgoing: &Outgoing<tokio::io::DuplexStream>,
-        settings: &Value,
-    ) {
-        let (quiescent, _status) = watch::channel(false);
-        handle_lsp_message(
-            message.to_string().as_bytes(),
-            pending,
-            &Arc::new(Mutex::new(HashMap::new())),
-            &quiescent,
-            outgoing,
-            settings,
+    async fn deliver(message: Value, connection: &Connection<DuplexStream>) {
+        handle_lsp_message(message.to_string().as_bytes(), connection).await;
+    }
+
+    /// Feed one notification through the classifier.
+    async fn notify(method: &str, params: Value, connection: &Connection<DuplexStream>) {
+        deliver(
+            json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+            connection,
         )
         .await;
     }
 
-    /// An outgoing half of a connection, along with the end rust-analyzer would read from.
-    fn outgoing() -> (Outgoing<tokio::io::DuplexStream>, tokio::io::DuplexStream) {
-        let (ours, theirs) = tokio::io::duplex(4096);
-        (Arc::new(Mutex::new(BufWriter::new(ours))), theirs)
+    /// Feed one `$/progress` notification through the classifier.
+    async fn progress(token: &str, kind: &str, connection: &Connection<DuplexStream>) {
+        notify(
+            "$/progress",
+            json!({ "token": token, "value": { "kind": kind } }),
+            connection,
+        )
+        .await;
     }
 
     /// The next message written to the connection, unwrapped from its header.
-    async fn framed(rust_analyzer: &mut tokio::io::DuplexStream) -> Value {
+    async fn framed(rust_analyzer: &mut DuplexStream) -> Value {
         let mut buffer = vec![0u8; 4096];
         let read = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -528,17 +647,5 @@ mod tests {
         assert!(header.starts_with("Content-Length: "), "{header}");
 
         serde_json::from_str(body).unwrap()
-    }
-
-    /// Feed one notification through `handle_notification` and return the diagnostics store.
-    async fn notify(
-        method: &str,
-        params: Value,
-        quiescent: &watch::Sender<bool>,
-    ) -> Arc<Mutex<HashMap<String, Vec<Value>>>> {
-        let diagnostics = Arc::new(Mutex::new(HashMap::new()));
-        let notification = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        handle_notification(notification, &diagnostics, quiescent).await;
-        diagnostics
     }
 }

@@ -196,6 +196,10 @@ Get diagnostics (errors, warnings, hints) for a specific file.
 **Parameters:**
 - `file_path`: Path to the Rust file
 
+Runs a fresh `cargo check` and waits for it to finish, so the result describes the file as it is on
+disk rather than as it was when first looked at. If the check does not finish in time, the result
+says so in a `note` field and asking again picks up the rest.
+
 Returns diagnostics with severity levels (error, warning, hint, information), messages, and location
 ranges. Includes a summary count of diagnostics by severity.
 
