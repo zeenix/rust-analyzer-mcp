@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncWriteExt, BufWriter},
+    io::BufWriter,
     process::{Child, Command},
     sync::{oneshot, watch, Mutex},
     task::JoinHandle,
@@ -24,11 +24,13 @@ use crate::{
     uri,
 };
 
+use super::connection::{send_message, Outgoing};
+
 pub struct RustAnalyzerClient {
     pub(super) process: Option<Child>,
     pub(super) request_id: Arc<Mutex<u64>>,
     pub(super) workspace_root: PathBuf,
-    pub(super) stdin: Option<BufWriter<tokio::process::ChildStdin>>,
+    pub(super) stdin: Option<Outgoing<tokio::process::ChildStdin>>,
     pub(super) pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     pub(super) initialized: bool,
     /// What rust-analyzer was last told about each open document, keyed by normalized URI.
@@ -111,10 +113,13 @@ impl RustAnalyzerClient {
             .take()
             .ok_or_else(|| anyhow!("Failed to get stderr"))?;
 
-        self.stdin = Some(BufWriter::new(stdin));
+        let stdin = Arc::new(Mutex::new(BufWriter::new(stdin)));
+        self.stdin = Some(Arc::clone(&stdin));
 
         // Start connection handlers, with a pending-request map of their own: the reader of an
-        // earlier process fails whatever is left in its map when it finishes.
+        // earlier process fails whatever is left in its map when it finishes. It writes to
+        // rust-analyzer as well as reading from it, since rust-analyzer's own requests are its
+        // to answer.
         self.pending_requests = Arc::new(Mutex::new(HashMap::new()));
         self.reader = Some(super::connection::start_handlers(
             stdout,
@@ -122,6 +127,8 @@ impl RustAnalyzerClient {
             Arc::clone(&self.pending_requests),
             Arc::clone(&self.diagnostics),
             self.quiescent.clone(),
+            stdin,
+            settings(),
         ));
 
         self.process = Some(child);
@@ -130,18 +137,9 @@ impl RustAnalyzerClient {
         self.initialize().await?;
         self.initialized = true;
 
-        // Send workspace/didChangeConfiguration to ensure settings are applied.
-        let config_params = json!({
-            "settings": {
-                "rust-analyzer": {
-                    "checkOnSave": {
-                        "enable": true,
-                        "command": "check",
-                        "allTargets": true
-                    }
-                }
-            }
-        });
+        // Tell rust-analyzer its configuration changed. It ignores what comes with the
+        // notification and asks for the settings itself, which the reader task answers.
+        let config_params = json!({ "settings": { "rust-analyzer": settings() } });
         let _ = self
             .send_notification("workspace/didChangeConfiguration", Some(config_params))
             .await;
@@ -161,18 +159,13 @@ impl RustAnalyzerClient {
             "params": params.unwrap_or(json!({}))
         });
 
-        let content = serde_json::to_string(&notification)?;
-        let message = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
-
         info!("Sending LSP notification: {}", method);
 
-        let Some(stdin) = &mut self.stdin else {
+        let Some(stdin) = &self.stdin else {
             return Err(anyhow!("No stdin available"));
         };
 
-        stdin.write_all(message.as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
+        send_message(stdin, &notification).await
     }
 
     pub(super) async fn send_request(
@@ -192,8 +185,7 @@ impl RustAnalyzerClient {
             params: params.clone(),
         };
 
-        let content = serde_json::to_string(&request)?;
-        let message = format!("Content-Length: {}\r\n\r\n{}", content.len(), content);
+        let request = serde_json::to_value(request)?;
 
         info!("Sending LSP request: {} with params: {:?}", method, params);
 
@@ -204,18 +196,14 @@ impl RustAnalyzerClient {
         let pending_requests = self.pending_requests.clone();
         pending_requests.lock().await.insert(id, tx);
 
-        let Some(stdin) = &mut self.stdin else {
+        let Some(stdin) = &self.stdin else {
             pending_requests.lock().await.remove(&id);
             return Err(anyhow!("No stdin available"));
         };
 
-        let mut written = stdin.write_all(message.as_bytes()).await;
-        if written.is_ok() {
-            written = stdin.flush().await;
-        }
-        if let Err(e) = written {
+        if let Err(e) = send_message(stdin, &request).await {
             pending_requests.lock().await.remove(&id);
-            return Err(e.into());
+            return Err(e);
         }
 
         // Wait for response with timeout. The channel only closes unanswered when the reader
@@ -234,27 +222,7 @@ impl RustAnalyzerClient {
         let init_params = json!({
             "processId": std::process::id(),
             "rootUri": uri::path_to_uri(&self.workspace_root)?,
-            "initializationOptions": {
-                "cargo": {
-                    "buildScripts": {
-                        "enable": true
-                    }
-                },
-                "checkOnSave": {
-                    "enable": true,
-                    "command": "check",
-                    "allTargets": true
-                },
-                "diagnostics": {
-                    "enable": true,
-                    "experimental": {
-                        "enable": true
-                    }
-                },
-                "procMacro": {
-                    "enable": true
-                }
-            },
+            "initializationOptions": settings(),
             "capabilities": {
                 "textDocument": {
                     "hover": {
@@ -473,6 +441,34 @@ impl RustAnalyzerClient {
     }
 }
 
+/// The configuration rust-analyzer is asked to run with.
+///
+/// Sent once as `initializationOptions`, and handed back whenever rust-analyzer asks for its
+/// configuration -- which it does, rather than reading the notification that told it to.
+fn settings() -> Value {
+    json!({
+        "cargo": {
+            "buildScripts": {
+                "enable": true
+            }
+        },
+        "checkOnSave": {
+            "enable": true,
+            "command": "check",
+            "allTargets": true
+        },
+        "diagnostics": {
+            "enable": true,
+            "experimental": {
+                "enable": true
+            }
+        },
+        "procMacro": {
+            "enable": true
+        }
+    })
+}
+
 /// What rust-analyzer was last told about a document, so that the next thing it is told about
 /// it can follow on.
 pub(super) struct OpenDocument {
@@ -675,6 +671,8 @@ mod tests {
             Arc::clone(&client.pending_requests),
             Arc::clone(&client.diagnostics),
             client.quiescent.clone(),
+            Arc::new(Mutex::new(BufWriter::new(tokio::io::sink()))),
+            settings(),
         ));
         tokio::task::yield_now().await;
         assert!(!client.is_gone());
@@ -709,7 +707,9 @@ mod tests {
             .spawn()
             .unwrap();
         let mut client = RustAnalyzerClient::new(PathBuf::from("."));
-        client.stdin = Some(BufWriter::new(child.stdin.take().unwrap()));
+        client.stdin = Some(Arc::new(Mutex::new(BufWriter::new(
+            child.stdin.take().unwrap(),
+        ))));
         (client, child)
     }
 
