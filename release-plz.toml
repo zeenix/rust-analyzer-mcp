@@ -1,3 +1,158 @@
+# release-plz configuration
+# https://release-plz.dev/docs/config
+
 [workspace]
-# Match the repository's existing `v<version>` tags, which the release workflow triggers on.
+# Keep the existing `v<version>` tag naming convention. Release names are freeform and
+# human-readable, unlike the tags.
 git_tag_name = "v{{ version }}"
+git_release_name = "{{ package }} {{ version }}"
+
+# Enable all release features.
+git_release_enable = true
+git_tag_enable = true
+publish = true
+# We're not a library.
+semver_check = false
+
+# Bump minor version for non-bugfix commits.
+custom_minor_increment_regex = """\
+^(🎨|⚡️|🔥|✨|💄|🎉|🔒️|⬇️|⬆️|📌|➕|➖|🔧|👽️|💥|♿️|💬|🔊|🔇|🚸|🏗️|🗑️)\
+"""
+
+# PR configuration.
+pr_name = "🔖 Release {{ version }}"
+
+# Changelog configuration for gimoji-based commits.
+# See: https://zeenix.github.io/gimoji/
+[changelog]
+
+# Changelog header without the default [Unreleased] section.
+header = """# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+
+# Changelog body template.
+# Issue refs are separated by "||" delimiter so we can insert period before them.
+body = """
+
+## {{ version | trim_start_matches(pat="v") }} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}\
+{% set first_line = commit.message | split(pat="\n") | first %}\
+{% set parts = first_line | split(pat="||") %}\
+- {{ parts | first | upper_first | trim | trim_end_matches(pat=".") }}\
+{% if commit.breaking %} (**BREAKING**){% endif %}.\
+{% if parts | length > 1 %} {{ parts | last }}{% endif %}
+{% endfor %}\
+{% endfor %}\
+"""
+
+# Protect breaking change commits from being filtered out.
+protect_breaking_commits = true
+
+# Commit message preprocessors (applied in order).
+commit_preprocessors = [
+    # Filter out non-latest dependency updates (keep only most recent bump per dependency).
+    # Pattern: "⬆️ *Update <dep> to <version>" - if newer commit updates same dep, skip this.
+    # Non-latest commits are prefixed with "🔖" to trigger the release-commit skip rule.
+    { pattern = "^⬆️ +Update [^ ]+ to ", replace_command = """sh -c '
+        msg=$(cat)
+        dep=$(echo "$msg" | sed -E "s/^[^ ]+ +Update ([^ ]+) to.*/\\1/")
+        latest=$(git log --oneline --all -E --grep="Update $dep to" --format=%H 2>/dev/null \
+            | head -1)
+        if [ "$COMMIT_SHA" != "$latest" ]; then printf "🔖"; else printf "%s" "$msg"; fi
+    '""" },
+    # Remove optional package/mod prefix (e.g., "lsp: ") but keep gimoji emojis.
+    # Matches emoji(s) at start, then "word(s): " prefix pattern.
+    { pattern = "^([^\\p{L}\\p{N}\\s]+) [\\w, -]+: ", replace = "$1 " },
+    # Extract issue refs from commit body using $COMMIT_SHA.
+    # Matches: "Fixes #123", "Closes issue #123", "Resolves bug #123", etc.
+    # Appends issue ref with "||" delimiter so template can insert period before it.
+    { pattern = ".*", replace_command = """sh -c '
+        title=$(cat)
+        ref=$(git log -1 --format=%b $COMMIT_SHA 2>/dev/null \
+            | grep -oE "(Fixes|Closes|Resolves).*#[0-9]+" | grep -oE "#[0-9]+" | head -1)
+        if [ -n "$ref" ]; then printf "%s||%s\\n" "$title" "$ref"
+        else printf "%s\\n" "$title"; fi
+    '""" },
+    # Replace the message of commits carrying a "Changelog: skip" git trailer with a sentinel
+    # that the first commit parser below drops (e.g. AI-workflow design docs and plans).
+    { pattern = ".*", replace_command = '''sh -c '
+        title=$(cat)
+        if git log -1 --format="%(trailers:key=Changelog,valueonly)" $COMMIT_SHA 2>/dev/null \
+            | grep -qix skip
+        then
+            echo changelog-skip
+        else
+            printf "%s\n" "$title"
+        fi
+    '
+    ''' },
+]
+
+# Categorize commits based on gimoji emojis.
+# See: https://zeenix.github.io/gimoji/
+commit_parsers = [
+    # Skip commits carrying a "Changelog: skip" trailer (see the preprocessor above).
+    { message = "^changelog-skip$", skip = true },
+    # Skip merge commits, release commits, and empty commits (just emojis).
+    { message = "^[Mm]erge", skip = true },
+    { message = "^🔖", skip = true },
+    { message = "^[\\p{Emoji}\\p{Emoji_Presentation}\\p{Extended_Pictographic}]+$", skip = true },
+
+    # Features.
+    { message = "^✨", group = "Added" },
+    { message = "^🎉", group = "Added" },
+
+    # Bug fixes.
+    { message = "^🐛", group = "Fixed" },
+    { message = "^🚑", group = "Fixed" },
+    { message = "^🩹", group = "Fixed" },
+    { message = "^🥅", group = "Fixed" },
+
+    # Performance.
+    { message = "^⚡", group = "Performance" },
+
+    # Documentation.
+    { message = "^📝", group = "Documentation" },
+    { message = "^💡", group = "Documentation" },
+
+    # Refactoring/changes.
+    { message = "^♻️", group = "Changed" },
+    { message = "^🎨", group = "Changed" },
+    { message = "^🚚", group = "Changed" },
+    { message = "^🔧", group = "Changed" },
+    { message = "^🏗️", group = "Changed" },
+    { message = "^💄", group = "Changed" },
+
+    # Breaking changes/removals.
+    { message = "^💥", group = "Breaking" },
+    { message = "^🔥", group = "Removed" },
+    { message = "^🗑️", group = "Deprecated" },
+
+    # Dependencies.
+    { message = "^➕", group = "Dependencies" },
+    { message = "^➖", group = "Dependencies" },
+    { message = "^📌", group = "Dependencies" },
+    { message = "^⬆️", group = "Dependencies" },
+    { message = "^⬇️", group = "Dependencies" },
+
+    # Security.
+    { message = "^🔒", group = "Security" },
+
+    # Testing.
+    { message = "^✅", group = "Testing" },
+    { message = "^🧪", group = "Testing" },
+
+    # CI/Build.
+    { message = "^👷", group = "CI" },
+    { message = "^💚", group = "CI" },
+
+    # Everything else.
+    { message = ".*", group = "Other" },
+]
