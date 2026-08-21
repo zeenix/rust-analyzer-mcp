@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use crate::{
     lsp::RustAnalyzerClient,
     protocol::mcp::{MCPError, MCPRequest, MCPResponse},
+    uri,
 };
 
 pub struct RustAnalyzerMCPServer {
@@ -70,15 +71,11 @@ impl RustAnalyzerMCPServer {
     }
 
     pub(super) async fn open_document_if_needed(&mut self, file_path: &str) -> Result<String> {
-        let absolute_path = self.workspace_root.join(file_path);
-        // Ensure we have an absolute path for the URI.
-        let absolute_path = absolute_path
-            .canonicalize()
-            .unwrap_or_else(|_| absolute_path.clone());
-        let uri = format!("file://{}", absolute_path.display());
-        let content = tokio::fs::read_to_string(&absolute_path)
+        let path = self.resolve_path(file_path);
+        let uri = uri::path_to_uri(&path)?;
+        let content = tokio::fs::read_to_string(&path)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", path.display(), e))?;
 
         let Some(client) = &mut self.client else {
             return Err(anyhow::anyhow!("Client not initialized"));
@@ -86,6 +83,20 @@ impl RustAnalyzerMCPServer {
 
         client.open_document(&uri, &content).await?;
         Ok(uri)
+    }
+
+    /// The file a tool call's `file_path` argument names.
+    ///
+    /// Clients spell that argument every way they have one to hand: relative to the workspace
+    /// root, absolute, or as the `file:` URI our own results are full of.
+    pub(super) fn resolve_path(&self, file_path: &str) -> PathBuf {
+        let path = match uri::uri_to_path(file_path) {
+            Some(path) => path,
+            // Joining an absolute path onto the root yields that path, so this covers both.
+            None => self.workspace_root.join(file_path),
+        };
+
+        path.canonicalize().unwrap_or(path)
     }
 
     /// Runs the server until its stdin reaches EOF or a shutdown signal arrives.
@@ -378,5 +389,38 @@ impl ShutdownSignal {
             // No signal support; only a stdin EOF stops the server.
             std::future::pending::<()>().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_paths_are_resolved_however_they_are_spelled() {
+        let server = RustAnalyzerMCPServer::with_workspace(workspace());
+        let absolute = server.workspace_root.join("src/lib.rs");
+        let uri = uri::path_to_uri(&absolute).unwrap();
+
+        assert_eq!(server.resolve_path("src/lib.rs"), absolute);
+        assert_eq!(
+            server.resolve_path(&absolute.display().to_string()),
+            absolute
+        );
+        assert_eq!(server.resolve_path(&uri), absolute);
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_still_resolves() {
+        // Nothing to canonicalize against, but the error belongs to whoever reads the file.
+        let server = RustAnalyzerMCPServer::with_workspace(workspace());
+        let missing = server.workspace_root.join("src/nowhere.rs");
+
+        assert_eq!(server.resolve_path("src/nowhere.rs"), missing);
+    }
+
+    /// A real directory, so that `canonicalize()` has something to work with.
+    fn workspace() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-project")
     }
 }

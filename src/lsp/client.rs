@@ -20,6 +20,7 @@ use crate::{
         DOCUMENT_OPEN_DELAY_MILLIS, GRACEFUL_SHUTDOWN_TIMEOUT_SECS, LSP_REQUEST_TIMEOUT_SECS,
     },
     protocol::lsp::LSPRequest,
+    uri,
 };
 
 pub struct RustAnalyzerClient {
@@ -239,7 +240,7 @@ impl RustAnalyzerClient {
     async fn initialize(&mut self) -> Result<()> {
         let init_params = json!({
             "processId": std::process::id(),
-            "rootUri": format!("file://{}", self.workspace_root.display()),
+            "rootUri": uri::path_to_uri(&self.workspace_root)?,
             "initializationOptions": {
                 "cargo": {
                     "buildScripts": {
@@ -364,7 +365,7 @@ impl RustAnalyzerClient {
 
         // Drop the diagnostics stored so far, so that what gets reported next comes from the cargo
         // check this didSave triggers rather than from before it.
-        self.diagnostics.lock().await.remove(uri);
+        self.diagnostics.lock().await.remove(&uri::normalize(uri));
         let save_params = json!({
             "textDocument": {
                 "uri": uri

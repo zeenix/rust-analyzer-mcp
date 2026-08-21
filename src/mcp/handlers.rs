@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::{
     diagnostics::format_diagnostics,
     protocol::mcp::{ContentItem, ToolResult},
+    uri,
 };
 
 use super::server::RustAnalyzerMCPServer;
@@ -226,7 +227,7 @@ async fn handle_set_workspace(
     server.client = None;
 
     // Set new workspace with proper absolute path handling.
-    let workspace_root = PathBuf::from(workspace_path);
+    let workspace_root = uri::uri_to_path(workspace_path).unwrap_or_else(|| workspace_path.into());
     server.workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
         if workspace_root.is_absolute() {
             workspace_root.clone()

@@ -99,6 +99,27 @@ async fn test_all_lsp_tools() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_file_uri_is_accepted_as_a_path() -> Result<()> {
+    // Clients hand tools the URIs they read out of earlier results, so a `file:` URI has to name
+    // the same file a path does. It used to be passed to the filesystem verbatim.
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let lib_path = client.workspace_path().join("src/lib.rs");
+    let uri = format!("file://{}", lib_path.display());
+
+    let response = client
+        .call_tool("rust_analyzer_symbols", json!({ "file_path": uri }))
+        .await?;
+
+    let text = response["content"][0]["text"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No text in symbols response: {response}"))?;
+    let symbols: Vec<Value> = serde_json::from_str(text)?;
+    assert!(!symbols.is_empty(), "Should have symbols in lib.rs: {text}");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_workspace_change() -> Result<()> {
     let mut client = IpcClient::get_or_create("test-project").await?;
 

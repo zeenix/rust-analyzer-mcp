@@ -3,6 +3,7 @@ use log::info;
 use serde_json::{json, Value};
 
 use super::client::RustAnalyzerClient;
+use crate::uri;
 
 impl RustAnalyzerClient {
     pub async fn hover(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
@@ -69,13 +70,14 @@ impl RustAnalyzerClient {
 
     pub async fn diagnostics(&mut self, uri: &str) -> Result<Value> {
         // First check if we have stored diagnostics from publishDiagnostics.
+        let key = uri::normalize(uri);
         let diag_lock = self.diagnostics.lock().await;
-        info!("Looking for diagnostics for URI: {}", uri);
+        info!("Looking for diagnostics for URI: {}", key);
         info!(
             "Available URIs with diagnostics: {:?}",
             diag_lock.keys().collect::<Vec<_>>()
         );
-        if let Some(diags) = diag_lock.get(uri) {
+        if let Some(diags) = diag_lock.get(&key) {
             info!("Found {} stored diagnostics for {}", diags.len(), uri);
             return Ok(json!(diags));
         }
