@@ -59,3 +59,13 @@ jobs:
       - name: Build and Test
         run: |
           cargo test --locked --workspace --release --all-features
+      # The test daemons log to these files, rust-analyzer's own stderr included; they are the
+      # only trace of why a daemon's rust-analyzer died.
+      - name: Upload the test daemons' logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-daemon-logs
+          path: /tmp/rust-analyzer-mcp-sockets/*.log*
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use serde_json::json;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -48,6 +48,19 @@ impl RustAnalyzerMCPServer {
     }
 
     pub(super) async fn ensure_client_started(&mut self) -> Result<()> {
+        // rust-analyzer does die on occasion (it panics on some requests, see open_document());
+        // keeping a dead client around would fail every tool call for the rest of this server's
+        // life, so respawn it instead.
+        if let Some(client) = &mut self.client {
+            if client.is_gone() {
+                match client.exit_status() {
+                    Some(status) => warn!("rust-analyzer exited ({status}), restarting it"),
+                    None => warn!("rust-analyzer closed its connection, restarting it"),
+                }
+                self.client = None;
+            }
+        }
+
         if self.client.is_none() {
             let mut client = RustAnalyzerClient::new(self.workspace_root.clone());
             client.start().await?;

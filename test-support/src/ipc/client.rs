@@ -15,6 +15,9 @@ use super::server::socket_path;
 /// Maximum attempts for a tool call whose previous attempts failed on a transient timeout.
 const TOOL_CALL_ATTEMPTS: u32 = 3;
 
+/// Size past which a daemon's log file is rotated before launching another daemon.
+const MAX_DAEMON_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Client that connects to the IPC MCP server
 pub struct IpcClient {
     stream: UnixStream,
@@ -112,8 +115,12 @@ impl IpcClient {
 
         // Start the server in background, keeping its stderr in a log file next to the socket
         // for post-mortem debugging. Append so racing daemon generations don't truncate each
-        // other's logs.
+        // other's logs, but rotate once the file has grown large: the MCP server's own logs land
+        // in it too, and nothing else ever trims it.
         let log_path = sock_path.with_extension("log");
+        if std::fs::metadata(&log_path).is_ok_and(|meta| meta.len() > MAX_DAEMON_LOG_BYTES) {
+            std::fs::rename(&log_path, log_path.with_extension("log.old"))?;
+        }
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

@@ -4,14 +4,15 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
     io::{AsyncWriteExt, BufWriter},
     process::{Child, Command},
-    sync::{oneshot, Mutex},
+    sync::{oneshot, watch, Mutex},
+    task::JoinHandle,
 };
 
 use crate::{
@@ -30,6 +31,13 @@ pub struct RustAnalyzerClient {
     pub(super) initialized: bool,
     pub(super) open_documents: Arc<Mutex<HashSet<String>>>,
     pub(super) diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    /// Whether rust-analyzer last reported itself quiescent, i.e. with no background work such
+    /// as loading the workspace in flight. Fed by its `experimental/serverStatus` notifications.
+    pub(super) quiescent: watch::Sender<bool>,
+    /// Open documents whose `didSave` has been sent, see [`Self::open_document`].
+    pub(super) saved_documents: HashSet<String>,
+    /// The task reading rust-analyzer's stdout; it finishing means rust-analyzer is gone.
+    pub(super) reader: Option<JoinHandle<()>>,
 }
 
 impl RustAnalyzerClient {
@@ -54,6 +62,9 @@ impl RustAnalyzerClient {
             initialized: false,
             open_documents: Arc::new(Mutex::new(HashSet::new())),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
+            quiescent: watch::channel(false).0,
+            saved_documents: HashSet::new(),
+            reader: None,
         }
     }
 
@@ -74,7 +85,9 @@ impl RustAnalyzerClient {
         cmd.current_dir(&self.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // So that a start failing halfway cannot leave an orphaned rust-analyzer behind.
+            .kill_on_drop(true);
 
         // Pass through isolation environment variables if they're set.
         if let Ok(cache_home) = std::env::var("XDG_CACHE_HOME") {
@@ -106,13 +119,16 @@ impl RustAnalyzerClient {
 
         self.stdin = Some(BufWriter::new(stdin));
 
-        // Start connection handlers.
-        super::connection::start_handlers(
+        // Start connection handlers, with a pending-request map of their own: the reader of an
+        // earlier process fails whatever is left in its map when it finishes.
+        self.pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        self.reader = Some(super::connection::start_handlers(
             stdout,
             stderr,
             Arc::clone(&self.pending_requests),
             Arc::clone(&self.diagnostics),
-        );
+            self.quiescent.clone(),
+        ));
 
         self.process = Some(child);
 
@@ -208,9 +224,10 @@ impl RustAnalyzerClient {
             return Err(e.into());
         }
 
-        // Wait for response with timeout.
+        // Wait for response with timeout. The channel only closes unanswered when the reader
+        // task gave up on rust-analyzer's stdout, i.e. rust-analyzer is gone.
         match tokio::time::timeout(Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS), rx).await {
-            Ok(response) => response.map_err(|_| anyhow!("Request cancelled")),
+            Ok(response) => response.map_err(|_| anyhow!("rust-analyzer exited before responding")),
             Err(_) => {
                 // Unregister so an abandoned request cannot leak its pending entry.
                 pending_requests.lock().await.remove(&id);
@@ -289,6 +306,11 @@ impl RustAnalyzerClient {
                     "didChangeConfiguration": {
                         "dynamicRegistration": false
                     }
+                },
+                // Opt into `experimental/serverStatus` notifications, which report whether
+                // rust-analyzer is quiescent.
+                "experimental": {
+                    "serverStatusNotification": true
                 }
             }
         });
@@ -306,41 +328,43 @@ impl RustAnalyzerClient {
     }
 
     pub async fn open_document(&mut self, uri: &str, content: &str) -> Result<()> {
-        // Check if document is already open.
-        {
-            let open_docs = self.open_documents.lock().await;
-            if open_docs.contains(uri) {
-                info!("Document already open: {}", uri);
-                return Ok(());
-            }
+        let already_open = self.open_documents.lock().await.contains(uri);
+        if already_open {
+            info!("Document already open: {}", uri);
+        } else {
+            info!("Opening document: {}", uri);
+            let params = json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": content
+                }
+            });
+            self.send_notification("textDocument/didOpen", Some(params))
+                .await?;
+
+            self.open_documents.lock().await.insert(uri.to_string());
         }
 
-        // Clear any existing diagnostics for this URI to ensure fresh data.
-        {
-            let mut diag_lock = self.diagnostics.lock().await;
-            diag_lock.remove(uri);
+        // A didSave makes rust-analyzer run cargo check for the document's package. It has to
+        // wait until rust-analyzer is quiescent, though: during a workspace load the freshly
+        // opened document has no source root yet, and rust-analyzer's didSave handler then panics
+        // and takes the whole process down (seen with 1.97 and 1.98). So hold it back while busy
+        // and send it on the document's next use instead; in the meantime the workspace-wide
+        // cargo check rust-analyzer runs on its own once quiescent covers the document anyway.
+        // The flag is only a snapshot, so this narrows the window rather than closing it.
+        if self.saved_documents.contains(uri) {
+            return Ok(());
+        }
+        if !*self.quiescent.borrow() {
+            info!("rust-analyzer is busy, holding back didSave for {}", uri);
+            return Ok(());
         }
 
-        info!("Opening document: {}", uri);
-        let params = json!({
-            "textDocument": {
-                "uri": uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": content
-            }
-        });
-
-        self.send_notification("textDocument/didOpen", Some(params.clone()))
-            .await?;
-
-        // Mark document as open.
-        {
-            let mut open_docs = self.open_documents.lock().await;
-            open_docs.insert(uri.to_string());
-        }
-
-        // Send didSave to trigger cargo check.
+        // Drop the diagnostics stored so far, so that what gets reported next comes from the cargo
+        // check this didSave triggers rather than from before it.
+        self.diagnostics.lock().await.remove(uri);
         let save_params = json!({
             "textDocument": {
                 "uri": uri
@@ -348,8 +372,9 @@ impl RustAnalyzerClient {
         });
         self.send_notification("textDocument/didSave", Some(save_params))
             .await?;
+        self.saved_documents.insert(uri.to_string());
 
-        // Give rust-analyzer time to process the document and run cargo check.
+        // Give rust-analyzer time to get cargo check going.
         tokio::time::sleep(Duration::from_millis(DOCUMENT_OPEN_DELAY_MILLIS)).await;
 
         Ok(())
@@ -386,8 +411,19 @@ impl RustAnalyzerClient {
 
         // Clear open documents and diagnostics.
         self.open_documents.lock().await.clear();
+        self.saved_documents.clear();
         self.diagnostics.lock().await.clear();
         self.initialized = false;
+    }
+
+    /// Whether rust-analyzer is gone, i.e. its stdout has closed because it exited or is about to.
+    pub fn is_gone(&self) -> bool {
+        self.reader.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    /// The exit status of the rust-analyzer process, if it has exited.
+    pub fn exit_status(&mut self) -> Option<ExitStatus> {
+        self.process.as_mut()?.try_wait().ok().flatten()
     }
 }
 
@@ -408,4 +444,139 @@ fn find_rust_analyzer() -> Result<PathBuf> {
             e
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    const URI: &str = "file:///tmp/lib.rs";
+
+    #[tokio::test]
+    async fn did_save_is_held_back_while_rust_analyzer_is_busy() {
+        let (mut client, mut child) = client_with_fake_stdin();
+
+        open(&mut client).await;
+        open(&mut client).await;
+
+        let sent = written(&mut client, &mut child).await;
+        assert_eq!(sent.matches("textDocument/didOpen").count(), 1, "{sent}");
+        assert_eq!(sent.matches("textDocument/didSave").count(), 0, "{sent}");
+    }
+
+    #[tokio::test]
+    async fn held_back_did_save_is_sent_once_rust_analyzer_is_quiescent() {
+        let (mut client, mut child) = client_with_fake_stdin();
+
+        open(&mut client).await;
+        client.quiescent.send_replace(true);
+        open(&mut client).await;
+        open(&mut client).await;
+
+        let sent = written(&mut client, &mut child).await;
+        assert_eq!(sent.matches("textDocument/didOpen").count(), 1, "{sent}");
+        assert_eq!(sent.matches("textDocument/didSave").count(), 1, "{sent}");
+    }
+
+    #[tokio::test]
+    async fn did_save_follows_did_open_while_rust_analyzer_is_quiescent() {
+        let (mut client, mut child) = client_with_fake_stdin();
+        client.quiescent.send_replace(true);
+
+        open(&mut client).await;
+        open(&mut client).await;
+
+        let sent = written(&mut client, &mut child).await;
+        assert_eq!(sent.matches("textDocument/didOpen").count(), 1, "{sent}");
+        assert_eq!(sent.matches("textDocument/didSave").count(), 1, "{sent}");
+    }
+
+    #[tokio::test]
+    async fn exit_status_reflects_whether_rust_analyzer_is_alive() {
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        // The shell lives until its stdin closes, then exits with 3.
+        let mut child = Command::new("sh")
+            .args(["-c", "read _; exit 3"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        client.process = Some(child);
+
+        assert!(client.exit_status().is_none());
+
+        drop(stdin);
+        client.process.as_mut().unwrap().wait().await.unwrap();
+        assert_eq!(
+            client.exit_status().and_then(|status| status.code()),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn is_gone_once_rust_analyzer_closes_its_stdout() {
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        let (stdout, rust_analyzer) = tokio::io::duplex(64);
+        client.reader = Some(super::super::connection::start_handlers(
+            stdout,
+            tokio::io::empty(),
+            Arc::clone(&client.pending_requests),
+            Arc::clone(&client.diagnostics),
+            client.quiescent.clone(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(!client.is_gone());
+
+        drop(rust_analyzer);
+        tokio::time::timeout(Duration::from_secs(5), client.reader.as_mut().unwrap())
+            .await
+            .expect("reader must finish once stdout closes")
+            .unwrap();
+        assert!(client.is_gone());
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostics_fails_once_rust_analyzer_is_gone() {
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        let mut reader = tokio::spawn(async {});
+        (&mut reader).await.unwrap();
+        client.reader = Some(reader);
+
+        // Must not fall back to an empty, i.e. clean-looking, report.
+        assert!(client.workspace_diagnostics().await.is_err());
+    }
+
+    /// A client whose "rust-analyzer" is a `cat` process, so that everything the client writes
+    /// to its stdin can be read back from the child's stdout. Starts out non-quiescent, like a
+    /// freshly started rust-analyzer.
+    fn client_with_fake_stdin() -> (RustAnalyzerClient, Child) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        client.stdin = Some(BufWriter::new(child.stdin.take().unwrap()));
+        (client, child)
+    }
+
+    async fn open(client: &mut RustAnalyzerClient) {
+        client.open_document(URI, "fn main() {}").await.unwrap();
+    }
+
+    /// Closes the client's stdin and returns everything it wrote.
+    async fn written(client: &mut RustAnalyzerClient, child: &mut Child) -> String {
+        client.stdin.take();
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .await
+            .unwrap();
+        child.wait().await.unwrap();
+        output
+    }
 }
