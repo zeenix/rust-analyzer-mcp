@@ -1,9 +1,9 @@
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-    sync::{oneshot, Mutex},
+    sync::{oneshot, watch, Mutex},
 };
 
 use crate::protocol::lsp::LSPResponse;
@@ -13,12 +13,18 @@ pub fn start_handlers(
     stderr: tokio::process::ChildStderr,
     pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    quiescent: watch::Sender<bool>,
 ) {
     // Log stderr in background.
     tokio::spawn(handle_stderr(stderr));
 
     // Start response handler task.
-    tokio::spawn(handle_stdout(stdout, pending_requests, diagnostics));
+    tokio::spawn(handle_stdout(
+        stdout,
+        pending_requests,
+        diagnostics,
+        quiescent,
+    ));
 }
 
 async fn handle_stderr(stderr: tokio::process::ChildStderr) {
@@ -52,6 +58,7 @@ async fn handle_stdout(
     stdout: tokio::process::ChildStdout,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    quiescent: watch::Sender<bool>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut buffer = String::new();
@@ -92,7 +99,7 @@ async fn handle_stdout(
         let response_str = String::from_utf8_lossy(&json_buffer);
         debug!("Received LSP message: {}", response_str);
 
-        handle_lsp_message(&json_buffer, &pending, &diagnostics).await;
+        handle_lsp_message(&json_buffer, &pending, &diagnostics, &quiescent).await;
     }
 }
 
@@ -106,6 +113,7 @@ async fn handle_lsp_message(
     json_buffer: &[u8],
     pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     diagnostics: &Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    quiescent: &watch::Sender<bool>,
 ) {
     let Ok(json_value) = serde_json::from_slice::<Value>(json_buffer) else {
         error!(
@@ -117,7 +125,7 @@ async fn handle_lsp_message(
 
     // Check if it's a notification (has method but no id).
     if json_value.get("method").is_some() && json_value.get("id").is_none() {
-        handle_notification(json_value, diagnostics).await;
+        handle_notification(json_value, diagnostics, quiescent).await;
         return;
     }
 
@@ -148,6 +156,7 @@ async fn handle_lsp_message(
 async fn handle_notification(
     json_value: Value,
     diagnostics: &Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    quiescent: &watch::Sender<bool>,
 ) {
     let Some(method) = json_value.get("method").and_then(|m| m.as_str()) else {
         return;
@@ -155,23 +164,102 @@ async fn handle_notification(
 
     debug!("Received notification: {}", method);
 
-    if method != "textDocument/publishDiagnostics" {
-        return;
-    }
-
     let Some(params) = json_value.get("params") else {
         return;
     };
 
-    let Some(uri) = params.get("uri").and_then(|u| u.as_str()) else {
-        return;
-    };
+    match method {
+        "textDocument/publishDiagnostics" => {
+            let Some(uri) = params.get("uri").and_then(|u| u.as_str()) else {
+                return;
+            };
 
-    let Some(diags) = params.get("diagnostics").and_then(|d| d.as_array()) else {
-        return;
-    };
+            let Some(diags) = params.get("diagnostics").and_then(|d| d.as_array()) else {
+                return;
+            };
 
-    let mut diag_lock = diagnostics.lock().await;
-    diag_lock.insert(uri.to_string(), diags.clone());
-    info!("Stored {} diagnostics for {}", diags.len(), uri);
+            let mut diag_lock = diagnostics.lock().await;
+            diag_lock.insert(uri.to_string(), diags.clone());
+            info!("Stored {} diagnostics for {}", diags.len(), uri);
+        }
+        // rust-analyzer's status report, opted into through the `serverStatusNotification`
+        // client capability. `quiescent` is false while it has background work in flight, such
+        // as loading the workspace.
+        "experimental/serverStatus" => {
+            let Some(is_quiescent) = params.get("quiescent").and_then(|q| q.as_bool()) else {
+                return;
+            };
+
+            info!("rust-analyzer reports quiescent: {}", is_quiescent);
+            // Only a degraded status comes with a message, so it is always worth surfacing.
+            if let Some(message) = params.get("message").and_then(|m| m.as_str()) {
+                warn!("rust-analyzer status: {}", message);
+            }
+            quiescent.send_replace(is_quiescent);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn server_status_tracks_quiescence() {
+        let (quiescent, status) = watch::channel(false);
+
+        notify(
+            "experimental/serverStatus",
+            json!({ "health": "ok", "quiescent": true }),
+            &quiescent,
+        )
+        .await;
+        assert!(*status.borrow());
+
+        notify(
+            "experimental/serverStatus",
+            json!({ "health": "warning", "quiescent": false, "message": "Loading" }),
+            &quiescent,
+        )
+        .await;
+        assert!(!*status.borrow());
+    }
+
+    #[tokio::test]
+    async fn server_status_without_quiescent_flag_is_ignored() {
+        let (quiescent, status) = watch::channel(true);
+        notify(
+            "experimental/serverStatus",
+            json!({ "health": "ok" }),
+            &quiescent,
+        )
+        .await;
+        assert!(*status.borrow());
+    }
+
+    #[tokio::test]
+    async fn publish_diagnostics_are_stored() {
+        let (quiescent, _status) = watch::channel(false);
+        let diagnostics = notify(
+            "textDocument/publishDiagnostics",
+            json!({ "uri": "file:///a.rs", "diagnostics": [{ "message": "boom" }] }),
+            &quiescent,
+        )
+        .await;
+        assert_eq!(diagnostics.lock().await["file:///a.rs"].len(), 1);
+    }
+
+    /// Feed one notification through `handle_notification` and return the diagnostics store.
+    async fn notify(
+        method: &str,
+        params: Value,
+        quiescent: &watch::Sender<bool>,
+    ) -> Arc<Mutex<HashMap<String, Vec<Value>>>> {
+        let diagnostics = Arc::new(Mutex::new(HashMap::new()));
+        let notification = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        handle_notification(notification, &diagnostics, quiescent).await;
+        diagnostics
+    }
 }
