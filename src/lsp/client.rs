@@ -187,11 +187,35 @@ impl RustAnalyzerClient {
         send_message(stdin, &notification).await
     }
 
+    /// Asks rust-analyzer something and waits for its answer.
+    ///
+    /// A request whose analysis is superseded while rust-analyzer is working on it comes back
+    /// refused rather than answered -- that is what "content modified" means -- and every
+    /// notification this server sends can do that to a request in flight. It means ask again.
     pub(super) async fn send_request(
         &mut self,
         method: &str,
         params: Option<Value>,
     ) -> Result<Value> {
+        for attempt in 1..REQUEST_ATTEMPTS {
+            let answer = self.send_request_once(method, params.clone()).await;
+            let Err(e) = &answer else {
+                return answer;
+            };
+            if !superseded(e) {
+                return answer;
+            }
+
+            info!(
+                "Asking rust-analyzer for {} again ({}): {}",
+                method, attempt, e
+            );
+        }
+
+        self.send_request_once(method, params).await
+    }
+
+    async fn send_request_once(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
         let mut request_id_lock = self.request_id.lock().await;
         let id = *request_id_lock;
         *request_id_lock += 1;
@@ -282,12 +306,28 @@ impl RustAnalyzerClient {
                             "valueSet": [1, 2]
                         }
                     },
-                    "formatting": {}
+                    "formatting": {},
+                    "rename": {
+                        "dynamicRegistration": false,
+                        "prepareSupport": true
+                    }
                 },
                 "workspace": {
                     "didChangeConfiguration": {
                         "dynamicRegistration": false
+                    },
+                    // Renaming a module renames its file, which rust-analyzer refuses to work
+                    // out at all for a client that has not said it understands file operations.
+                    "workspaceEdit": {
+                        "documentChanges": true,
+                        "resourceOperations": ["create", "rename", "delete"],
+                        "failureHandling": "abort"
                     }
+                },
+                // The default, stated outright because every position in every result is counted
+                // this way and the tools say so.
+                "general": {
+                    "positionEncodings": ["utf-16"]
                 },
                 // Opt into the progress reports rust-analyzer gives on its background work,
                 // the cargo checks above all. It stays silent about all of it otherwise.
@@ -419,6 +459,32 @@ impl RustAnalyzerClient {
         Ok(())
     }
 
+    /// Tells rust-analyzer to stop taking this document's content from us.
+    ///
+    /// What is on disk becomes the truth about it again, which for a file that is no longer
+    /// there means it stops existing rather than lingering in rust-analyzer as it last was.
+    pub async fn close_document(&mut self, uri: &str) -> Result<()> {
+        let key = uri::normalize(uri);
+        if self.open_documents.lock().await.remove(&key).is_none() {
+            return Ok(());
+        }
+
+        info!("Closing document: {}", uri);
+        let params = json!({ "textDocument": { "uri": uri } });
+        self.send_notification("textDocument/didClose", Some(params))
+            .await?;
+
+        self.saved_documents.remove(&key);
+        self.diagnostics.lock().await.remove(&key);
+
+        Ok(())
+    }
+
+    /// The documents rust-analyzer has been told about, by URI.
+    pub async fn open_document_uris(&self) -> Vec<String> {
+        self.open_documents.lock().await.keys().cloned().collect()
+    }
+
     /// Shuts rust-analyzer down, attempting the graceful LSP handshake first.
     pub async fn shutdown(&mut self) -> Result<()> {
         if self.initialized {
@@ -478,6 +544,17 @@ pub(super) struct OpenDocument {
     /// hash rather than the content itself: an agent works its way through a lot of files, and
     /// nothing here needs the old text back.
     content_hash: u64,
+}
+
+/// How many times to ask for something rust-analyzer abandoned mid-request.
+const REQUEST_ATTEMPTS: u32 = 3;
+
+/// Whether rust-analyzer abandoned a request because what it was working from changed under it.
+fn superseded(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .to_lowercase()
+        .contains("content modified")
 }
 
 /// The version a document is opened at, which every later change counts up from.

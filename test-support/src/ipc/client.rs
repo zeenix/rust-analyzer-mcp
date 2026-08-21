@@ -43,7 +43,10 @@ impl IpcClient {
     pub async fn get_or_create(project_type: &str) -> Result<Self> {
         // Map project types to workspace paths
         let workspace_path = match project_type {
-            "test-project" | "test-project-singleton" | "test-project-concurrent" => {
+            "test-project"
+            | "test-project-singleton"
+            | "test-project-concurrent"
+            | "test-project-rename" => {
                 let manifest_dir =
                     std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
                 Path::new(&manifest_dir).join("test-project")

@@ -85,6 +85,32 @@ impl RustAnalyzerMCPServer {
         Ok(uri)
     }
 
+    /// Brings rust-analyzer up to date with every document it has been told about.
+    ///
+    /// One document at a time is enough for a question about one file, but a rename reaches
+    /// across the workspace and is worked out from whatever rust-analyzer holds for each file it
+    /// touches. Anything stale in there comes back as an edit to a line that has moved.
+    pub(super) async fn refresh_open_documents(&mut self) -> Result<()> {
+        let Some(client) = &mut self.client else {
+            return Err(anyhow::anyhow!("Client not initialized"));
+        };
+
+        for uri in client.open_document_uris().await {
+            let Some(path) = uri::uri_to_path(&uri) else {
+                continue;
+            };
+
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => client.open_document(&uri, &content).await?,
+                // Gone from disk, which a rename of a module's file does to it. Left open, it
+                // would go on existing as far as rust-analyzer is concerned.
+                Err(_) => client.close_document(&uri).await?,
+            }
+        }
+
+        Ok(())
+    }
+
     /// The file a tool call's `file_path` argument names.
     ///
     /// Clients spell that argument every way they have one to hand: relative to the workspace

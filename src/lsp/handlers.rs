@@ -87,6 +87,38 @@ impl RustAnalyzerClient {
             .await
     }
 
+    /// Asks what renaming the symbol at a position would take, without doing any of it.
+    pub async fn rename(
+        &mut self,
+        uri: &str,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "newName": new_name
+        });
+
+        self.send_request("textDocument/rename", Some(params)).await
+    }
+
+    /// The range of the symbol a rename at this position would be about.
+    ///
+    /// Asked before a rename for two reasons: it says what is about to be renamed, which is worth
+    /// reporting back, and when there is nothing renameable there it says so more precisely than
+    /// the rename itself does.
+    pub async fn prepare_rename(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        self.send_request("textDocument/prepareRename", Some(params))
+            .await
+    }
+
     pub async fn document_symbols(&mut self, uri: &str) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri }

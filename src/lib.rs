@@ -3,6 +3,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod lsp;
 pub mod mcp;
+pub mod position;
 pub mod protocol;
 pub mod settings;
 pub mod uri;
