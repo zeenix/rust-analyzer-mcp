@@ -2,7 +2,8 @@ use anyhow::{anyhow, Result};
 use log::info;
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
     path::PathBuf,
     process::{ExitStatus, Stdio},
     sync::Arc,
@@ -30,7 +31,8 @@ pub struct RustAnalyzerClient {
     pub(super) stdin: Option<BufWriter<tokio::process::ChildStdin>>,
     pub(super) pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     pub(super) initialized: bool,
-    pub(super) open_documents: Arc<Mutex<HashSet<String>>>,
+    /// What rust-analyzer was last told about each open document, keyed by normalized URI.
+    pub(super) open_documents: Arc<Mutex<HashMap<String, OpenDocument>>>,
     pub(super) diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     /// Whether rust-analyzer last reported itself quiescent, i.e. with no background work such
     /// as loading the workspace in flight. Fed by its `experimental/serverStatus` notifications.
@@ -52,7 +54,7 @@ impl RustAnalyzerClient {
             stdin: None,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             initialized: false,
-            open_documents: Arc::new(Mutex::new(HashSet::new())),
+            open_documents: Arc::new(Mutex::new(HashMap::new())),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             quiescent: watch::channel(false).0,
             saved_documents: HashSet::new(),
@@ -319,24 +321,76 @@ impl RustAnalyzerClient {
         Ok(())
     }
 
+    /// Tells rust-analyzer about `content`, opening the document or updating it as needed.
+    ///
+    /// An open document's content belongs to us for as long as it stays open: rust-analyzer
+    /// refuses to re-read one from disk, so an edit anyone else makes is invisible to it until
+    /// this sends the new content along. Every request for a document that has been edited since
+    /// it was opened -- which, with an agent at the other end, is most of them -- was answered
+    /// from the content it had when it was first looked at.
     pub async fn open_document(&mut self, uri: &str, content: &str) -> Result<()> {
-        let already_open = self.open_documents.lock().await.contains(uri);
-        if already_open {
-            info!("Document already open: {}", uri);
-        } else {
-            info!("Opening document: {}", uri);
-            let params = json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": "rust",
-                    "version": 1,
-                    "text": content
-                }
-            });
-            self.send_notification("textDocument/didOpen", Some(params))
-                .await?;
+        let key = uri::normalize(uri);
+        let content_hash = hash(content);
+        let known = self
+            .open_documents
+            .lock()
+            .await
+            .get(&key)
+            .map(|document| (document.version, document.content_hash));
 
-            self.open_documents.lock().await.insert(uri.to_string());
+        match known {
+            None => {
+                info!("Opening document: {}", uri);
+                let params = json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "rust",
+                        "version": FIRST_DOCUMENT_VERSION,
+                        "text": content
+                    }
+                });
+                self.send_notification("textDocument/didOpen", Some(params))
+                    .await?;
+                self.open_documents.lock().await.insert(
+                    key.clone(),
+                    OpenDocument {
+                        version: FIRST_DOCUMENT_VERSION,
+                        content_hash,
+                    },
+                );
+            }
+            Some((_, known_hash)) if known_hash == content_hash => {
+                info!("Document already open and unchanged: {}", uri);
+            }
+            Some((version, _)) => {
+                // Whole-document changes are what the LSP calls a content change with no range,
+                // and what rust-analyzer's handler looks for first. Sending the file as one is
+                // both simpler and safer than working out a diff nobody asked us for.
+                let version = version + 1;
+                info!("Document changed, sending version {} of {}", version, uri);
+                let params = json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "version": version
+                    },
+                    "contentChanges": [{ "text": content }]
+                });
+                self.send_notification("textDocument/didChange", Some(params))
+                    .await?;
+                self.open_documents.lock().await.insert(
+                    key.clone(),
+                    OpenDocument {
+                        version,
+                        content_hash,
+                    },
+                );
+
+                // Whatever was reported about the content just replaced is no longer about
+                // anything: drop it, and let the didSave below ask for a check of what is there
+                // now.
+                self.diagnostics.lock().await.remove(&key);
+                self.saved_documents.remove(&key);
+            }
         }
 
         // A didSave makes rust-analyzer run cargo check for the document's package. It has to
@@ -346,7 +400,7 @@ impl RustAnalyzerClient {
         // and send it on the document's next use instead; in the meantime the workspace-wide
         // cargo check rust-analyzer runs on its own once quiescent covers the document anyway.
         // The flag is only a snapshot, so this narrows the window rather than closing it.
-        if self.saved_documents.contains(uri) {
+        if self.saved_documents.contains(&key) {
             return Ok(());
         }
         if !*self.quiescent.borrow() {
@@ -356,7 +410,7 @@ impl RustAnalyzerClient {
 
         // Drop the diagnostics stored so far, so that what gets reported next comes from the cargo
         // check this didSave triggers rather than from before it.
-        self.diagnostics.lock().await.remove(&uri::normalize(uri));
+        self.diagnostics.lock().await.remove(&key);
         let save_params = json!({
             "textDocument": {
                 "uri": uri
@@ -364,7 +418,7 @@ impl RustAnalyzerClient {
         });
         self.send_notification("textDocument/didSave", Some(save_params))
             .await?;
-        self.saved_documents.insert(uri.to_string());
+        self.saved_documents.insert(key);
 
         // Give rust-analyzer time to get cargo check going.
         tokio::time::sleep(Duration::from_millis(DOCUMENT_OPEN_DELAY_MILLIS)).await;
@@ -417,6 +471,27 @@ impl RustAnalyzerClient {
     pub fn exit_status(&mut self) -> Option<ExitStatus> {
         self.process.as_mut()?.try_wait().ok().flatten()
     }
+}
+
+/// What rust-analyzer was last told about a document, so that the next thing it is told about
+/// it can follow on.
+pub(super) struct OpenDocument {
+    /// The version last sent. rust-analyzer wants these to climb, and echoes the current one
+    /// back with every diagnostic it publishes.
+    version: u64,
+    /// Fingerprint of the content last sent, which is how an edit is told from a re-read. A
+    /// hash rather than the content itself: an agent works its way through a lot of files, and
+    /// nothing here needs the old text back.
+    content_hash: u64,
+}
+
+/// The version a document is opened at, which every later change counts up from.
+const FIRST_DOCUMENT_VERSION: u64 = 1;
+
+fn hash(content: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn find_rust_analyzer() -> Result<PathBuf> {
@@ -490,6 +565,81 @@ mod tests {
         let sent = written(&mut client, &mut child).await;
         assert_eq!(sent.matches("textDocument/didOpen").count(), 1, "{sent}");
         assert_eq!(sent.matches("textDocument/didSave").count(), 1, "{sent}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_edited_document_is_sent_as_a_change() {
+        let (mut client, mut child) = client_with_fake_stdin();
+        client.quiescent.send_replace(true);
+
+        client.open_document(URI, "fn main() {}").await.unwrap();
+        client
+            .open_document(URI, "fn main() { let x = 1; }")
+            .await
+            .unwrap();
+
+        let sent = written(&mut client, &mut child).await;
+        assert_eq!(sent.matches("textDocument/didOpen").count(), 1, "{sent}");
+        assert_eq!(sent.matches("textDocument/didChange").count(), 1, "{sent}");
+        assert!(sent.contains(r#"let x = 1;"#), "{sent}");
+        // The version climbs, which is what rust-analyzer stamps its diagnostics with.
+        assert!(sent.contains(r#""version":2"#), "{sent}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_document_that_did_not_change_is_not_sent_again() {
+        // rust-analyzer drops a change whose text it already has, so the only thing sending one
+        // achieves is a check that never reports anything back.
+        let (mut client, mut child) = client_with_fake_stdin();
+        client.quiescent.send_replace(true);
+
+        open(&mut client).await;
+        open(&mut client).await;
+
+        let sent = written(&mut client, &mut child).await;
+        assert_eq!(sent.matches("textDocument/didOpen").count(), 1, "{sent}");
+        assert_eq!(sent.matches("textDocument/didChange").count(), 0, "{sent}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_edit_gets_the_next_version() {
+        let (mut client, mut child) = client_with_fake_stdin();
+        client.quiescent.send_replace(true);
+
+        for content in ["fn main() {}", "fn main() { 1; }", "fn main() { 2; }"] {
+            client.open_document(URI, content).await.unwrap();
+        }
+
+        let sent = written(&mut client, &mut child).await;
+        assert!(sent.contains(r#""version":1"#), "{sent}");
+        assert!(sent.contains(r#""version":2"#), "{sent}");
+        assert!(sent.contains(r#""version":3"#), "{sent}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_edit_drops_what_was_reported_about_the_old_content() {
+        let (mut client, mut child) = client_with_fake_stdin();
+        client.quiescent.send_replace(true);
+
+        client.open_document(URI, "fn main() {}").await.unwrap();
+        client
+            .diagnostics
+            .lock()
+            .await
+            .insert(URI.to_string(), vec![json!({ "message": "stale" })]);
+        client
+            .open_document(URI, "fn main() { let x = 1; }")
+            .await
+            .unwrap();
+
+        assert!(!client.diagnostics.lock().await.contains_key(URI));
+        // And the check that reports on the new content is asked for again.
+        let sent = written(&mut client, &mut child).await;
+        assert_eq!(sent.matches("textDocument/didSave").count(), 2, "{sent}");
     }
 
     #[cfg(unix)]
