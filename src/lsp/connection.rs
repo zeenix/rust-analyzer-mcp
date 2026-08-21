@@ -18,6 +18,12 @@ use crate::{protocol::lsp::LSPResponse, uri};
 /// What rust-analyzer has published about each document, by normalized URI.
 pub type Diagnostics = Arc<Mutex<HashMap<String, Vec<Value>>>>;
 
+/// What a request to rust-analyzer comes back with: its result, or what it says went wrong.
+pub type Answer = std::result::Result<Value, String>;
+
+/// The requests waiting for an answer, by the id each was sent under.
+pub type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Answer>>>>;
+
 /// The cargo checks rust-analyzer has run, as reported by its progress notifications.
 ///
 /// A check is the only thing that produces the diagnostics rustc gives, so knowing whether one
@@ -90,7 +96,7 @@ pub async fn send_message<W: AsyncWrite + Unpin>(
 /// and everything they answer one with.
 pub struct Connection<W> {
     /// The requests waiting for an answer, by the id each was sent under.
-    pub pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    pub pending_requests: Pending,
     /// The last diagnostics published for each document.
     pub diagnostics: Diagnostics,
     /// Whether rust-analyzer has any background work in flight.
@@ -226,10 +232,7 @@ async fn handle_lsp_message<W: AsyncWrite + Unpin>(json_buffer: &[u8], connectio
     }
 }
 
-async fn handle_response(
-    json_value: Value,
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-) {
+async fn handle_response(json_value: Value, pending: &Pending) {
     let Ok(response) = serde_json::from_value::<LSPResponse>(json_value) else {
         return;
     };
@@ -245,12 +248,23 @@ async fn handle_response(
 
     if let Some(error) = response.error {
         error!("LSP error for request {}: {}", id, error);
-        let _ = sender.send(json!(null));
+        // What rust-analyzer refused to do and why is the answer, and often the only useful one:
+        // "Invalid name `1`: not an identifier" tells whoever asked what to do about it, where a
+        // bare nothing leaves them guessing at a rename that quietly did nothing.
+        let _ = sender.send(Err(message_of(&error)));
     } else {
         let result = response.result.unwrap_or(json!(null));
         info!("Sending result for request {}: {:?}", id, result);
-        let _ = sender.send(result);
+        let _ = sender.send(Ok(result));
     }
+}
+
+/// What an LSP error says, which is its `message` unless it is shaped unexpectedly.
+fn message_of(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(|message| message.as_str())
+        .map_or_else(|| error.to_string(), str::to_string)
 }
 
 /// Answers a request rust-analyzer made of us.
@@ -577,6 +591,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_rust_analyzer_refused_to_do_reaches_whoever_asked() {
+        // A bare "no" is indistinguishable from a request that did nothing; the reason is the
+        // whole of the answer for anything the user got wrong.
+        let (connection, _rust_analyzer) = connection();
+        let (sender, response) = oneshot::channel();
+        connection.pending_requests.lock().await.insert(1, sender);
+
+        deliver(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32602, "message": "Invalid name `1`: not an identifier" }
+            }),
+            &connection,
+        )
+        .await;
+
+        assert_eq!(
+            response.await.unwrap(),
+            Err("Invalid name `1`: not an identifier".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn answers_still_reach_whoever_is_waiting() {
         let (connection, _rust_analyzer) = connection();
         let (sender, response) = oneshot::channel();
@@ -588,7 +626,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.await.unwrap(), json!({ "contents": "docs" }));
+        assert_eq!(
+            response.await.unwrap().unwrap(),
+            json!({ "contents": "docs" })
+        );
         assert!(connection.pending_requests.lock().await.is_empty());
     }
 

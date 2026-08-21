@@ -24,14 +24,14 @@ use crate::{
     uri,
 };
 
-use super::connection::{send_message, Connection, Diagnostics, Flycheck, Outgoing};
+use super::connection::{send_message, Connection, Diagnostics, Flycheck, Outgoing, Pending};
 
 pub struct RustAnalyzerClient {
     pub(super) process: Option<Child>,
     pub(super) request_id: Arc<Mutex<u64>>,
     pub(super) workspace_root: PathBuf,
     pub(super) stdin: Option<Outgoing<tokio::process::ChildStdin>>,
-    pub(super) pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    pub(super) pending_requests: Pending,
     pub(super) initialized: bool,
     /// What rust-analyzer was last told about each open document, keyed by normalized URI.
     pub(super) open_documents: Arc<Mutex<HashMap<String, OpenDocument>>>,
@@ -228,7 +228,8 @@ impl RustAnalyzerClient {
         // Wait for response with timeout. The channel only closes unanswered when the reader
         // task gave up on rust-analyzer's stdout, i.e. rust-analyzer is gone.
         match tokio::time::timeout(Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS), rx).await {
-            Ok(response) => response.map_err(|_| anyhow!("rust-analyzer exited before responding")),
+            Ok(Ok(answer)) => answer.map_err(|message| anyhow!("{message}")),
+            Ok(Err(_)) => Err(anyhow!("rust-analyzer exited before responding")),
             Err(_) => {
                 // Unregister so an abandoned request cannot leak its pending entry.
                 pending_requests.lock().await.remove(&id);
