@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -12,6 +12,7 @@ use tokio::{
     io::{AsyncWriteExt, BufWriter},
     process::{Child, Command},
     sync::{oneshot, watch, Mutex},
+    task::JoinHandle,
 };
 
 use crate::{
@@ -35,6 +36,8 @@ pub struct RustAnalyzerClient {
     pub(super) quiescent: watch::Sender<bool>,
     /// Open documents whose `didSave` has been sent, see [`Self::open_document`].
     pub(super) saved_documents: HashSet<String>,
+    /// The task reading rust-analyzer's stdout; it finishing means rust-analyzer is gone.
+    pub(super) reader: Option<JoinHandle<()>>,
 }
 
 impl RustAnalyzerClient {
@@ -61,6 +64,7 @@ impl RustAnalyzerClient {
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             quiescent: watch::channel(false).0,
             saved_documents: HashSet::new(),
+            reader: None,
         }
     }
 
@@ -81,7 +85,9 @@ impl RustAnalyzerClient {
         cmd.current_dir(&self.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // So that a start failing halfway cannot leave an orphaned rust-analyzer behind.
+            .kill_on_drop(true);
 
         // Pass through isolation environment variables if they're set.
         if let Ok(cache_home) = std::env::var("XDG_CACHE_HOME") {
@@ -113,14 +119,16 @@ impl RustAnalyzerClient {
 
         self.stdin = Some(BufWriter::new(stdin));
 
-        // Start connection handlers.
-        super::connection::start_handlers(
+        // Start connection handlers, with a pending-request map of their own: the reader of an
+        // earlier process fails whatever is left in its map when it finishes.
+        self.pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        self.reader = Some(super::connection::start_handlers(
             stdout,
             stderr,
             Arc::clone(&self.pending_requests),
             Arc::clone(&self.diagnostics),
             self.quiescent.clone(),
-        );
+        ));
 
         self.process = Some(child);
 
@@ -216,9 +224,10 @@ impl RustAnalyzerClient {
             return Err(e.into());
         }
 
-        // Wait for response with timeout.
+        // Wait for response with timeout. The channel only closes unanswered when the reader
+        // task gave up on rust-analyzer's stdout, i.e. rust-analyzer is gone.
         match tokio::time::timeout(Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS), rx).await {
-            Ok(response) => response.map_err(|_| anyhow!("Request cancelled")),
+            Ok(response) => response.map_err(|_| anyhow!("rust-analyzer exited before responding")),
             Err(_) => {
                 // Unregister so an abandoned request cannot leak its pending entry.
                 pending_requests.lock().await.remove(&id);
@@ -406,6 +415,16 @@ impl RustAnalyzerClient {
         self.diagnostics.lock().await.clear();
         self.initialized = false;
     }
+
+    /// Whether rust-analyzer is gone, i.e. its stdout has closed because it exited or is about to.
+    pub fn is_gone(&self) -> bool {
+        self.reader.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    /// The exit status of the rust-analyzer process, if it has exited.
+    pub fn exit_status(&mut self) -> Option<ExitStatus> {
+        self.process.as_mut()?.try_wait().ok().flatten()
+    }
 }
 
 fn find_rust_analyzer() -> Result<PathBuf> {
@@ -471,6 +490,61 @@ mod tests {
         let sent = written(&mut client, &mut child).await;
         assert_eq!(sent.matches("textDocument/didOpen").count(), 1, "{sent}");
         assert_eq!(sent.matches("textDocument/didSave").count(), 1, "{sent}");
+    }
+
+    #[tokio::test]
+    async fn exit_status_reflects_whether_rust_analyzer_is_alive() {
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        // The shell lives until its stdin closes, then exits with 3.
+        let mut child = Command::new("sh")
+            .args(["-c", "read _; exit 3"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        client.process = Some(child);
+
+        assert!(client.exit_status().is_none());
+
+        drop(stdin);
+        client.process.as_mut().unwrap().wait().await.unwrap();
+        assert_eq!(
+            client.exit_status().and_then(|status| status.code()),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn is_gone_once_rust_analyzer_closes_its_stdout() {
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        let (stdout, rust_analyzer) = tokio::io::duplex(64);
+        client.reader = Some(super::super::connection::start_handlers(
+            stdout,
+            tokio::io::empty(),
+            Arc::clone(&client.pending_requests),
+            Arc::clone(&client.diagnostics),
+            client.quiescent.clone(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(!client.is_gone());
+
+        drop(rust_analyzer);
+        tokio::time::timeout(Duration::from_secs(5), client.reader.as_mut().unwrap())
+            .await
+            .expect("reader must finish once stdout closes")
+            .unwrap();
+        assert!(client.is_gone());
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostics_fails_once_rust_analyzer_is_gone() {
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        let mut reader = tokio::spawn(async {});
+        (&mut reader).await.unwrap();
+        client.reader = Some(reader);
+
+        // Must not fall back to an empty, i.e. clean-looking, report.
+        assert!(client.workspace_diagnostics().await.is_err());
     }
 
     /// A client whose "rust-analyzer" is a `cat` process, so that everything the client writes

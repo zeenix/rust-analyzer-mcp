@@ -2,19 +2,22 @@ use log::{debug, error, info, warn};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     sync::{oneshot, watch, Mutex},
+    task::JoinHandle,
 };
 
 use crate::protocol::lsp::LSPResponse;
 
+/// Spawns the tasks reading rust-analyzer's stdout and stderr, returning the stdout reader's
+/// handle: it finishes once rust-analyzer's stdout closes, i.e. once rust-analyzer is gone.
 pub fn start_handlers(
-    stdout: tokio::process::ChildStdout,
-    stderr: tokio::process::ChildStderr,
+    stdout: impl AsyncRead + Unpin + Send + 'static,
+    stderr: impl AsyncRead + Unpin + Send + 'static,
     pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     quiescent: watch::Sender<bool>,
-) {
+) -> JoinHandle<()> {
     // Log stderr in background.
     tokio::spawn(handle_stderr(stderr));
 
@@ -24,10 +27,10 @@ pub fn start_handlers(
         pending_requests,
         diagnostics,
         quiescent,
-    ));
+    ))
 }
 
-async fn handle_stderr(stderr: tokio::process::ChildStderr) {
+async fn handle_stderr(stderr: impl AsyncRead + Unpin + Send + 'static) {
     let mut reader = BufReader::new(stderr);
     let mut buffer = String::new();
 
@@ -55,7 +58,7 @@ async fn handle_stderr(stderr: tokio::process::ChildStderr) {
 }
 
 async fn handle_stdout(
-    stdout: tokio::process::ChildStdout,
+    stdout: impl AsyncRead + Unpin + Send + 'static,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     quiescent: watch::Sender<bool>,
@@ -101,6 +104,10 @@ async fn handle_stdout(
 
         handle_lsp_message(&json_buffer, &pending, &diagnostics, &quiescent).await;
     }
+
+    // rust-analyzer is gone, so no pending request will ever be answered: fail them now rather
+    // than letting each run into the request timeout.
+    pending.lock().await.clear();
 }
 
 fn parse_content_length(header: &str) -> Option<usize> {
@@ -249,6 +256,26 @@ mod tests {
         )
         .await;
         assert_eq!(diagnostics.lock().await["file:///a.rs"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_stdout_fails_pending_requests() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, response) = oneshot::channel();
+        pending.lock().await.insert(1, sender);
+        let (quiescent, _status) = watch::channel(false);
+
+        // An already-closed stdout stands in for a rust-analyzer that died mid-request.
+        handle_stdout(
+            tokio::io::empty(),
+            Arc::clone(&pending),
+            Arc::new(Mutex::new(HashMap::new())),
+            quiescent,
+        )
+        .await;
+
+        assert!(response.await.is_err());
+        assert!(pending.lock().await.is_empty());
     }
 
     /// Feed one notification through `handle_notification` and return the diagnostics store.

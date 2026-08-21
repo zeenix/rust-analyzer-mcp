@@ -111,6 +111,8 @@ impl RustAnalyzerClient {
             .await
         {
             Ok(response) => Ok(response),
+            // A dead rust-analyzer must not pass for a clean workspace.
+            Err(e) if self.is_gone() => Err(e),
             Err(_) => {
                 // Fallback: return diagnostics for all open documents.
                 let mut all_diagnostics = json!({});
