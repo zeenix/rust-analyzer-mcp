@@ -1,0 +1,3 @@
+[workspace]
+# Match the repository's existing `v<version>` tags, which the release workflow triggers on.
+git_tag_name = "v{{ version }}"
