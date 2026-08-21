@@ -39,9 +39,11 @@ async fn handle_stderr(stderr: tokio::process::ChildStderr) {
             break; // EOF
         }
 
+        // rust-analyzer is quiet on stderr by default, so what does show up there (its panic
+        // messages above all) is worth keeping at the default log level.
         let trimmed = buffer.trim();
         if !trimmed.is_empty() {
-            debug!("rust-analyzer stderr: {}", trimmed);
+            info!("rust-analyzer stderr: {}", trimmed);
         }
     }
 }
