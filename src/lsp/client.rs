@@ -20,6 +20,7 @@ use crate::{
         DOCUMENT_OPEN_DELAY_MILLIS, GRACEFUL_SHUTDOWN_TIMEOUT_SECS, LSP_REQUEST_TIMEOUT_SECS,
     },
     protocol::lsp::LSPRequest,
+    uri,
 };
 
 pub struct RustAnalyzerClient {
@@ -42,16 +43,7 @@ pub struct RustAnalyzerClient {
 
 impl RustAnalyzerClient {
     pub fn new(workspace_root: PathBuf) -> Self {
-        // Ensure the workspace root is absolute.
-        let workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-            if workspace_root.is_absolute() {
-                workspace_root.clone()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(&workspace_root)
-            }
-        });
+        let workspace_root = uri::absolute(&workspace_root);
 
         Self {
             process: None,
@@ -239,7 +231,7 @@ impl RustAnalyzerClient {
     async fn initialize(&mut self) -> Result<()> {
         let init_params = json!({
             "processId": std::process::id(),
-            "rootUri": format!("file://{}", self.workspace_root.display()),
+            "rootUri": uri::path_to_uri(&self.workspace_root)?,
             "initializationOptions": {
                 "cargo": {
                     "buildScripts": {
@@ -364,7 +356,7 @@ impl RustAnalyzerClient {
 
         // Drop the diagnostics stored so far, so that what gets reported next comes from the cargo
         // check this didSave triggers rather than from before it.
-        self.diagnostics.lock().await.remove(uri);
+        self.diagnostics.lock().await.remove(&uri::normalize(uri));
         let save_params = json!({
             "textDocument": {
                 "uri": uri
@@ -449,10 +441,16 @@ fn find_rust_analyzer() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Some of these stand a real process up in rust-analyzer's place, which takes shell tooling
+    // this repository only assumes on Unix.
+    #[cfg(unix)]
     use tokio::io::AsyncReadExt;
 
+    #[cfg(unix)]
     const URI: &str = "file:///tmp/lib.rs";
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn did_save_is_held_back_while_rust_analyzer_is_busy() {
         let (mut client, mut child) = client_with_fake_stdin();
@@ -465,6 +463,7 @@ mod tests {
         assert_eq!(sent.matches("textDocument/didSave").count(), 0, "{sent}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn held_back_did_save_is_sent_once_rust_analyzer_is_quiescent() {
         let (mut client, mut child) = client_with_fake_stdin();
@@ -479,6 +478,7 @@ mod tests {
         assert_eq!(sent.matches("textDocument/didSave").count(), 1, "{sent}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn did_save_follows_did_open_while_rust_analyzer_is_quiescent() {
         let (mut client, mut child) = client_with_fake_stdin();
@@ -492,6 +492,7 @@ mod tests {
         assert_eq!(sent.matches("textDocument/didSave").count(), 1, "{sent}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn exit_status_reflects_whether_rust_analyzer_is_alive() {
         let mut client = RustAnalyzerClient::new(PathBuf::from("."));
@@ -550,6 +551,7 @@ mod tests {
     /// A client whose "rust-analyzer" is a `cat` process, so that everything the client writes
     /// to its stdin can be read back from the child's stdout. Starts out non-quiescent, like a
     /// freshly started rust-analyzer.
+    #[cfg(unix)]
     fn client_with_fake_stdin() -> (RustAnalyzerClient, Child) {
         let mut child = Command::new("cat")
             .stdin(Stdio::piped())
@@ -561,11 +563,13 @@ mod tests {
         (client, child)
     }
 
+    #[cfg(unix)]
     async fn open(client: &mut RustAnalyzerClient) {
         client.open_document(URI, "fn main() {}").await.unwrap();
     }
 
     /// Closes the client's stdin and returns everything it wrote.
+    #[cfg(unix)]
     async fn written(client: &mut RustAnalyzerClient, child: &mut Child) -> String {
         client.stdin.take();
         let mut output = String::new();

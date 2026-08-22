@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Result};
 use log::debug;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::{
     diagnostics::format_diagnostics,
     protocol::mcp::{ContentItem, ToolResult},
+    uri,
 };
 
 use super::server::RustAnalyzerMCPServer;
@@ -225,17 +226,10 @@ async fn handle_set_workspace(
     }
     server.client = None;
 
-    // Set new workspace with proper absolute path handling.
-    let workspace_root = PathBuf::from(workspace_path);
-    server.workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| {
-        if workspace_root.is_absolute() {
-            workspace_root.clone()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(&workspace_root)
-        }
-    });
+    // Set new workspace with proper absolute path handling, taking a `file:` URI as readily as
+    // a path.
+    let workspace_root = uri::uri_to_path(workspace_path).unwrap_or_else(|| workspace_path.into());
+    server.workspace_root = uri::absolute(&workspace_root);
 
     // Start the new client automatically.
     server.ensure_client_started().await?;

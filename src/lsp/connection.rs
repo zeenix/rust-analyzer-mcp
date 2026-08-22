@@ -7,7 +7,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::protocol::lsp::LSPResponse;
+use crate::{protocol::lsp::LSPResponse, uri};
 
 /// Spawns the tasks reading rust-analyzer's stdout and stderr, returning the stdout reader's
 /// handle: it finishes once rust-analyzer's stdout closes, i.e. once rust-analyzer is gone.
@@ -186,7 +186,8 @@ async fn handle_notification(
             };
 
             let mut diag_lock = diagnostics.lock().await;
-            diag_lock.insert(uri.to_string(), diags.clone());
+            // Keyed the same way the lookups spell it, see `uri::normalize()`.
+            diag_lock.insert(uri::normalize(uri), diags.clone());
             info!("Stored {} diagnostics for {}", diags.len(), uri);
         }
         // rust-analyzer's status report, opted into through the `serverStatusNotification`

@@ -19,18 +19,22 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+# Keeps Windows paths out of the extended-length `\\?\` form, which nothing downstream parses.
+dunce = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
+url = "2.5"
 env_logger = "0.10"
 log = "0.4"
 futures = "0.3"
 which = "6.0"
 
-[dev-dependencies]
-# Test support library
+# The test support library, and the integration tests that use it, talk over a Unix socket.
+[target.'cfg(unix)'.dev-dependencies]
 test-support = { path = "test-support" }
 
+[dev-dependencies]
 # Core testing
 tokio-test = "0.4"
 assert_cmd = "2.0"          # For testing CLI behavior

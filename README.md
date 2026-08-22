@@ -123,6 +123,9 @@ The server communicates via stdio and follows the MCP protocol.
 
 ## Available Tools
 
+Every `file_path` argument below may be given relative to the workspace root, as an absolute path,
+or as a `file:` URI.
+
 ### Working Features ✅
 
 #### `rust_analyzer_symbols`
