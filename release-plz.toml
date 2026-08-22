@@ -36,16 +36,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 """
 
 # Changelog body template.
+# Each section heading carries the emoji of its category, so the per-commit emoji prefix is
+# stripped from the entries instead of being repeated on every line. Group names are prefixed
+# with an "<!-- NN -->" ordering comment, which `striptags` drops from the rendered heading.
 # Issue refs are separated by "||" delimiter so we can insert period before them.
 body = """
 
 ## {{ version | trim_start_matches(pat="v") }} - {{ timestamp | date(format="%Y-%m-%d") }}
 {% for group, commits in commits | group_by(attribute="group") %}
-### {{ group | upper_first }}
+### {{ group | striptags | trim | upper_first }}
 {% for commit in commits %}\
 {% set first_line = commit.message | split(pat="\n") | first %}\
 {% set parts = first_line | split(pat="||") %}\
-- {{ parts | first | upper_first | trim | trim_end_matches(pat=".") }}\
+{% set title = parts | first | trim %}\
+{% if title is matching("^[^\\p{L}\\p{N}\\s]+\\s") %}\
+{% set title = title | split(pat=" ") | slice(start=1) | join(sep=" ") | trim %}\
+{% endif %}\
+- {{ title | upper_first | trim_end_matches(pat=".") }}\
 {% if commit.breaking %} (**BREAKING**){% endif %}.\
 {% if parts | length > 1 %} {{ parts | last }}{% endif %}
 {% endfor %}\
@@ -97,6 +104,8 @@ commit_preprocessors = [
 
 # Categorize commits based on gimoji emojis.
 # See: https://zeenix.github.io/gimoji/
+# The "<!-- NN -->" prefix on each group name fixes the order of the changelog sections
+# (the template strips it); the emoji right after it becomes the section heading emoji.
 commit_parsers = [
     # Skip commits carrying a "Changelog: skip" trailer (see the preprocessor above).
     { message = "^changelog-skip$", skip = true },
@@ -106,53 +115,53 @@ commit_parsers = [
     { message = "^[\\p{Emoji}\\p{Emoji_Presentation}\\p{Extended_Pictographic}]+$", skip = true },
 
     # Features.
-    { message = "^✨", group = "Added" },
-    { message = "^🎉", group = "Added" },
+    { message = "^✨", group = "<!-- 00 -->✨ Added" },
+    { message = "^🎉", group = "<!-- 00 -->✨ Added" },
 
     # Bug fixes.
-    { message = "^🐛", group = "Fixed" },
-    { message = "^🚑", group = "Fixed" },
-    { message = "^🩹", group = "Fixed" },
-    { message = "^🥅", group = "Fixed" },
+    { message = "^🐛", group = "<!-- 07 -->🐛 Fixed" },
+    { message = "^🚑", group = "<!-- 07 -->🐛 Fixed" },
+    { message = "^🩹", group = "<!-- 07 -->🐛 Fixed" },
+    { message = "^🥅", group = "<!-- 07 -->🐛 Fixed" },
 
     # Performance.
-    { message = "^⚡", group = "Performance" },
+    { message = "^⚡", group = "<!-- 09 -->⚡️ Performance" },
 
     # Documentation.
-    { message = "^📝", group = "Documentation" },
-    { message = "^💡", group = "Documentation" },
+    { message = "^📝", group = "<!-- 06 -->📝 Documentation" },
+    { message = "^💡", group = "<!-- 06 -->📝 Documentation" },
 
     # Refactoring/changes.
-    { message = "^♻️", group = "Changed" },
-    { message = "^🎨", group = "Changed" },
-    { message = "^🚚", group = "Changed" },
-    { message = "^🔧", group = "Changed" },
-    { message = "^🏗️", group = "Changed" },
-    { message = "^💄", group = "Changed" },
+    { message = "^♻️", group = "<!-- 03 -->♻️ Changed" },
+    { message = "^🎨", group = "<!-- 03 -->♻️ Changed" },
+    { message = "^🚚", group = "<!-- 03 -->♻️ Changed" },
+    { message = "^🔧", group = "<!-- 03 -->♻️ Changed" },
+    { message = "^🏗️", group = "<!-- 03 -->♻️ Changed" },
+    { message = "^💄", group = "<!-- 03 -->♻️ Changed" },
 
     # Breaking changes/removals.
-    { message = "^💥", group = "Breaking" },
-    { message = "^🔥", group = "Removed" },
-    { message = "^🗑️", group = "Deprecated" },
+    { message = "^💥", group = "<!-- 01 -->💥 Breaking" },
+    { message = "^🔥", group = "<!-- 10 -->🔥 Removed" },
+    { message = "^🗑️", group = "<!-- 05 -->🗑️ Deprecated" },
 
     # Dependencies.
-    { message = "^➕", group = "Dependencies" },
-    { message = "^➖", group = "Dependencies" },
-    { message = "^📌", group = "Dependencies" },
-    { message = "^⬆️", group = "Dependencies" },
-    { message = "^⬇️", group = "Dependencies" },
+    { message = "^➕", group = "<!-- 04 -->⬆️ Dependencies" },
+    { message = "^➖", group = "<!-- 04 -->⬆️ Dependencies" },
+    { message = "^📌", group = "<!-- 04 -->⬆️ Dependencies" },
+    { message = "^⬆️", group = "<!-- 04 -->⬆️ Dependencies" },
+    { message = "^⬇️", group = "<!-- 04 -->⬆️ Dependencies" },
 
     # Security.
-    { message = "^🔒", group = "Security" },
+    { message = "^🔒", group = "<!-- 11 -->🔒️ Security" },
 
     # Testing.
-    { message = "^✅", group = "Testing" },
-    { message = "^🧪", group = "Testing" },
+    { message = "^✅", group = "<!-- 12 -->✅ Testing" },
+    { message = "^🧪", group = "<!-- 12 -->✅ Testing" },
 
     # CI/Build.
-    { message = "^👷", group = "CI" },
-    { message = "^💚", group = "CI" },
+    { message = "^👷", group = "<!-- 02 -->👷 CI" },
+    { message = "^💚", group = "<!-- 02 -->👷 CI" },
 
     # Everything else.
-    { message = ".*", group = "Other" },
+    { message = ".*", group = "<!-- 08 -->⚙️ Other" },
 ]
