@@ -107,6 +107,45 @@ Add this to your Claude Desktop configuration (`claude_desktop_config.json`):
 **Note:** If installed from crates.io, the command will be in your PATH. For Claude Desktop, you
 may want to specify a `cwd` parameter if you want to analyze a specific project by default.
 
+### Cargo features
+
+By default rust-analyzer analyses and checks your crate with whatever features its manifest makes
+default, so code behind a feature gate looks unresolved and its errors go unreported. Pass the
+features to use on the command line:
+
+```bash
+rust-analyzer-mcp --all-features /path/to/project
+rust-analyzer-mcp --features serde,tokio /path/to/project
+rust-analyzer-mcp --no-default-features --features serde /path/to/project
+```
+
+In a workspace, a feature may need naming with the package it belongs to, exactly as cargo wants
+it: `--features my-crate/serde`.
+
+Which features to use is a choice worth making per project rather than everywhere: `--all-features`
+enables even the features a crate never expects to see enabled together, which for some projects
+means analysis that fails or takes far longer than it needs to. Options go in `args` alongside the
+command:
+
+```json
+{
+  "mcpServers": {
+    "rust-analyzer": {
+      "command": "rust-analyzer-mcp",
+      "args": ["--features", "serde,tokio"]
+    }
+  }
+}
+```
+
+Anything else rust-analyzer can be configured with is available through `--config`, which takes any
+[rust-analyzer setting](https://rust-analyzer.github.io/book/configuration.html) without the
+`rust-analyzer.` prefix. The value is read as JSON, or taken for a string if it is not JSON:
+
+```bash
+rust-analyzer-mcp --config check.command=clippy --config 'check.extraArgs=["--tests"]' .
+```
+
 ### Other MCP Clients
 
 For other MCP clients, run the server with:

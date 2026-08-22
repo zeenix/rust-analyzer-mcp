@@ -7,12 +7,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use crate::{
     lsp::RustAnalyzerClient,
     protocol::mcp::{MCPError, MCPRequest, MCPResponse},
+    settings::Settings,
     uri,
 };
 
 pub struct RustAnalyzerMCPServer {
     pub(super) client: Option<RustAnalyzerClient>,
     pub(super) workspace_root: PathBuf,
+    /// What rust-analyzer is asked to run with, for every rust-analyzer this server starts.
+    pub(super) settings: Settings,
 }
 
 impl Default for RustAnalyzerMCPServer {
@@ -26,6 +29,7 @@ impl RustAnalyzerMCPServer {
         Self {
             client: None,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            settings: Settings::default(),
         }
     }
 
@@ -33,7 +37,14 @@ impl RustAnalyzerMCPServer {
         Self {
             client: None,
             workspace_root: uri::absolute(&workspace_root),
+            settings: Settings::default(),
         }
+    }
+
+    /// Runs rust-analyzer with `settings`, whatever workspace it is pointed at.
+    pub fn with_settings(mut self, settings: Settings) -> Self {
+        self.settings = settings;
+        self
     }
 
     pub(super) async fn ensure_client_started(&mut self) -> Result<()> {
@@ -51,7 +62,8 @@ impl RustAnalyzerMCPServer {
         }
 
         if self.client.is_none() {
-            let mut client = RustAnalyzerClient::new(self.workspace_root.clone());
+            let mut client =
+                RustAnalyzerClient::new(self.workspace_root.clone(), self.settings.to_json());
             client.start().await?;
             self.client = Some(client);
         }

@@ -50,10 +50,13 @@ pub struct RustAnalyzerClient {
     pub(super) saved_documents: HashSet<String>,
     /// The task reading rust-analyzer's stdout; it finishing means rust-analyzer is gone.
     pub(super) reader: Option<JoinHandle<()>>,
+    /// What rust-analyzer was started with, and is handed again whenever it asks for its
+    /// configuration.
+    pub(super) settings: Value,
 }
 
 impl RustAnalyzerClient {
-    pub fn new(workspace_root: PathBuf) -> Self {
+    pub fn new(workspace_root: PathBuf, settings: Value) -> Self {
         let workspace_root = uri::absolute(&workspace_root);
 
         Self {
@@ -70,6 +73,7 @@ impl RustAnalyzerClient {
             gave_up_on_checks: false,
             saved_documents: HashSet::new(),
             reader: None,
+            settings,
         }
     }
 
@@ -78,6 +82,9 @@ impl RustAnalyzerClient {
             "Starting rust-analyzer process in workspace: {}",
             self.workspace_root.display()
         );
+        // rust-analyzer says nothing about settings it does not recognise, so a mistyped one is
+        // only ever findable here.
+        info!("rust-analyzer settings: {}", self.settings);
 
         // Clear any existing diagnostics from previous sessions.
         self.diagnostics.lock().await.clear();
@@ -139,7 +146,7 @@ impl RustAnalyzerClient {
                 quiescent: self.quiescent.clone(),
                 flycheck: self.flycheck.clone(),
                 outgoing: stdin,
-                settings: settings(),
+                settings: self.settings.clone(),
             },
         ));
 
@@ -151,7 +158,7 @@ impl RustAnalyzerClient {
 
         // Tell rust-analyzer its configuration changed. It ignores what comes with the
         // notification and asks for the settings itself, which the reader task answers.
-        let config_params = json!({ "settings": { "rust-analyzer": settings() } });
+        let config_params = json!({ "settings": { "rust-analyzer": self.settings } });
         let _ = self
             .send_notification("workspace/didChangeConfiguration", Some(config_params))
             .await;
@@ -234,7 +241,7 @@ impl RustAnalyzerClient {
         let init_params = json!({
             "processId": std::process::id(),
             "rootUri": uri::path_to_uri(&self.workspace_root)?,
-            "initializationOptions": settings(),
+            "initializationOptions": self.settings,
             "capabilities": {
                 "textDocument": {
                     "hover": {
@@ -458,34 +465,6 @@ impl RustAnalyzerClient {
     pub fn exit_status(&mut self) -> Option<ExitStatus> {
         self.process.as_mut()?.try_wait().ok().flatten()
     }
-}
-
-/// The configuration rust-analyzer is asked to run with.
-///
-/// Sent once as `initializationOptions`, and handed back whenever rust-analyzer asks for its
-/// configuration -- which it does, rather than reading the notification that told it to.
-fn settings() -> Value {
-    json!({
-        "cargo": {
-            "buildScripts": {
-                "enable": true
-            }
-        },
-        "checkOnSave": {
-            "enable": true,
-            "command": "check",
-            "allTargets": true
-        },
-        "diagnostics": {
-            "enable": true,
-            "experimental": {
-                "enable": true
-            }
-        },
-        "procMacro": {
-            "enable": true
-        }
-    })
 }
 
 /// What rust-analyzer was last told about a document, so that the next thing it is told about
@@ -756,7 +735,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn exit_status_reflects_whether_rust_analyzer_is_alive() {
-        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."), json!({}));
         // The shell lives until its stdin closes, then exits with 3.
         let mut child = Command::new("sh")
             .args(["-c", "read _; exit 3"])
@@ -778,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn is_gone_once_rust_analyzer_closes_its_stdout() {
-        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."), json!({}));
         let (stdout, rust_analyzer) = tokio::io::duplex(64);
         client.reader = Some(super::super::connection::start_handlers(
             stdout,
@@ -789,7 +768,7 @@ mod tests {
                 quiescent: client.quiescent.clone(),
                 flycheck: client.flycheck.clone(),
                 outgoing: Arc::new(Mutex::new(BufWriter::new(tokio::io::sink()))),
-                settings: settings(),
+                settings: json!({}),
             },
         ));
         tokio::task::yield_now().await;
@@ -805,7 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_diagnostics_fails_once_rust_analyzer_is_gone() {
-        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."), json!({}));
         let mut reader = tokio::spawn(async {});
         (&mut reader).await.unwrap();
         client.reader = Some(reader);
@@ -824,7 +803,7 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut client = RustAnalyzerClient::new(PathBuf::from("."));
+        let mut client = RustAnalyzerClient::new(PathBuf::from("."), json!({}));
         client.stdin = Some(Arc::new(Mutex::new(BufWriter::new(
             child.stdin.take().unwrap(),
         ))));
