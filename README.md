@@ -250,6 +250,21 @@ Get all diagnostics across the entire workspace.
 Returns aggregated diagnostics for all files in the workspace with file paths, severity levels,
 messages, and a summary of total counts by severity.
 
+#### `rust_analyzer_rename`
+Rename the symbol at a position, everywhere it is used in the workspace.
+
+**Parameters:**
+- `file_path`: Path to the Rust file
+- `line`: Line number (0-based)
+- `character`: Character position (0-based)
+- `new_name`: The new name
+
+Changes no files. It returns the edits to apply, each with the byte range it covers and the text it
+replaces, listed last-first within each file so they can be applied one after another without
+adjusting for the ones already made. It fails rather than answering while rust-analyzer is still
+loading the workspace, since a rename worked out before then could miss references. Renaming a module also renames its file, which is reported
+under `file_operations`; the untouched LSP `WorkspaceEdit` is included as `workspace_edit`.
+
 ### `rust_analyzer_set_workspace`
 Change the workspace root directory.
 
@@ -367,7 +382,7 @@ cargo run --release
 
 This is a foundation implementation that covers the most common rust-analyzer features. Contributions are welcome for:
 
-- Additional LSP methods (workspace symbols, rename, etc.)
+- Additional LSP methods (workspace symbols, call hierarchy, etc.)
 - Better error handling and diagnostics  
 - Configuration options (via CLI args or config files)
 - Performance optimizations and async improvements

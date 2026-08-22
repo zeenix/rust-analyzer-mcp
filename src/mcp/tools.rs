@@ -95,6 +95,27 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "rust_analyzer_rename".to_string(),
+            description: "Rename the Rust symbol at a position and return the edits that carry \
+                          the rename out across the whole workspace. Changes no files: apply the \
+                          returned edits yourself. Renaming a module also renames its file, \
+                          which is reported under file_operations. Fails with an explanation if \
+                          there is nothing renameable at the position or the symbol is defined \
+                          in a dependency, or if rust-analyzer has not finished loading the \
+                          workspace -- a rename worked out before then could miss references."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" },
+                    "new_name": { "type": "string", "description": "The new name. For a lifetime, include the leading apostrophe" }
+                },
+                "required": ["file_path", "line", "character", "new_name"]
+            }),
+        },
+        ToolDefinition {
             name: "rust_analyzer_set_workspace".to_string(),
             description: "Set the workspace root directory for rust-analyzer".to_string(),
             input_schema: json!({

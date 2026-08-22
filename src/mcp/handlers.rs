@@ -1,10 +1,15 @@
 use anyhow::{anyhow, Result};
 use log::debug;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::{
+    config::WORKSPACE_LOAD_TIMEOUT_SECS,
     diagnostics::format_diagnostics,
+    position,
     protocol::mcp::{ContentItem, ToolResult},
     uri,
 };
@@ -59,6 +64,7 @@ pub async fn handle_tool_call(
         "rust_analyzer_symbols" => handle_symbols(server, args).await,
         "rust_analyzer_format" => handle_format(server, args).await,
         "rust_analyzer_code_actions" => handle_code_actions(server, args).await,
+        "rust_analyzer_rename" => handle_rename(server, args).await,
         "rust_analyzer_set_workspace" => handle_set_workspace(server, args).await,
         "rust_analyzer_diagnostics" => handle_diagnostics(server, args).await,
         "rust_analyzer_workspace_diagnostics" => handle_workspace_diagnostics(server, args).await,
@@ -210,6 +216,225 @@ async fn handle_code_actions(
             text: serde_json::to_string_pretty(&result)?,
         }],
     })
+}
+
+async fn handle_rename(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+    let Some(new_name) = args["new_name"].as_str() else {
+        return Err(anyhow!("Missing new_name"));
+    };
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+    // A rename is worked out across every file rust-analyzer holds, so every one of them has to
+    // be the file that is actually there.
+    server.refresh_open_documents().await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    // A rename is worked out from everything rust-analyzer has loaded, so one worked out while
+    // it is still loading can miss the references it has not reached yet -- and half a rename
+    // applied leaves the code worse than it was found. There is no reporting that with the
+    // edits, either: whoever asked would have every reason to take them for the whole rename.
+    if !client
+        .wait_until_loaded(Duration::from_secs(WORKSPACE_LOAD_TIMEOUT_SECS))
+        .await
+    {
+        return Err(anyhow!(
+            "rust-analyzer is still loading the workspace after {}s. A rename worked out now \
+             could miss references, so it is not worth having; ask again once it has settled.",
+            WORKSPACE_LOAD_TIMEOUT_SECS
+        ));
+    }
+
+    // What is about to be renamed is asked for first: its answer names the symbol, and it
+    // explains a position with nothing to rename at it better than the rename itself would.
+    let renaming = client.prepare_rename(&uri, line, character).await?;
+    let edit = client.rename(&uri, line, character, new_name).await?;
+    if edit.is_null() {
+        return Err(anyhow!(
+            "Nothing to rename at {}:{}:{}",
+            file_path,
+            line,
+            character
+        ));
+    }
+
+    let old_name = renamed_symbol(server, &file_path, &renaming).await;
+    let result = describe_rename(&edit, old_name, new_name).await;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+/// The text `prepareRename` pointed at, which is the name being replaced.
+async fn renamed_symbol(
+    server: &RustAnalyzerMCPServer,
+    file_path: &str,
+    renaming: &Value,
+) -> Option<String> {
+    // rust-analyzer answers with a bare range; the specification also allows one wrapped
+    // alongside a placeholder.
+    let range = renaming.get("range").unwrap_or(renaming);
+    let content = tokio::fs::read_to_string(server.resolve_path(file_path))
+        .await
+        .ok()?;
+
+    Some(text_of(&content, range)?.to_string())
+}
+
+/// An account of a workspace edit that can be applied without working any of it out again.
+async fn describe_rename(edit: &Value, old_name: Option<String>, new_name: &str) -> Value {
+    let mut changes = Vec::new();
+    let mut file_operations = Vec::new();
+    let mut edit_count = 0;
+
+    for change in document_changes(edit) {
+        match change {
+            Change::Text { uri, edits } => {
+                let path = uri::uri_to_path(&uri);
+                let content = match &path {
+                    Some(path) => tokio::fs::read_to_string(path).await.ok(),
+                    None => None,
+                };
+
+                let mut edits: Vec<Value> = edits
+                    .iter()
+                    .map(|edit| describe_edit(edit, content.as_deref()))
+                    .collect();
+                // Descending, so that applying them one after another needs no arithmetic: every
+                // edit's range still means what it says once the ones after it have been made.
+                edits.sort_by_key(|edit| {
+                    std::cmp::Reverse((
+                        edit["line"].as_u64().unwrap_or(0),
+                        edit["character"].as_u64().unwrap_or(0),
+                    ))
+                });
+
+                edit_count += edits.len();
+                changes.push(json!({
+                    "file": display_path(&path, &uri),
+                    "edits": edits,
+                }));
+            }
+            Change::Resource(operation) => file_operations.push(operation),
+        }
+    }
+
+    json!({
+        "applied": false,
+        "old_name": old_name,
+        "new_name": new_name,
+        "position_encoding": "utf-16",
+        "summary": {
+            "files_changed": changes.len(),
+            "edits": edit_count,
+            "file_operations": file_operations.len(),
+        },
+        "changes": changes,
+        "file_operations": file_operations,
+        // Everything above is this, worked out. Whoever would rather work it out themselves can.
+        "workspace_edit": edit,
+    })
+}
+
+/// One entry of a workspace edit.
+enum Change {
+    /// Edits to one file.
+    Text { uri: String, edits: Vec<Value> },
+    /// Something done to a file itself, such as the rename of a module's file.
+    Resource(Value),
+}
+
+/// The changes a workspace edit is made of, however it spells them.
+fn document_changes(edit: &Value) -> Vec<Change> {
+    // `documentChanges` is what a client that understands file operations gets, and the only
+    // form that can carry them; `changes` is the older shape, kept for the rust-analyzer that
+    // answers with it.
+    if let Some(document_changes) = edit.get("documentChanges").and_then(|it| it.as_array()) {
+        return document_changes
+            .iter()
+            .map(
+                |change| match change.get("edits").and_then(|it| it.as_array()) {
+                    Some(edits) => Change::Text {
+                        uri: change["textDocument"]["uri"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        edits: edits.clone(),
+                    },
+                    None => Change::Resource(change.clone()),
+                },
+            )
+            .collect();
+    }
+
+    edit.get("changes")
+        .and_then(|it| it.as_object())
+        .map(|changes| {
+            changes
+                .iter()
+                .map(|(uri, edits)| Change::Text {
+                    uri: uri.clone(),
+                    edits: edits.as_array().cloned().unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One text edit, with the offsets and the text it replaces spelled out.
+fn describe_edit(edit: &Value, content: Option<&str>) -> Value {
+    let range = edit.get("range").cloned().unwrap_or(json!(null));
+    let mut described = json!({
+        "line": range["start"]["line"],
+        "character": range["start"]["character"],
+        "end_line": range["end"]["line"],
+        "end_character": range["end"]["character"],
+        "new_text": edit.get("newText").cloned().unwrap_or(json!("")),
+    });
+
+    // Byte offsets and the text being replaced, so that an edit can be applied to the file as
+    // bytes and checked before it is: the columns above are UTF-16 code units, which are neither.
+    if let Some(content) = content {
+        if let Some((start, end)) = byte_range(content, &range) {
+            described["byte_range"] = json!([start, end]);
+            described["old_text"] = json!(&content[start..end]);
+        }
+    }
+
+    described
+}
+
+/// What `range` covers in `content`.
+fn text_of<'a>(content: &'a str, range: &Value) -> Option<&'a str> {
+    let (start, end) = byte_range(content, range)?;
+
+    Some(&content[start..end])
+}
+
+/// The byte offsets `range` covers in `content`.
+fn byte_range(content: &str, range: &Value) -> Option<(usize, usize)> {
+    let at = |end: &str, of: &str| -> Option<u32> {
+        range.get(end)?.get(of)?.as_u64().map(|it| it as u32)
+    };
+
+    let start = position::byte_offset(content, at("start", "line")?, at("start", "character")?);
+    let end = position::byte_offset(content, at("end", "line")?, at("end", "character")?);
+
+    (start <= end).then_some((start, end))
+}
+
+/// The path a URI names, or the URI itself when it names none.
+fn display_path(path: &Option<PathBuf>, uri: &str) -> String {
+    path.as_ref()
+        .map_or_else(|| uri.to_string(), |path| path.display().to_string())
 }
 
 async fn handle_set_workspace(
