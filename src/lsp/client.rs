@@ -24,7 +24,7 @@ use crate::{
     uri,
 };
 
-use super::connection::{send_message, Outgoing};
+use super::connection::{send_message, Connection, Diagnostics, Flycheck, Outgoing};
 
 pub struct RustAnalyzerClient {
     pub(super) process: Option<Child>,
@@ -35,10 +35,17 @@ pub struct RustAnalyzerClient {
     pub(super) initialized: bool,
     /// What rust-analyzer was last told about each open document, keyed by normalized URI.
     pub(super) open_documents: Arc<Mutex<HashMap<String, OpenDocument>>>,
-    pub(super) diagnostics: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    pub(super) diagnostics: Diagnostics,
     /// Whether rust-analyzer last reported itself quiescent, i.e. with no background work such
     /// as loading the workspace in flight. Fed by its `experimental/serverStatus` notifications.
     pub(super) quiescent: watch::Sender<bool>,
+    /// The cargo checks rust-analyzer has run, fed by its `$/progress` notifications.
+    pub(super) flycheck: watch::Sender<Flycheck>,
+    /// Whether waiting for a cargo check has already been given up on once. Ones older than
+    /// the reports never report a check, and waiting on a report that is not coming would cost
+    /// every diagnostics call the whole timeout -- but this only holds while no check has been
+    /// reported at all, so one that turns up later puts the waiting back.
+    pub(super) gave_up_on_checks: bool,
     /// Open documents whose `didSave` has been sent, see [`Self::open_document`].
     pub(super) saved_documents: HashSet<String>,
     /// The task reading rust-analyzer's stdout; it finishing means rust-analyzer is gone.
@@ -59,6 +66,8 @@ impl RustAnalyzerClient {
             open_documents: Arc::new(Mutex::new(HashMap::new())),
             diagnostics: Arc::new(Mutex::new(HashMap::new())),
             quiescent: watch::channel(false).0,
+            flycheck: watch::channel(Flycheck::default()).0,
+            gave_up_on_checks: false,
             saved_documents: HashSet::new(),
             reader: None,
         }
@@ -124,11 +133,14 @@ impl RustAnalyzerClient {
         self.reader = Some(super::connection::start_handlers(
             stdout,
             stderr,
-            Arc::clone(&self.pending_requests),
-            Arc::clone(&self.diagnostics),
-            self.quiescent.clone(),
-            stdin,
-            settings(),
+            Connection {
+                pending_requests: Arc::clone(&self.pending_requests),
+                diagnostics: Arc::clone(&self.diagnostics),
+                quiescent: self.quiescent.clone(),
+                flycheck: self.flycheck.clone(),
+                outgoing: stdin,
+                settings: settings(),
+            },
         ));
 
         self.process = Some(child);
@@ -268,6 +280,11 @@ impl RustAnalyzerClient {
                     "didChangeConfiguration": {
                         "dynamicRegistration": false
                     }
+                },
+                // Opt into the progress reports rust-analyzer gives on its background work,
+                // the cargo checks above all. It stays silent about all of it otherwise.
+                "window": {
+                    "workDoneProgress": true
                 },
                 // Opt into `experimental/serverStatus` notifications, which report whether
                 // rust-analyzer is quiescent.
@@ -427,6 +444,8 @@ impl RustAnalyzerClient {
         self.open_documents.lock().await.clear();
         self.saved_documents.clear();
         self.diagnostics.lock().await.clear();
+        self.flycheck.send_replace(Flycheck::default());
+        self.gave_up_on_checks = false;
         self.initialized = false;
     }
 
@@ -520,6 +539,10 @@ mod tests {
 
     #[cfg(unix)]
     const URI: &str = "file:///tmp/lib.rs";
+
+    /// The progress token rust-analyzer reports a workspace's cargo checks under.
+    #[cfg(unix)]
+    const FLYCHECK: &str = "rust-analyzer/flycheck/0";
 
     #[cfg(unix)]
     #[tokio::test]
@@ -639,6 +662,98 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn diagnostics_are_asked_for_and_waited_on() {
+        let (mut client, mut child) = client_with_fake_stdin();
+        client.quiescent.send_replace(true);
+
+        // Stand in for rust-analyzer: report a check starting and finishing, with something to
+        // say about the file, once the client is waiting for one.
+        let flycheck = client.flycheck.clone();
+        let diagnostics = Arc::clone(&client.diagnostics);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flycheck.send_modify(|flycheck| flycheck.begin(FLYCHECK));
+            diagnostics.lock().await.insert(
+                URI.to_string(),
+                vec![json!({ "message": "mismatched types" })],
+            );
+            flycheck.send_modify(|flycheck| flycheck.end(FLYCHECK));
+        });
+
+        let fresh = client.fresh_diagnostics(URI).await.unwrap();
+
+        assert!(fresh.complete);
+        assert_eq!(fresh.items[0]["message"], "mismatched types");
+        let sent = written(&mut client, &mut child).await;
+        assert!(sent.contains("rust-analyzer/runFlycheck"), "{sent}");
+        // And rust-analyzer's own analysis is asked for rather than waited for.
+        assert!(sent.contains("textDocument/diagnostic"), "{sent}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn diagnostics_come_back_marked_when_no_check_runs() {
+        // What an older rust-analyzer, or one with checking switched off, leaves us with: no
+        // check to wait for, so what is already known is the best there is.
+        let (mut client, _child) = client_with_fake_stdin();
+        client.quiescent.send_replace(true);
+
+        let fresh = client.fresh_diagnostics(URI).await.unwrap();
+
+        assert!(!fresh.complete);
+        assert_eq!(fresh.items, json!([]));
+        // And having learnt that, it does not wait the same wait out again.
+        assert!(client.gave_up_on_checks);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_check_reported_late_puts_the_waiting_back() {
+        // Giving up on a rust-analyzer that reports no checks must not outlast a check turning
+        // up: on a workspace big enough, the first one begins after the wait has been given up.
+        let (mut client, _child) = client_with_fake_stdin();
+        client.quiescent.send_replace(true);
+        client.fresh_diagnostics(URI).await.unwrap();
+        assert!(client.gave_up_on_checks);
+
+        client.flycheck.send_modify(|flycheck| {
+            flycheck.begin(FLYCHECK);
+            flycheck.end(FLYCHECK);
+        });
+
+        // So this call waits again, and the check it asks for is waited out.
+        let flycheck = client.flycheck.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flycheck.send_modify(|flycheck| flycheck.begin(FLYCHECK));
+            flycheck.send_modify(|flycheck| flycheck.end(FLYCHECK));
+        });
+
+        let fresh = client.fresh_diagnostics(URI).await.unwrap();
+
+        assert!(fresh.complete);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn diagnostics_from_a_workspace_still_loading_are_marked() {
+        // A file rust-analyzer has not reached yet looks exactly like a file with nothing wrong
+        // with it, so an unqualified "no errors" here would be a lie.
+        let (mut client, _child) = client_with_fake_stdin();
+        let flycheck = client.flycheck.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flycheck.send_modify(|flycheck| flycheck.begin(FLYCHECK));
+            flycheck.send_modify(|flycheck| flycheck.end(FLYCHECK));
+        });
+
+        let fresh = client.fresh_diagnostics(URI).await.unwrap();
+
+        assert!(!fresh.complete);
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn exit_status_reflects_whether_rust_analyzer_is_alive() {
         let mut client = RustAnalyzerClient::new(PathBuf::from("."));
@@ -668,11 +783,14 @@ mod tests {
         client.reader = Some(super::super::connection::start_handlers(
             stdout,
             tokio::io::empty(),
-            Arc::clone(&client.pending_requests),
-            Arc::clone(&client.diagnostics),
-            client.quiescent.clone(),
-            Arc::new(Mutex::new(BufWriter::new(tokio::io::sink()))),
-            settings(),
+            Connection {
+                pending_requests: Arc::clone(&client.pending_requests),
+                diagnostics: Arc::clone(&client.diagnostics),
+                quiescent: client.quiescent.clone(),
+                flycheck: client.flycheck.clone(),
+                outgoing: Arc::new(Mutex::new(BufWriter::new(tokio::io::sink()))),
+                settings: settings(),
+            },
         ));
         tokio::task::yield_now().await;
         assert!(!client.is_gone());

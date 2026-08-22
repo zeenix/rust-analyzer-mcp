@@ -247,40 +247,20 @@ async fn handle_diagnostics(server: &mut RustAnalyzerMCPServer, args: Value) -> 
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    // Poll for diagnostics - rust-analyzer needs time to run cargo check.
-    // For files with expected errors (like diagnostics_test.rs), poll longer.
-    let should_poll = file_path.contains("diagnostics_test") || file_path.contains("simple_error");
-
     let Some(client) = &mut server.client else {
         return Err(anyhow!("Client not initialized"));
     };
 
-    let mut result = json!([]);
-    if should_poll {
-        let start = std::time::Instant::now();
-        let timeout = tokio::time::Duration::from_secs(8); // Less than test timeout.
-        let poll_interval = tokio::time::Duration::from_millis(500);
-
-        while start.elapsed() < timeout {
-            result = client.diagnostics(&uri).await?;
-            let Some(diag_array) = result.as_array() else {
-                tokio::time::sleep(poll_interval).await;
-                continue;
-            };
-
-            if !diag_array.is_empty() {
-                // We got diagnostics, stop polling.
-                break;
-            }
-            tokio::time::sleep(poll_interval).await;
-        }
-    } else {
-        // For clean files, just wait a bit and check once.
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        result = client.diagnostics(&uri).await?;
+    let fresh = client.fresh_diagnostics(&uri).await?;
+    let mut diagnostics = format_diagnostics(&file_path, &fresh.items);
+    if !fresh.complete {
+        // Saying so beats either waiting longer or passing off what rust-analyzer had got to so
+        // far as the state of the code -- least of all when that is an empty list.
+        diagnostics["note"] = json!(
+            "rust-analyzer had not finished loading the workspace or checking it when this was \
+             reported, so these diagnostics may be incomplete. Ask again for the rest."
+        );
     }
-
-    let diagnostics = format_diagnostics(&file_path, &result);
 
     Ok(ToolResult {
         content: vec![ContentItem {
