@@ -149,6 +149,15 @@ impl RustAnalyzerMCPServer {
                 continue;
             };
 
+            // A message without an `id` is a JSON-RPC notification, which must never be answered,
+            // not even with an error: a client that receives a response it did not ask for treats
+            // it as a protocol violation and closes the transport. `notifications/initialized` is
+            // part of every MCP handshake, so this used to break every spec-compliant client.
+            if request.id.is_none() {
+                debug!("Ignoring notification: {}", request.method);
+                continue;
+            }
+
             debug!("Received request: {}", request.method);
             // A shutdown signal must not wait for the request to finish: a tool call that
             // cold-starts rust-analyzer can run for minutes.
@@ -241,6 +250,13 @@ impl RustAnalyzerMCPServer {
                         "tools": {}
                     }
                 }),
+            },
+            // A liveness check the client may send at any point, including before `initialize`.
+            // Its result is empty; what matters is that it comes back at all.
+            "ping" => MCPResponse::Success {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: json!({}),
             },
             "tools/list" => MCPResponse::Success {
                 jsonrpc: "2.0".to_string(),
