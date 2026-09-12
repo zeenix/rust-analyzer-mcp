@@ -9,6 +9,7 @@ use std::{
 use crate::{
     config::WORKSPACE_LOAD_TIMEOUT_SECS,
     diagnostics::format_diagnostics,
+    locations,
     lsp::RustAnalyzerClient,
     position,
     protocol::mcp::{ContentItem, ToolResult},
@@ -88,16 +89,38 @@ async fn ensure_index_ready(client: &RustAnalyzerClient) -> Result<()> {
 /// A file outside the root is not wrong in itself -- a definition can lead into a dependency's
 /// sources, and asking about one there works -- so this only speaks up when the answer was
 /// empty anyway.
+///
+/// The root itself can also be the problem. `set_workspace` refuses a directory with no
+/// `Cargo.toml`, but the workspace the server *starts* in is its working directory, which nothing
+/// chooses and nothing checks -- so a session opened outside a Rust project begins in exactly the
+/// state `set_workspace` refuses to move into, and a file inside that root passes the check below
+/// while rust-analyzer has loaded nothing at all.
 fn explain_empty_answer(
     server: &RustAnalyzerMCPServer,
     result: &Value,
     file_path: &str,
 ) -> Result<()> {
     let empty = result.is_null() || result.as_array().is_some_and(|items| items.is_empty());
-    if !empty
-        || server
-            .resolve_path(file_path)
-            .starts_with(&server.workspace_root)
+    if !empty {
+        return Ok(());
+    }
+
+    if !server.workspace_root.join("Cargo.toml").is_file() {
+        return Err(anyhow!(
+            "rust-analyzer had nothing to say about {}, and the workspace it has loaded ({}) is \
+             not a Rust workspace: there is no Cargo.toml in it, so it has loaded nothing and \
+             every question about every file is answered this way. That is the directory the \
+             server was started in -- it is not chosen, it is wherever the session began. Point \
+             it at the project this file belongs to with rust_analyzer_set_workspace, then ask \
+             again.",
+            file_path,
+            server.workspace_root.display()
+        ));
+    }
+
+    if server
+        .resolve_path(file_path)
+        .starts_with(&server.workspace_root)
     {
         return Ok(());
     }

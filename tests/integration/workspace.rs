@@ -6,7 +6,6 @@
 //! every file comes back looking like dead code.
 
 use anyhow::Result;
-use serde_json::json;
 use tempfile::TempDir;
 use test_support::{IsolatedProject, MCPTestClient};
 
@@ -42,6 +41,40 @@ async fn a_directory_with_no_manifest_is_refused_as_a_workspace() -> Result<()> 
             .as_str()
             .is_some_and(|text| text.contains("run")),
         "the original workspace is expected to still answer: {symbols}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_workspace_with_no_manifest_is_not_reported_as_empty() -> Result<()> {
+    // The door set_workspace cannot close: the workspace a server starts in is its working
+    // directory, so a session opened outside a Rust project begins in the state set_workspace
+    // refuses to move into -- and the file asked about is *inside* that root, so being outside
+    // the workspace is not what is wrong with it.
+    let not_a_workspace = TempDir::new()?;
+    // Where a crate would keep it, so the readiness poll has a file to find -- and so the point
+    // stands that nothing but the missing manifest is wrong here.
+    let orphan = not_a_workspace.path().join("src/lib.rs");
+    std::fs::create_dir_all(orphan.parent().unwrap())?;
+    std::fs::write(&orphan, "pub fn stranded() -> u32 {\n    7\n}\n")?;
+
+    let client = MCPTestClient::start(not_a_workspace.path()).await?;
+    client.initialize_and_wait().await?;
+
+    let complaint = client
+        .get_hover(orphan.to_str().unwrap(), 0, 7)
+        .await
+        .expect_err("a workspace with no Cargo.toml has loaded nothing to answer from");
+    let complaint = complaint.to_string();
+
+    assert!(
+        complaint.contains("not a Rust workspace"),
+        "the error is expected to say what is wrong with the loaded root: {complaint}"
+    );
+    assert!(
+        complaint.contains(&not_a_workspace.path().display().to_string()),
+        "the error is expected to name the root it is complaining about: {complaint}"
     );
 
     Ok(())
