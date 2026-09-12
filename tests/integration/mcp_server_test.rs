@@ -360,8 +360,10 @@ async fn test_references(client: &mut IpcClient, workspace_path: &Path) -> Resul
         return Ok(false);
     };
 
-    let references: Vec<Value> = serde_json::from_str(text_str)?;
-    Ok(!references.is_empty())
+    let references: Value = serde_json::from_str(text_str)?;
+    Ok(references["locations"]
+        .as_array()
+        .is_some_and(|hits| !hits.is_empty()))
 }
 
 async fn test_hover(client: &mut IpcClient, workspace_path: &Path) -> Result<bool> {

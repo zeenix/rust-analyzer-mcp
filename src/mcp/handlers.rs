@@ -226,6 +226,7 @@ async fn handle_references(server: &mut RustAnalyzerMCPServer, args: Value) -> R
 
     let result = client.references(&uri, line, character).await?;
     explain_empty_answer(server, &result, &file_path)?;
+    let result = locations::annotate(&result, &server.workspace_root);
 
     Ok(ToolResult {
         content: vec![ContentItem {

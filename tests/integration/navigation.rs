@@ -115,6 +115,54 @@ async fn an_implementation_is_found_by_the_trait_it_implements() -> Result<()> {
     Ok(())
 }
 
+/// A reference is where a name appears, and the line it appears in says which appearance it is.
+#[tokio::test]
+async fn references_carry_the_line_they_point_at() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let utils = client.workspace_path().join("src/utils.rs");
+
+    // `pub fn process`, on the name itself.
+    let answer = call(
+        &mut client,
+        "rust_analyzer_references",
+        json!({ "file_path": utils.to_str().unwrap(), "line": 3, "character": 7 }),
+    )
+    .await?;
+
+    let hits = answer["locations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a list of locations, got: {answer}"));
+    assert!(
+        !hits.is_empty(),
+        "`process` is called in this project: {answer}"
+    );
+    assert_eq!(
+        answer["count"].as_u64(),
+        Some(hits.len() as u64),
+        "the count is expected to be of the hits reported: {answer}"
+    );
+
+    for hit in hits {
+        assert!(
+            hit["file"].is_string() && hit["line"].is_number() && hit["character"].is_number(),
+            "every hit is expected to say where it is: {hit}"
+        );
+        // The path is the one a reader reads, not the temporary directory the test runs in.
+        assert!(
+            !hit["file"].as_str().unwrap_or_default().starts_with('/'),
+            "a hit inside the workspace is expected to be named relative to it: {hit}"
+        );
+        assert!(
+            hit["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("process")),
+            "the line quoted is expected to be the line the hit points at: {hit}"
+        );
+    }
+
+    Ok(())
+}
+
 /// The parsed answer of a tool that replies with JSON in a text content item.
 async fn call(client: &mut IpcClient, tool: &str, arguments: Value) -> Result<Value> {
     let response = client.call_tool(tool, arguments).await?;
