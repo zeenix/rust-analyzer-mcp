@@ -280,8 +280,30 @@ impl RustAnalyzerClient {
                     "definition": {
                         "linkSupport": true
                     },
+                    // What a value's type is declared as, and which types carry a trait's
+                    // implementation -- the second being the one question no text search can
+                    // answer at all, since the answer is decided by dispatch rather than by
+                    // anything written at the call.
+                    "typeDefinition": {
+                        "linkSupport": true
+                    },
+                    "implementation": {
+                        "linkSupport": true
+                    },
+                    // Which functions call this one, as opposed to where its name appears.
+                    "callHierarchy": {
+                        "dynamicRegistration": false
+                    },
                     "references": {},
-                    "documentSymbol": {},
+                    // Ask for the nested `DocumentSymbol` shape rather than the flat
+                    // `SymbolInformation` one rust-analyzer falls back to. Only the nested shape
+                    // carries `selectionRange`, which is the identifier itself; the flat shape
+                    // has a `range` that starts at the item's doc comment, so a position taken
+                    // from it lands several lines above the name and every position request made
+                    // with it answers about nothing.
+                    "documentSymbol": {
+                        "hierarchicalDocumentSymbolSupport": true
+                    },
                     "codeAction": {
                         "codeActionLiteralSupport": {
                             "codeActionKind": {
@@ -314,6 +336,11 @@ impl RustAnalyzerClient {
                 },
                 "workspace": {
                     "didChangeConfiguration": {
+                        "dynamicRegistration": false
+                    },
+                    // Without this rust-analyzer answers `workspace/symbol` with nothing at
+                    // all, and a name cannot be turned into a position by any other means here.
+                    "symbol": {
                         "dynamicRegistration": false
                     },
                     // Renaming a module renames its file, which rust-analyzer refuses to work
