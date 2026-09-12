@@ -98,6 +98,89 @@ async fn test_file_diagnostics() -> Result<()> {
     Ok(())
 }
 
+/// One fault, one entry -- however many of rust-analyzer's two mouths reported it.
+#[tokio::test]
+async fn a_fault_reported_twice_is_counted_once() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project-diagnostics").await?;
+    let errors_path = client.workspace_path().join("src/errors.rs");
+
+    let mut parsed = serde_json::Value::Null;
+    for attempt in 0..20 {
+        let response = client
+            .call_tool(
+                "rust_analyzer_diagnostics",
+                json!({ "file_path": errors_path.to_str().unwrap() }),
+            )
+            .await?;
+        assert_tool_response(&response);
+        parsed = serde_json::from_str(response["content"][0]["text"].as_str().unwrap())?;
+
+        // Both sources have to have reported before there is anything to deduplicate: the
+        // rust-analyzer half arrives first, and the rustc half follows when flycheck finishes.
+        let has_rustc = parsed["diagnostics"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|d| d["sources"].to_string().contains("rustc"))
+        });
+        if has_rustc {
+            break;
+        }
+        if attempt < 19 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    let diagnostics = parsed["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array");
+    let mut faults = std::collections::HashSet::new();
+    for diag in diagnostics {
+        let fault = (
+            diag["severity"].to_string(),
+            diag["code"].to_string(),
+            diag["range"]["start"]["line"].to_string(),
+            diag["range"]["start"]["character"].to_string(),
+        );
+        assert!(
+            faults.insert(fault.clone()),
+            "the same fault is reported twice, once per source: {fault:?} in {}",
+            serde_json::to_string_pretty(&parsed)?
+        );
+    }
+
+    // The undefined variable on line 4 is one of the faults both of them report, and the wording
+    // kept is the compiler's -- it names the variable, where rust-analyzer's does not.
+    let undefined = diagnostics
+        .iter()
+        .find(|d| d["code"] == json!("E0425"))
+        .expect("the undefined variable is expected to be reported");
+    assert_eq!(
+        undefined["sources"],
+        json!(["rust-analyzer", "rustc"]),
+        "both sources are expected to be recorded: {undefined}"
+    );
+    assert!(
+        undefined["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("undefined_var")),
+        "the compiler's wording is expected to be the one kept: {undefined}"
+    );
+
+    // And the counts are of what is left, so they are the number of faults, not of reports.
+    let summary = &parsed["summary"];
+    let counted = summary["errors"].as_u64().unwrap_or(0)
+        + summary["warnings"].as_u64().unwrap_or(0)
+        + summary["information"].as_u64().unwrap_or(0)
+        + summary["hints"].as_u64().unwrap_or(0);
+    assert_eq!(
+        counted as usize,
+        diagnostics.len(),
+        "the summary is expected to count exactly the diagnostics reported: {summary}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_file_diagnostics_clean_file() -> Result<()> {
     // Use test-project-diagnostics which has a clean file
