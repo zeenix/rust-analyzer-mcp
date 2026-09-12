@@ -7,6 +7,7 @@ mod integration {
     mod rename;
     mod shared_test;
     mod shutdown;
+    mod symbols;
 }
 mod unit {
     mod protocol {

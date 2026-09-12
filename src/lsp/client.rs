@@ -281,7 +281,15 @@ impl RustAnalyzerClient {
                         "linkSupport": true
                     },
                     "references": {},
-                    "documentSymbol": {},
+                    // Ask for the nested `DocumentSymbol` shape rather than the flat
+                    // `SymbolInformation` one rust-analyzer falls back to. Only the nested shape
+                    // carries `selectionRange`, which is the identifier itself; the flat shape
+                    // has a `range` that starts at the item's doc comment, so a position taken
+                    // from it lands several lines above the name and every position request made
+                    // with it answers about nothing.
+                    "documentSymbol": {
+                        "hierarchicalDocumentSymbolSupport": true
+                    },
                     "codeAction": {
                         "codeActionLiteralSupport": {
                             "codeActionKind": {
