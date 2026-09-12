@@ -121,7 +121,10 @@ async fn test_file_uri_is_accepted_as_a_path() -> Result<()> {
 
 #[tokio::test]
 async fn test_workspace_change() -> Result<()> {
-    let mut client = IpcClient::get_or_create("test-project").await?;
+    // A daemon of this test's own: the workspace it is about to be pointed at outlives this
+    // test, and every later question asked of a shared daemon would be answered about the wrong
+    // project.
+    let mut client = IpcClient::get_or_create("test-project-set-workspace").await?;
 
     // Create a second isolated project to switch to
     let second_project = test_support::IsolatedProject::new()?;
@@ -357,8 +360,10 @@ async fn test_references(client: &mut IpcClient, workspace_path: &Path) -> Resul
         return Ok(false);
     };
 
-    let references: Vec<Value> = serde_json::from_str(text_str)?;
-    Ok(!references.is_empty())
+    let references: Value = serde_json::from_str(text_str)?;
+    Ok(references["locations"]
+        .as_array()
+        .is_some_and(|hits| !hits.is_empty()))
 }
 
 async fn test_hover(client: &mut IpcClient, workspace_path: &Path) -> Result<bool> {
