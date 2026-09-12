@@ -9,6 +9,7 @@ use std::{
 use crate::{
     config::WORKSPACE_LOAD_TIMEOUT_SECS,
     diagnostics::format_diagnostics,
+    lsp::RustAnalyzerClient,
     position,
     protocol::mcp::{ContentItem, ToolResult},
     uri,
@@ -49,6 +50,68 @@ impl ToolParams {
     }
 }
 
+/// Refuses to answer from an index rust-analyzer has not finished building.
+///
+/// Everything rust-analyzer works out from the whole workspace -- what a symbol is, where it is
+/// defined, what refers to it -- it answers with `null` or `[]` until it has loaded that
+/// workspace. Those are the same answers it gives for a symbol nothing refers to and for a
+/// position that is not on a symbol at all, so a caller cannot tell an index that is not ready
+/// from code that is genuinely unused, and the wrong one of those is the one people act on.
+///
+/// Waiting makes the common case right, and saying so when the wait runs out makes the rest
+/// loud rather than silent.
+async fn ensure_index_ready(client: &RustAnalyzerClient) -> Result<()> {
+    if client
+        .wait_until_loaded(Duration::from_secs(WORKSPACE_LOAD_TIMEOUT_SECS))
+        .await
+    {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "rust-analyzer is still loading the workspace after {}s. An answer worked out now would \
+         be from a partial index, and an empty one could not be told from a symbol that is \
+         really unused; ask again once it has settled.",
+        WORKSPACE_LOAD_TIMEOUT_SECS
+    ))
+}
+
+/// Explains an empty answer that the loaded workspace accounts for, and leaves every other
+/// answer alone.
+///
+/// rust-analyzer only knows the workspace it was pointed at. Asked about a file outside it, it
+/// does not say so -- it answers `null`, or an empty list, which is also what it answers for a
+/// symbol nothing refers to and for a position that is not on a symbol. That is the same silent
+/// wrong answer the readiness gate exists to prevent, arriving by a different route: the gate is
+/// satisfied, because a workspace with no Rust in it finishes loading immediately.
+///
+/// A file outside the root is not wrong in itself -- a definition can lead into a dependency's
+/// sources, and asking about one there works -- so this only speaks up when the answer was
+/// empty anyway.
+fn explain_empty_answer(
+    server: &RustAnalyzerMCPServer,
+    result: &Value,
+    file_path: &str,
+) -> Result<()> {
+    let empty = result.is_null() || result.as_array().is_some_and(|items| items.is_empty());
+    if !empty
+        || server
+            .resolve_path(file_path)
+            .starts_with(&server.workspace_root)
+    {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "rust-analyzer had nothing to say about {}, which is outside the workspace it has \
+         loaded ({}). Everything it knows comes from that workspace, so a file outside it reads \
+         as empty rather than as unknown. Point it at the project this file belongs to with \
+         rust_analyzer_set_workspace, then ask again.",
+        file_path,
+        server.workspace_root.display()
+    ))
+}
+
 pub async fn handle_tool_call(
     server: &mut RustAnalyzerMCPServer,
     tool_name: &str,
@@ -82,7 +145,10 @@ async fn handle_hover(server: &mut RustAnalyzerMCPServer, args: Value) -> Result
         return Err(anyhow!("Client not initialized"));
     };
 
+    ensure_index_ready(client).await?;
+
     let result = client.hover(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -102,7 +168,10 @@ async fn handle_definition(server: &mut RustAnalyzerMCPServer, args: Value) -> R
         return Err(anyhow!("Client not initialized"));
     };
 
+    ensure_index_ready(client).await?;
+
     let result = client.definition(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -122,7 +191,10 @@ async fn handle_references(server: &mut RustAnalyzerMCPServer, args: Value) -> R
         return Err(anyhow!("Client not initialized"));
     };
 
+    ensure_index_ready(client).await?;
+
     let result = client.references(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -142,7 +214,10 @@ async fn handle_completion(server: &mut RustAnalyzerMCPServer, args: Value) -> R
         return Err(anyhow!("Client not initialized"));
     };
 
+    ensure_index_ready(client).await?;
+
     let result = client.completion(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -163,6 +238,10 @@ async fn handle_symbols(server: &mut RustAnalyzerMCPServer, args: Value) -> Resu
         return Err(anyhow!("Client not initialized"));
     };
 
+    // Deliberately not waiting for the workspace to load, unlike every other read here: the
+    // symbols of one file are worked out from that file alone, so this answers correctly while
+    // the rest of rust-analyzer is still catching up -- and it is the one thing left to ask when
+    // it is.
     let result = client.document_symbols(&uri).await?;
     debug!("Document symbols result: {:?}", result);
 
@@ -205,6 +284,8 @@ async fn handle_code_actions(
     let Some(client) = &mut server.client else {
         return Err(anyhow!("Client not initialized"));
     };
+
+    ensure_index_ready(client).await?;
 
     let result = client
         .code_actions(&uri, line, character, end_line, end_character)
@@ -445,16 +526,36 @@ async fn handle_set_workspace(
         return Err(anyhow!("Missing workspace_path"));
     };
 
+    // Work out the new root before anything is torn down, taking a `file:` URI as readily as a
+    // path, and taking the manifest itself to mean the directory holding it.
+    let named = uri::uri_to_path(workspace_path).unwrap_or_else(|| workspace_path.into());
+    let named = uri::absolute(&named);
+    let workspace_root = match named.file_name() {
+        Some(name) if name == "Cargo.toml" => named.parent().unwrap_or(&named).to_path_buf(),
+        _ => named,
+    };
+
+    // A directory with no manifest in it is not a workspace, and rust-analyzer started on one
+    // has nothing loaded and says nothing about any file -- which reads as a workspace full of
+    // code nothing refers to. Refusing here costs a typo'd path; accepting one quietly redirects
+    // every question asked afterwards.
+    if !workspace_root.join("Cargo.toml").is_file() {
+        return Err(anyhow!(
+            "{} is not a Rust workspace: no Cargo.toml in it. rust-analyzer started there would \
+             load nothing and answer every question about every file with silence, so the \
+             workspace is left as it was ({}).",
+            workspace_root.display(),
+            server.workspace_root.display()
+        ));
+    }
+
     // Shutdown existing client.
     if let Some(client) = &mut server.client {
         client.shutdown().await?;
     }
     server.client = None;
 
-    // Set new workspace with proper absolute path handling, taking a `file:` URI as readily as
-    // a path.
-    let workspace_root = uri::uri_to_path(workspace_path).unwrap_or_else(|| workspace_path.into());
-    server.workspace_root = uri::absolute(&workspace_root);
+    server.workspace_root = workspace_root;
 
     // Start the new client automatically.
     server.ensure_client_started().await?;
