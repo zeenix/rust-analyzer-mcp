@@ -250,8 +250,21 @@ async fn handle_symbols(server: &mut RustAnalyzerMCPServer, args: Value) -> Resu
     // symbols of one file are worked out from that file alone, so this answers correctly while
     // the rest of rust-analyzer is still catching up -- and it is the one thing left to ask when
     // it is.
-    let result = client.document_symbols(&uri).await?;
+    let mut result = client.document_symbols(&uri).await?;
+
+    // Except immediately after the file is opened, when rust-analyzer has yet to parse it and
+    // answers `null` -- an answer that reads as a file with nothing in it. Rare when the machine
+    // is idle and common when several rust-analyzers are competing for it, which is the sort of
+    // difference that turns into a test that fails only in CI. Waiting for the load it did not
+    // need is the cheapest way to be sure the second answer means something.
+    if result.is_null() {
+        debug!("No symbols for {} yet; waiting for rust-analyzer", uri);
+        ensure_index_ready(client).await?;
+        result = client.document_symbols(&uri).await?;
+    }
+
     debug!("Document symbols result: {:?}", result);
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
