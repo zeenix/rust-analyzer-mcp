@@ -315,7 +315,9 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             description: "Get all compiler diagnostics across the entire workspace".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" }
+                }
             }),
         },
     ]

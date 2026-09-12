@@ -122,6 +122,50 @@ async fn a_call_can_name_the_workspace_it_is_about() -> Result<()> {
     Ok(())
 }
 
+/// The whole-workspace diagnostic is the one tool with no file to name a workspace by, which is
+/// exactly why it has to accept one: otherwise a caller passing `workspace_path` to everything
+/// else is still answered about somebody else's project here.
+#[tokio::test]
+async fn the_workspace_diagnostic_can_name_its_workspace() -> Result<()> {
+    let default = IsolatedProject::new()?;
+    let elsewhere = IsolatedProject::new()?;
+    let client = MCPTestClient::start(default.path()).await?;
+    client.initialize_and_wait().await?;
+
+    let answer = client
+        .call_tool(
+            "rust_analyzer_workspace_diagnostics",
+            json!({ "workspace_path": elsewhere.path().to_str().unwrap() }),
+        )
+        .await?;
+
+    let text = answer["content"][0]["text"].as_str().unwrap_or_default();
+    let reported: serde_json::Value = serde_json::from_str(text)?;
+
+    // Compared canonical: a temporary directory on macOS is reached through a symlink, and the
+    // workspace reported is the resolved path.
+    let named = std::fs::canonicalize(elsewhere.path())?;
+    let answered = std::fs::canonicalize(reported["workspace"].as_str().unwrap_or_default())?;
+    assert_eq!(
+        answered, named,
+        "the workspace named by the call is expected to be the one reported on: {reported}"
+    );
+    assert_ne!(
+        answered,
+        std::fs::canonicalize(default.path())?,
+        "the default workspace is expected not to be the one that answered: {reported}"
+    );
+
+    // Nothing has opened a file in that workspace, so this call is what started its
+    // rust-analyzer -- the one tool that cannot rely on a document being opened for it.
+    assert!(
+        reported.get("summary").is_some(),
+        "the named workspace is expected to have been asked, not merely named: {reported}"
+    );
+
+    Ok(())
+}
+
 /// A workspace named by a call is checked the way one set as the default is.
 #[tokio::test]
 async fn a_call_cannot_name_a_workspace_that_is_not_one() -> Result<()> {

@@ -878,6 +878,11 @@ async fn handle_workspace_diagnostics(
     server: &mut RustAnalyzerMCPServer,
     _args: Value,
 ) -> Result<ToolResult> {
+    // Every other tool starts rust-analyzer by opening the file it was asked about. This one is
+    // asked about no file, so it has to start it itself -- and the workspace it starts in may be
+    // one this call named, which nothing has opened a file in.
+    server.ensure_client_started().await?;
+
     let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
