@@ -139,6 +139,14 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
 
         match listener.accept() {
             Ok((stream, _)) => {
+                // The listener is non-blocking so that the accept above can poll for shutdown,
+                // and on the BSDs -- macOS among them -- an accepted connection inherits that
+                // from its listener, where on Linux it does not. Everything below treats the
+                // connection as blocking: left inherited, a response larger than the socket's
+                // send buffer comes back as a partial write and the client is handed a line that
+                // stops mid-JSON.
+                stream.set_nonblocking(false)?;
+
                 // Update last activity
                 *last_activity.lock().unwrap() = Instant::now();
 
