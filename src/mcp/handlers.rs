@@ -128,6 +128,9 @@ pub async fn handle_tool_call(
         "rust_analyzer_workspace_symbols" => handle_workspace_symbols(server, args).await,
         "rust_analyzer_type_definition" => handle_type_definition(server, args).await,
         "rust_analyzer_implementation" => handle_implementation(server, args).await,
+        "rust_analyzer_expand_macro" => handle_expand_macro(server, args).await,
+        "rust_analyzer_related_tests" => handle_related_tests(server, args).await,
+        "rust_analyzer_runnables" => handle_runnables(server, args).await,
         "rust_analyzer_incoming_calls" => handle_calls(server, args, Calls::Incoming).await,
         "rust_analyzer_outgoing_calls" => handle_calls(server, args, Calls::Outgoing).await,
         "rust_analyzer_format" => handle_format(server, args).await,
@@ -299,6 +302,94 @@ async fn handle_implementation(
     ensure_index_ready(client).await?;
 
     let result = client.implementation(&uri, line, character).await?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_expand_macro(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client.expand_macro(&uri, line, character).await?;
+    if result.is_null() {
+        return Err(anyhow!(
+            "Nothing to expand at {}:{}:{}. The position has to be on a macro call; a macro \
+             whose expansion rust-analyzer cannot work out answers the same way.",
+            file_path,
+            line,
+            character
+        ));
+    }
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_related_tests(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client.related_tests(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_runnables(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    // A position is optional here, unlike everywhere else: without one the answer covers the
+    // whole file, which is what "how do I run this" usually means.
+    let position = match (args["line"].as_u64(), args["character"].as_u64()) {
+        (Some(line), Some(character)) => Some((line as u32, character as u32)),
+        _ => None,
+    };
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client.runnables(&uri, position).await?;
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {

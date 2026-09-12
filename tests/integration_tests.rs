@@ -1,6 +1,7 @@
 mod integration {
     mod diagnostics;
     mod edits;
+    mod extensions;
     mod features;
     mod mcp_server_test;
     mod navigation;

@@ -140,6 +140,60 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "rust_analyzer_expand_macro".to_string(),
+            description: "Expand the macro call at a position and return the code it becomes. \
+                          Macro-generated code exists nowhere in the source, so reading the \
+                          files -- by eye, by grep, or by structural search -- cannot show it; \
+                          hover does not show it either. Use it when a type, method or trait \
+                          impl appears to come from nowhere."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based), on the macro's name" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_related_tests".to_string(),
+            description: "Find the tests that exercise the symbol at a position. An empty answer \
+                          means rust-analyzer found no test reaching this symbol, which is worth \
+                          knowing before changing it -- but it is worked out from calls, so a \
+                          test reaching it only through a trait object or a macro may not \
+                          appear."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_runnables".to_string(),
+            description: "Get the exact cargo commands that run what is in a file -- its tests, \
+                          its binary, its doctests -- each with the arguments and environment \
+                          rust-analyzer would use. Saves guessing at a test filter or a package \
+                          name. Give a position to narrow it to the single test or binary at \
+                          that position; omit it for everything in the file."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
+                    "line": { "type": "number", "description": "Line number (0-based). Optional: with a position the answer covers only what is at it" },
+                    "character": { "type": "number", "description": "Character position (0-based). Optional, and only used together with line" }
+                },
+                "required": ["file_path"]
+            }),
+        },
+        ToolDefinition {
             name: "rust_analyzer_workspace_symbols".to_string(),
             description: "Search the whole workspace for symbols by name, and get the position \
                           of each one -- the only way here to turn a name into the file, line \
