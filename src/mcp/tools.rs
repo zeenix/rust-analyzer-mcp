@@ -69,6 +69,27 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "rust_analyzer_workspace_symbols".to_string(),
+            description: "Search the whole workspace for symbols by name, and get the position \
+                          of each one -- the only way here to turn a name into the file, line \
+                          and character the other tools need. DISCOVERY, NOT A CENSUS: the \
+                          query is matched fuzzily (its letters need only appear in order), the \
+                          results are scored and only the best few dozen come back, and \
+                          rust-analyzer searches its own index rather than the text of the \
+                          files. So a symbol missing from these results is NOT evidence that it \
+                          does not exist, and unrelated symbols scoring on scattered letters are \
+                          expected. Use it to find a symbol you can name; never to prove one \
+                          absent, and never to count anything."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Name, or part of one, to search for. An empty query is not a listing: rust-analyzer answers it with nothing" }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDefinition {
             name: "rust_analyzer_format".to_string(),
             description: "Format a Rust file using rust-analyzer".to_string(),
             input_schema: json!({

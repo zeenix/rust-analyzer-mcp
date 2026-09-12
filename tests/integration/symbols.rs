@@ -85,6 +85,48 @@ async fn a_doc_comment_does_not_move_the_name() -> Result<()> {
     Ok(())
 }
 
+/// Nothing else here turns a name into a position, so this is the one tool that can be asked a
+/// question without already knowing the answer to it.
+#[tokio::test]
+async fn a_symbol_can_be_found_by_name_alone() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project-symbols").await?;
+
+    let response = client
+        .call_tool(
+            "rust_analyzer_workspace_symbols",
+            json!({ "query": "Calculator" }),
+        )
+        .await?;
+    let text = response["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a text content item, got: {response}"));
+    let found: Value = serde_json::from_str(text)?;
+
+    let calculator = found
+        .as_array()
+        .and_then(|found| found.iter().find(|symbol| symbol["name"] == "Calculator"))
+        .unwrap_or_else(|| panic!("test-project declares a `Calculator`: {found}"));
+
+    // The position has to be the name itself, since the only thing to do with it is ask another
+    // question there -- and every other tool answers a question asked at a doc comment with
+    // silence.
+    let path = calculator["location"]["uri"]
+        .as_str()
+        .and_then(|uri| uri.strip_prefix("file://"))
+        .unwrap_or_else(|| panic!("expected a file URI: {calculator}"));
+    let source = std::fs::read_to_string(path)?;
+    let start = &calculator["location"]["range"]["start"];
+    let line = line_of(&source, start["line"].as_u64().unwrap() as usize);
+    let character = start["character"].as_u64().unwrap() as usize;
+
+    assert!(
+        line[character..].starts_with("Calculator"),
+        "the reported position is expected to be the name itself, found {line:?} at {character}"
+    );
+
+    Ok(())
+}
+
 /// The symbols of `file_path`, as the tool answers them.
 async fn symbols_of(client: &mut IpcClient, file_path: &str) -> Result<Value> {
     let response = client

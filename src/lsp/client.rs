@@ -324,6 +324,11 @@ impl RustAnalyzerClient {
                     "didChangeConfiguration": {
                         "dynamicRegistration": false
                     },
+                    // Without this rust-analyzer answers `workspace/symbol` with nothing at
+                    // all, and a name cannot be turned into a position by any other means here.
+                    "symbol": {
+                        "dynamicRegistration": false
+                    },
                     // Renaming a module renames its file, which rust-analyzer refuses to work
                     // out at all for a client that has not said it understands file operations.
                     "workspaceEdit": {

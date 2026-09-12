@@ -119,6 +119,17 @@ impl RustAnalyzerClient {
             .await
     }
 
+    /// The symbols across the whole workspace whose names match `query`.
+    ///
+    /// rust-analyzer scores this fuzzily rather than matching it, and answers with the best few
+    /// -- so it finds a symbol by name without a position, which nothing else here does, and it
+    /// is no kind of census.
+    pub async fn workspace_symbols(&mut self, query: &str) -> Result<Value> {
+        let params = json!({ "query": query });
+
+        self.send_request("workspace/symbol", Some(params)).await
+    }
+
     pub async fn document_symbols(&mut self, uri: &str) -> Result<Value> {
         let params = json!({
             "textDocument": { "uri": uri }
