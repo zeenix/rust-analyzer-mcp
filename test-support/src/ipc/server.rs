@@ -376,8 +376,15 @@ fn wait_for_ready(
     Ok(())
 }
 
+/// Where the daemon for `project_type` listens.
+///
+/// The directory is named as briefly as it can stand being: a unix socket's path has to fit in
+/// `sun_path`, which is 104 bytes on macOS including the terminator, and a temporary directory
+/// there is already about half of that (`/var/folders/xx/<26 characters>/T/`). Spelling the
+/// directory out in full put the longest project's socket at exactly 104 bytes, and every test
+/// using it failed to reach a daemon that could never bind.
 pub fn socket_path(project_type: &str) -> PathBuf {
-    let socket_dir = std::env::temp_dir().join("rust-analyzer-mcp-sockets");
+    let socket_dir = std::env::temp_dir().join("ra-mcp-socks");
     let _ = fs::create_dir_all(&socket_dir);
     socket_dir.join(format!("{}.sock", project_type))
 }
