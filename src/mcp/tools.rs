@@ -36,7 +36,9 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             name: "rust_analyzer_references".to_string(),
             description: "Find all references to a symbol at a specific position. Each hit comes \
                           back with the line of source at it, so the list can be read without \
-                          opening every file in it."
+                          opening every file in it. The symbol's own declaration is one of the \
+                          hits, marked `declaration: true` -- so `count` is the uses of the symbol \
+                          plus one, not a count of callers."
                 .to_string(),
             input_schema: json!({
                 "type": "object",

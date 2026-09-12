@@ -251,8 +251,12 @@ async fn handle_references(server: &mut RustAnalyzerMCPServer, args: Value) -> R
     ensure_index_ready(client).await?;
 
     let result = client.references(&uri, line, character).await?;
+    // LSP counts the declaration among the references, so the list is one longer than the uses of
+    // the symbol. Asking where the declaration is costs one request against an index that has just
+    // answered a harder question, and is what lets the answer say which hit it is.
+    let definition = client.definition(&uri, line, character).await?;
     explain_empty_answer(server, &result, &file_path)?;
-    let result = locations::annotate(&result, &server.workspace_root);
+    let result = locations::annotate(&result, &server.workspace_root, &definition);
 
     Ok(ToolResult {
         content: vec![ContentItem {

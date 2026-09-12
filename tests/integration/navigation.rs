@@ -163,6 +163,56 @@ async fn references_carry_the_line_they_point_at() -> Result<()> {
     Ok(())
 }
 
+/// LSP counts a symbol's declaration among its references, so a count read as "callers" is one
+/// too many. The hit that is the declaration says so.
+#[tokio::test]
+async fn references_say_which_hit_is_the_declaration() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let utils = client.workspace_path().join("src/utils.rs");
+
+    // `pub fn process`, on the name itself.
+    let answer = call(
+        &mut client,
+        "rust_analyzer_references",
+        json!({ "file_path": utils.to_str().unwrap(), "line": 3, "character": 7 }),
+    )
+    .await?;
+
+    let hits = answer["locations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a list of locations, got: {answer}"));
+
+    let declarations: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit["declaration"] == json!(true))
+        .collect();
+    assert_eq!(
+        declarations.len(),
+        1,
+        "exactly one hit is expected to be the declaration: {answer}"
+    );
+
+    let declaration = declarations[0];
+    assert_eq!(
+        declaration["line"].as_u64(),
+        Some(3),
+        "the declaration is expected to be the one at `pub fn process`: {declaration}"
+    );
+    assert!(
+        declaration["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("fn process")),
+        "the hit marked as the declaration is expected to be the declaring line: {declaration}"
+    );
+
+    assert!(
+        hits.len() > declarations.len(),
+        "`process` is used as well as declared, so not every hit is the declaration: {answer}"
+    );
+
+    Ok(())
+}
+
 /// The parsed answer of a tool that replies with JSON in a text content item.
 async fn call(client: &mut IpcClient, tool: &str, arguments: Value) -> Result<Value> {
     let response = client.call_tool(tool, arguments).await?;
