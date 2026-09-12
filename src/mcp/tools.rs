@@ -10,6 +10,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
@@ -23,6 +24,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
@@ -39,6 +41,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
@@ -52,6 +55,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
@@ -66,6 +70,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" }
                 },
                 "required": ["file_path"]
@@ -83,6 +88,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
@@ -100,6 +106,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
@@ -119,6 +126,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
@@ -135,6 +143,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
@@ -153,6 +162,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based), on the macro's name" }
@@ -171,6 +181,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" }
@@ -189,6 +200,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based). Optional: with a position the answer covers only what is at it" },
                     "character": { "type": "number", "description": "Character position (0-based). Optional, and only used together with line" }
@@ -212,6 +224,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "query": { "type": "string", "description": "Name, or part of one, to search for. An empty query is not a listing: rust-analyzer answers it with nothing" }
                 },
                 "required": ["query"]
@@ -223,6 +236,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" }
                 },
                 "required": ["file_path"]
@@ -234,6 +248,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Start line number (0-based)" },
                     "character": { "type": "number", "description": "Start character position (0-based)" },
@@ -256,6 +271,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
                     "line": { "type": "number", "description": "Line number (0-based)" },
                     "character": { "type": "number", "description": "Character position (0-based)" },
@@ -266,7 +282,13 @@ pub fn get_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rust_analyzer_set_workspace".to_string(),
-            description: "Set the workspace root directory for rust-analyzer".to_string(),
+            description: "Move the workspace every later call is answered from, and shut down \
+                          the rust-analyzer of any other workspace this server holds. It is a \
+                          setting shared with everyone else using this server, so where the \
+                          question is about one project and the default may be another's, pass \
+                          workspace_path on the call itself instead: that is answered by the \
+                          named workspace without moving anybody's default."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -282,6 +304,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
                     "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" }
                 },
                 "required": ["file_path"]

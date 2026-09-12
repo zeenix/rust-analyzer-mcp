@@ -16,7 +16,7 @@ use crate::{
     uri,
 };
 
-use super::server::RustAnalyzerMCPServer;
+use super::server::{manifest_directory, RustAnalyzerMCPServer};
 
 /// Helper struct for extracting common tool parameters.
 struct ToolParams;
@@ -140,6 +140,32 @@ pub async fn handle_tool_call(
     tool_name: &str,
     args: Value,
 ) -> Result<ToolResult> {
+    // A call may name the workspace it is about, and is then answered by that workspace's own
+    // rust-analyzer rather than by whichever one this server was last pointed at. Naming it is
+    // the only way a caller sharing this server with others can be sure which index answered --
+    // and it names it for this call only, so one caller doing so does not move the workspace out
+    // from under the next. `set_workspace` names its argument for the opposite reason, to move
+    // the default, so it handles its own.
+    let default_workspace = server.workspace_root.clone();
+    let named_a_workspace = tool_name != "rust_analyzer_set_workspace"
+        && args.get("workspace_path").is_some_and(Value::is_string);
+    if named_a_workspace {
+        server.select_workspace(args["workspace_path"].as_str())?;
+    }
+
+    let answer = dispatch(server, tool_name, args).await;
+
+    if named_a_workspace {
+        server.workspace_root = default_workspace;
+    }
+    answer
+}
+
+async fn dispatch(
+    server: &mut RustAnalyzerMCPServer,
+    tool_name: &str,
+    args: Value,
+) -> Result<ToolResult> {
     server.ensure_client_started().await?;
 
     match tool_name {
@@ -172,7 +198,7 @@ async fn handle_hover(server: &mut RustAnalyzerMCPServer, args: Value) -> Result
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -195,7 +221,7 @@ async fn handle_definition(server: &mut RustAnalyzerMCPServer, args: Value) -> R
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -218,7 +244,7 @@ async fn handle_references(server: &mut RustAnalyzerMCPServer, args: Value) -> R
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -242,7 +268,7 @@ async fn handle_completion(server: &mut RustAnalyzerMCPServer, args: Value) -> R
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -266,7 +292,7 @@ async fn handle_symbols(server: &mut RustAnalyzerMCPServer, args: Value) -> Resu
     let uri = server.open_document_if_needed(&file_path).await?;
     debug!("Document opened with URI: {}", uri);
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -307,7 +333,7 @@ async fn handle_type_definition(
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -332,7 +358,7 @@ async fn handle_implementation(
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -357,7 +383,7 @@ async fn handle_expand_macro(
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -391,7 +417,7 @@ async fn handle_related_tests(
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -419,7 +445,7 @@ async fn handle_runnables(server: &mut RustAnalyzerMCPServer, args: Value) -> Re
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -455,7 +481,7 @@ async fn handle_calls(
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -500,7 +526,7 @@ async fn handle_workspace_symbols(
         return Err(anyhow!("Missing query"));
     };
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -524,7 +550,7 @@ async fn handle_format(server: &mut RustAnalyzerMCPServer, args: Value) -> Resul
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -547,7 +573,7 @@ async fn handle_code_actions(
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -577,7 +603,7 @@ async fn handle_rename(server: &mut RustAnalyzerMCPServer, args: Value) -> Resul
     // be the file that is actually there.
     server.refresh_open_documents().await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -793,35 +819,21 @@ async fn handle_set_workspace(
     };
 
     // Work out the new root before anything is torn down, taking a `file:` URI as readily as a
-    // path, and taking the manifest itself to mean the directory holding it.
+    // path, and refusing a directory with no manifest rather than loading nothing from it.
     let named = uri::uri_to_path(workspace_path).unwrap_or_else(|| workspace_path.into());
-    let named = uri::absolute(&named);
-    let workspace_root = match named.file_name() {
-        Some(name) if name == "Cargo.toml" => named.parent().unwrap_or(&named).to_path_buf(),
-        _ => named,
-    };
-
-    // A directory with no manifest in it is not a workspace, and rust-analyzer started on one
-    // has nothing loaded and says nothing about any file -- which reads as a workspace full of
-    // code nothing refers to. Refusing here costs a typo'd path; accepting one quietly redirects
-    // every question asked afterwards.
-    if !workspace_root.join("Cargo.toml").is_file() {
-        return Err(anyhow!(
-            "{} is not a Rust workspace: no Cargo.toml in it. rust-analyzer started there would \
-             load nothing and answer every question about every file with silence, so the \
-             workspace is left as it was ({}).",
-            workspace_root.display(),
+    let workspace_root = manifest_directory(&uri::absolute(&named)).map_err(|e| {
+        anyhow!(
+            "{e} The workspace is left as it was ({}).",
             server.workspace_root.display()
-        ));
-    }
-
-    // Shutdown existing client.
-    if let Some(client) = &mut server.client {
-        client.shutdown().await?;
-    }
-    server.client = None;
+        )
+    })?;
 
     server.workspace_root = workspace_root;
+
+    // Moving the default says the other workspaces are finished with -- unlike naming one per
+    // call, which says it will be named again -- so their rust-analyzers go rather than sit on a
+    // gigabyte of index nobody is asking about.
+    server.drop_other_workspaces().await;
 
     // Start the new client automatically.
     server.ensure_client_started().await?;
@@ -839,7 +851,7 @@ async fn handle_diagnostics(server: &mut RustAnalyzerMCPServer, args: Value) -> 
 
     let uri = server.open_document_if_needed(&file_path).await?;
 
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
@@ -866,7 +878,7 @@ async fn handle_workspace_diagnostics(
     server: &mut RustAnalyzerMCPServer,
     _args: Value,
 ) -> Result<ToolResult> {
-    let Some(client) = &mut server.client else {
+    let Some(client) = server.client() else {
         return Err(anyhow!("Client not initialized"));
     };
 
