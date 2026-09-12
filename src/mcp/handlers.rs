@@ -9,6 +9,7 @@ use std::{
 use crate::{
     config::WORKSPACE_LOAD_TIMEOUT_SECS,
     diagnostics::format_diagnostics,
+    lsp::RustAnalyzerClient,
     position,
     protocol::mcp::{ContentItem, ToolResult},
     uri,
@@ -49,6 +50,32 @@ impl ToolParams {
     }
 }
 
+/// Refuses to answer from an index rust-analyzer has not finished building.
+///
+/// Everything rust-analyzer works out from the whole workspace -- what a symbol is, where it is
+/// defined, what refers to it -- it answers with `null` or `[]` until it has loaded that
+/// workspace. Those are the same answers it gives for a symbol nothing refers to and for a
+/// position that is not on a symbol at all, so a caller cannot tell an index that is not ready
+/// from code that is genuinely unused, and the wrong one of those is the one people act on.
+///
+/// Waiting makes the common case right, and saying so when the wait runs out makes the rest
+/// loud rather than silent.
+async fn ensure_index_ready(client: &RustAnalyzerClient) -> Result<()> {
+    if client
+        .wait_until_loaded(Duration::from_secs(WORKSPACE_LOAD_TIMEOUT_SECS))
+        .await
+    {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "rust-analyzer is still loading the workspace after {}s. An answer worked out now would \
+         be from a partial index, and an empty one could not be told from a symbol that is \
+         really unused; ask again once it has settled.",
+        WORKSPACE_LOAD_TIMEOUT_SECS
+    ))
+}
+
 pub async fn handle_tool_call(
     server: &mut RustAnalyzerMCPServer,
     tool_name: &str,
@@ -82,6 +109,8 @@ async fn handle_hover(server: &mut RustAnalyzerMCPServer, args: Value) -> Result
         return Err(anyhow!("Client not initialized"));
     };
 
+    ensure_index_ready(client).await?;
+
     let result = client.hover(&uri, line, character).await?;
 
     Ok(ToolResult {
@@ -101,6 +130,8 @@ async fn handle_definition(server: &mut RustAnalyzerMCPServer, args: Value) -> R
     let Some(client) = &mut server.client else {
         return Err(anyhow!("Client not initialized"));
     };
+
+    ensure_index_ready(client).await?;
 
     let result = client.definition(&uri, line, character).await?;
 
@@ -122,6 +153,8 @@ async fn handle_references(server: &mut RustAnalyzerMCPServer, args: Value) -> R
         return Err(anyhow!("Client not initialized"));
     };
 
+    ensure_index_ready(client).await?;
+
     let result = client.references(&uri, line, character).await?;
 
     Ok(ToolResult {
@@ -141,6 +174,8 @@ async fn handle_completion(server: &mut RustAnalyzerMCPServer, args: Value) -> R
     let Some(client) = &mut server.client else {
         return Err(anyhow!("Client not initialized"));
     };
+
+    ensure_index_ready(client).await?;
 
     let result = client.completion(&uri, line, character).await?;
 
@@ -163,6 +198,10 @@ async fn handle_symbols(server: &mut RustAnalyzerMCPServer, args: Value) -> Resu
         return Err(anyhow!("Client not initialized"));
     };
 
+    // Deliberately not waiting for the workspace to load, unlike every other read here: the
+    // symbols of one file are worked out from that file alone, so this answers correctly while
+    // the rest of rust-analyzer is still catching up -- and it is the one thing left to ask when
+    // it is.
     let result = client.document_symbols(&uri).await?;
     debug!("Document symbols result: {:?}", result);
 
@@ -205,6 +244,8 @@ async fn handle_code_actions(
     let Some(client) = &mut server.client else {
         return Err(anyhow!("Client not initialized"));
     };
+
+    ensure_index_ready(client).await?;
 
     let result = client
         .code_actions(&uri, line, character, end_line, end_character)
