@@ -124,11 +124,12 @@ async fn a_call_can_name_the_workspace_it_is_about() -> Result<()> {
 
 /// The whole-workspace diagnostic is the one tool with no file to name a workspace by, which is
 /// exactly why it has to accept one: otherwise a caller passing `workspace_path` to everything
-/// else is still answered about somebody else's project here.
+/// else is still answered about somebody else's project here. And it has to answer with the
+/// workspace's faults, not with the right root over an empty report.
 #[tokio::test]
 async fn the_workspace_diagnostic_can_name_its_workspace() -> Result<()> {
     let default = IsolatedProject::new()?;
-    let elsewhere = IsolatedProject::new()?;
+    let elsewhere = IsolatedProject::new_diagnostics()?;
     let client = MCPTestClient::start(default.path()).await?;
     client.initialize_and_wait().await?;
 
@@ -156,11 +157,23 @@ async fn the_workspace_diagnostic_can_name_its_workspace() -> Result<()> {
         "the default workspace is expected not to be the one that answered: {reported}"
     );
 
-    // Nothing has opened a file in that workspace, so this call is what started its
-    // rust-analyzer -- the one tool that cannot rely on a document being opened for it.
+    // The faults themselves, not merely the right root over an empty report: nothing has opened a
+    // file in that workspace, and reporting what is open would report nothing at all. The fixture
+    // has five errors in one file and warnings in another, so counting anything less than two
+    // faulted files means the check did not cover the workspace.
+    let summary = &reported["summary"];
     assert!(
-        reported.get("summary").is_some(),
-        "the named workspace is expected to have been asked, not merely named: {reported}"
+        summary["total_errors"].as_u64().unwrap_or(0) >= 5,
+        "the errors in the named workspace are expected to be reported: {reported}"
+    );
+    assert!(
+        summary["total_files"].as_u64().unwrap_or(0) >= 2,
+        "a check covers the workspace, not just a file somebody opened: {reported}"
+    );
+    assert_eq!(
+        reported["complete"],
+        json!(true),
+        "the check is expected to have finished, so the counts mean what they say: {reported}"
     );
 
     Ok(())

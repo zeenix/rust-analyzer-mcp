@@ -3,3 +3,4 @@ mod connection;
 mod handlers;
 
 pub use client::RustAnalyzerClient;
+pub use handlers::WorkspaceDiagnostics;

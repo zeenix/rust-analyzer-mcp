@@ -1,7 +1,7 @@
 use anyhow::Result;
 use log::{info, warn};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use tokio::sync::watch;
 
 use super::{client::RustAnalyzerClient, connection::Flycheck};
@@ -16,6 +16,14 @@ use crate::{
 /// What rust-analyzer marks the diagnostics it worked out itself with, as opposed to the ones it
 /// read out of a cargo check.
 const ANALYSIS_SOURCE: &str = "rust-analyzer";
+
+/// What a cargo check said about a whole workspace: the faulted files by URI, and whether the
+/// check finished. An empty `files` with `complete` false is "nothing analysed", which is a
+/// different answer from "nothing wrong" and must not be reported as one.
+pub struct WorkspaceDiagnostics {
+    pub files: HashMap<String, Value>,
+    pub complete: bool,
+}
 
 /// Diagnostics, and whether anything was still going on that could add to them.
 pub struct FreshDiagnostics {
@@ -291,6 +299,25 @@ impl RustAnalyzerClient {
     /// waiting for it to finish is the only way to answer with the code in front of us rather
     /// than whatever was last reported about it.
     pub async fn fresh_diagnostics(&mut self, uri: &str) -> Result<FreshDiagnostics> {
+        let complete = self
+            .run_check(json!({ "textDocument": { "uri": uri } }), uri)
+            .await?;
+
+        Ok(FreshDiagnostics {
+            items: self.current_diagnostics(uri).await?,
+            complete,
+        })
+    }
+
+    /// Runs a cargo check and waits for it to finish, saying whether it got that far.
+    ///
+    /// `params` is what the check is asked for: a document, or `textDocument: null` for every
+    /// workspace rust-analyzer holds. `about` names it in the log and nothing else.
+    ///
+    /// Returns false when the workspace was still loading, or the check did not finish or never
+    /// started -- any of which makes what was published the best available rather than the last
+    /// word.
+    async fn run_check(&mut self, params: Value, about: &str) -> Result<bool> {
         // A report on a workspace rust-analyzer is still loading covers the part of it that has
         // been reached, and a file it has not reached looks exactly like a file with nothing
         // wrong with it.
@@ -308,7 +335,6 @@ impl RustAnalyzerClient {
         // so everything said before it is superseded.
         self.diagnostics.lock().await.clear();
 
-        let params = json!({ "textDocument": { "uri": uri } });
         self.send_notification("rust-analyzer/runFlycheck", Some(params.clone()))
             .await?;
 
@@ -317,10 +343,7 @@ impl RustAnalyzerClient {
         // after all -- a workspace big enough for the first check to start late -- makes this
         // false again, and the waiting resumes.
         if self.gave_up_on_checks && before.never_ran_one() {
-            return Ok(FreshDiagnostics {
-                items: self.current_diagnostics(uri).await?,
-                complete: false,
-            });
+            return Ok(false);
         }
 
         // Waiting for the check to start is a step of its own, because it may never do: the
@@ -340,12 +363,15 @@ impl RustAnalyzerClient {
                 break;
             }
 
-            info!("Asking for a cargo check of {} again", uri);
+            info!("Asking for a cargo check of {} again", about);
             self.send_notification("rust-analyzer/runFlycheck", Some(params.clone()))
                 .await?;
         }
         if !started {
-            info!("No cargo check started for {}, reporting what we have", uri);
+            info!(
+                "No cargo check started for {}, reporting what we have",
+                about
+            );
             // Nothing has ever reported a check here, so take it that nothing will and stop
             // making every later call wait the same wait out. Only until one does: the check
             // this call asked for may yet begin, and the next call will see that it did.
@@ -354,10 +380,7 @@ impl RustAnalyzerClient {
                 self.gave_up_on_checks = true;
             }
 
-            return Ok(FreshDiagnostics {
-                items: self.current_diagnostics(uri).await?,
-                complete: false,
-            });
+            return Ok(false);
         }
 
         let finished = wait_for(
@@ -367,17 +390,17 @@ impl RustAnalyzerClient {
         )
         .await;
         if !finished {
-            warn!("cargo check for {} is still running, reporting early", uri);
+            warn!(
+                "cargo check for {} is still running, reporting early",
+                about
+            );
         }
 
         // The results are published just after the check reports itself done, from a turn of
         // rust-analyzer's loop we cannot see the end of.
         tokio::time::sleep(Duration::from_millis(DOCUMENT_OPEN_DELAY_MILLIS)).await;
 
-        Ok(FreshDiagnostics {
-            items: self.current_diagnostics(uri).await?,
-            complete: loaded && finished,
-        })
+        Ok(loaded && finished)
     }
 
     /// Waits until rust-analyzer has no loading left to do, giving up after `timeout`.
@@ -457,35 +480,40 @@ impl RustAnalyzerClient {
             .unwrap_or_default()
     }
 
-    pub async fn workspace_diagnostics(&mut self) -> Result<Value> {
-        // Try workspace/diagnostic if available, otherwise collect from all open documents.
-        let params = json!({
-            "identifier": "rust-analyzer",
-            "previousResultId": null
-        });
+    /// What a cargo check has to say about the whole workspace, file by file.
+    ///
+    /// A check is run and waited for, because the alternative is reporting whatever happened to
+    /// have been published already -- and in a workspace nothing has opened a file in, that is
+    /// nothing at all. A confident zero is the worst answer this tool can give: it reads as a
+    /// clean workspace, which is why `complete` says whether the check got far enough for the
+    /// zero to mean anything.
+    pub async fn workspace_diagnostics(&mut self) -> Result<WorkspaceDiagnostics> {
+        // `textDocument: null` asks for every workspace rust-analyzer holds, so this needs no
+        // file -- which matters, because this is the one tool called without one.
+        let complete = self
+            .run_check(json!({ "textDocument": null }), "the workspace")
+            .await?;
 
-        match self
-            .send_request("workspace/diagnostic", Some(params))
-            .await
-        {
-            Ok(response) => Ok(response),
-            // A dead rust-analyzer must not pass for a clean workspace.
-            Err(e) if self.is_gone() => Err(e),
-            Err(_) => {
-                // Fallback: return diagnostics for all open documents.
-                let mut all_diagnostics = json!({});
-                let open_docs: Vec<String> =
-                    self.open_documents.lock().await.keys().cloned().collect();
-
-                for doc_uri in open_docs.iter() {
-                    if let Ok(diag) = self.diagnostics(doc_uri).await {
-                        all_diagnostics[doc_uri] = diag;
-                    }
-                }
-
-                Ok(all_diagnostics)
-            }
+        // A dead rust-analyzer must not pass for a clean workspace.
+        if self.is_gone() {
+            return Err(anyhow::anyhow!(
+                "rust-analyzer is gone, so nothing can be said about the workspace"
+            ));
         }
+
+        // Everything the check published, rather than everything that happens to be open: the
+        // two are the same only by luck, and a file nobody opened is exactly the one a
+        // whole-workspace report is asked for.
+        let files = self
+            .diagnostics
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, diagnostics)| !diagnostics.is_empty())
+            .map(|(uri, diagnostics)| (uri.clone(), json!(diagnostics)))
+            .collect();
+
+        Ok(WorkspaceDiagnostics { files, complete })
     }
 
     pub async fn code_actions(

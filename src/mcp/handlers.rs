@@ -10,7 +10,7 @@ use crate::{
     config::WORKSPACE_LOAD_TIMEOUT_SECS,
     diagnostics::format_diagnostics,
     locations,
-    lsp::RustAnalyzerClient,
+    lsp::{RustAnalyzerClient, WorkspaceDiagnostics},
     position,
     protocol::mcp::{ContentItem, ToolResult},
     uri,
@@ -891,10 +891,8 @@ async fn handle_workspace_diagnostics(
         return Err(anyhow!("Client not initialized"));
     };
 
-    let result = client.workspace_diagnostics().await?;
-
-    // Format workspace diagnostics.
-    let formatted = format_workspace_diagnostics(&server.workspace_root, &result);
+    let reported = client.workspace_diagnostics().await?;
+    let formatted = format_workspace_diagnostics(&server.workspace_root, &reported);
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -904,109 +902,61 @@ async fn handle_workspace_diagnostics(
     })
 }
 
-fn format_workspace_diagnostics(workspace_root: &Path, result: &Value) -> Value {
-    if !result.is_object() {
-        // Handle unexpected format.
-        if let Some(items) = result.get("items") {
-            return json!({
-                "workspace": workspace_root.display().to_string(),
-                "diagnostics": items,
-                "summary": {
-                    "total_diagnostics": items.as_array().map(|a| a.len()).unwrap_or(0),
-                    "by_severity": {}
-                }
-            });
-        }
+/// The whole-workspace report: one entry per faulted file, counted the way the per-file tool
+/// counts, and honest about whether anything was analysed at all.
+fn format_workspace_diagnostics(workspace_root: &Path, reported: &WorkspaceDiagnostics) -> Value {
+    let mut files = serde_json::Map::new();
+    let (mut errors, mut warnings, mut information, mut hints) = (0, 0, 0, 0);
 
-        return json!({
-            "workspace": workspace_root.display().to_string(),
-            "diagnostics": result,
-            "summary": {
-                "note": "Unexpected response format from rust-analyzer"
-            }
-        });
+    // Sorted, because these come from a map and an answer that reorders itself between two
+    // identical calls is one nobody can diff.
+    let mut faulted: Vec<_> = reported.files.iter().collect();
+    faulted.sort_by_key(|(uri, _)| *uri);
+
+    for (uri, diagnostics) in faulted {
+        let shown = uri::uri_to_path(uri)
+            .map(|path| {
+                path.strip_prefix(workspace_root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_else(|| uri.to_string());
+
+        // Counted by the same code as the single-file tool, so one fault is not one number here
+        // and two there: rust-analyzer and rustc each report it, and only one of them is it.
+        let formatted = format_diagnostics(&shown, diagnostics);
+        errors += formatted["summary"]["errors"].as_u64().unwrap_or(0);
+        warnings += formatted["summary"]["warnings"].as_u64().unwrap_or(0);
+        information += formatted["summary"]["information"].as_u64().unwrap_or(0);
+        hints += formatted["summary"]["hints"].as_u64().unwrap_or(0);
+
+        files.insert(shown, formatted);
     }
 
-    // Fallback format (diagnostics per URI).
     let mut output = json!({
         "workspace": workspace_root.display().to_string(),
-        "files": {},
         "summary": {
-            "total_files": 0,
-            "total_errors": 0,
-            "total_warnings": 0,
-            "total_information": 0,
-            "total_hints": 0
-        }
+            "total_files": files.len(),
+            "total_errors": errors,
+            "total_warnings": warnings,
+            "total_information": information,
+            "total_hints": hints,
+        },
+        "complete": reported.complete,
+        "files": files,
     });
 
-    let mut total_errors = 0;
-    let mut total_warnings = 0;
-    let mut total_information = 0;
-    let mut total_hints = 0;
-    let mut file_count = 0;
-
-    let Some(obj) = result.as_object() else {
-        return output;
-    };
-
-    for (uri, diagnostics) in obj {
-        let Some(diag_array) = diagnostics.as_array() else {
-            continue;
-        };
-
-        if diag_array.is_empty() {
-            continue;
-        }
-
-        file_count += 1;
-        let mut file_errors = 0;
-        let mut file_warnings = 0;
-        let mut file_information = 0;
-        let mut file_hints = 0;
-
-        for diag in diag_array {
-            let Some(severity) = diag.get("severity").and_then(|s| s.as_u64()) else {
-                continue;
-            };
-
-            match severity {
-                1 => {
-                    file_errors += 1;
-                    total_errors += 1;
-                }
-                2 => {
-                    file_warnings += 1;
-                    total_warnings += 1;
-                }
-                3 => {
-                    file_information += 1;
-                    total_information += 1;
-                }
-                4 => {
-                    file_hints += 1;
-                    total_hints += 1;
-                }
-                _ => {}
-            }
-        }
-
-        output["files"][uri] = json!({
-            "diagnostics": diagnostics,
-            "summary": {
-                "errors": file_errors,
-                "warnings": file_warnings,
-                "information": file_information,
-                "hints": file_hints
-            }
-        });
+    if !reported.complete {
+        // The zero this would otherwise report is the dangerous one: it reads as a clean
+        // workspace, and a caller acting on it acts on a check that never ran.
+        output["note"] = json!(
+            "rust-analyzer had not finished loading the workspace or checking it when this was \
+             reported. These counts are a floor rather than the state of the workspace -- an \
+             empty report here means nothing was analysed, not that nothing is wrong. Ask again \
+             for the rest."
+        );
     }
-
-    output["summary"]["total_files"] = json!(file_count);
-    output["summary"]["total_errors"] = json!(total_errors);
-    output["summary"]["total_warnings"] = json!(total_warnings);
-    output["summary"]["total_information"] = json!(total_information);
-    output["summary"]["total_hints"] = json!(total_hints);
 
     output
 }
