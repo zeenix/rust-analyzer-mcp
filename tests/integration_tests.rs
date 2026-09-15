@@ -3,6 +3,7 @@ mod integration {
     mod edits;
     mod features;
     mod mcp_server_test;
+    mod navigation;
     mod notifications;
     mod rename;
     mod shared_test;

@@ -90,6 +90,10 @@ pub async fn handle_tool_call(
         "rust_analyzer_completion" => handle_completion(server, args).await,
         "rust_analyzer_symbols" => handle_symbols(server, args).await,
         "rust_analyzer_workspace_symbols" => handle_workspace_symbols(server, args).await,
+        "rust_analyzer_type_definition" => handle_type_definition(server, args).await,
+        "rust_analyzer_implementation" => handle_implementation(server, args).await,
+        "rust_analyzer_incoming_calls" => handle_calls(server, args, Calls::Incoming).await,
+        "rust_analyzer_outgoing_calls" => handle_calls(server, args, Calls::Outgoing).await,
         "rust_analyzer_format" => handle_format(server, args).await,
         "rust_analyzer_code_actions" => handle_code_actions(server, args).await,
         "rust_analyzer_rename" => handle_rename(server, args).await,
@@ -210,6 +214,112 @@ async fn handle_symbols(server: &mut RustAnalyzerMCPServer, args: Value) -> Resu
         content: vec![ContentItem {
             content_type: "text".to_string(),
             text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_type_definition(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client.type_definition(&uri, line, character).await?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_implementation(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client.implementation(&uri, line, character).await?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+/// Which way round a call hierarchy is being asked about.
+#[derive(Clone, Copy)]
+enum Calls {
+    /// What calls the function at the position.
+    Incoming,
+    /// What the function at the position calls.
+    Outgoing,
+}
+
+async fn handle_calls(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+    direction: Calls,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    // A call hierarchy is about an item rather than a position, and the item has to be asked for
+    // first. Doing it here rather than exposing it as a tool of its own keeps the round trip in
+    // one place: the item is of no use to anyone except as the argument to these two calls.
+    let prepared = client.prepare_call_hierarchy(&uri, line, character).await?;
+    let Some(item) = prepared.as_array().and_then(|items| items.first()) else {
+        return Err(anyhow!(
+            "Nothing callable at {}:{}:{}. A call hierarchy starts at a function, a method or \
+             something else that can be called; check the position is on the name of one.",
+            file_path,
+            line,
+            character
+        ));
+    };
+    let item = item.clone();
+
+    let result = match direction {
+        Calls::Incoming => client.incoming_calls(&item).await?,
+        Calls::Outgoing => client.outgoing_calls(&item).await?,
+    };
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&json!({
+                "item": item,
+                "calls": result,
+            }))?,
         }],
     })
 }

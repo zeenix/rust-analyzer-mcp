@@ -69,6 +69,77 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "rust_analyzer_implementation".to_string(),
+            description: "Find what implements the trait, or the trait method, at a position. \
+                          The one question no text search can answer even in principle: which \
+                          type an implementation belongs to is decided by dispatch, not by \
+                          anything written at the position, so grep and structural search both \
+                          fail on it. Asked on a trait, it finds the types implementing it; on a \
+                          trait method, the bodies that implement that method."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_type_definition".to_string(),
+            description: "Go to the definition of the TYPE of the thing at a position, rather \
+                          than the thing itself. On a variable or a field, this lands on the \
+                          type it holds; plain definition would land on the variable's own \
+                          declaration."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_incoming_calls".to_string(),
+            description: "Find the FUNCTIONS that call the function at a position, each with the \
+                          places inside it where the call is made. Different from references, \
+                          which lists every mention of the name and leaves working out what \
+                          contains each one to you. The position must be on something callable; \
+                          the call-hierarchy item it resolves to is returned alongside the \
+                          calls, so you can see what was actually asked about."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
+            name: "rust_analyzer_outgoing_calls".to_string(),
+            description: "Find the functions called BY the function at a position. Expect hits \
+                          outside the workspace: a call into a dependency or the standard \
+                          library resolves to that crate's own sources."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
+                    "line": { "type": "number", "description": "Line number (0-based)" },
+                    "character": { "type": "number", "description": "Character position (0-based)" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
             name: "rust_analyzer_workspace_symbols".to_string(),
             description: "Search the whole workspace for symbols by name, and get the position \
                           of each one -- the only way here to turn a name into the file, line \
