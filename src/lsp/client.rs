@@ -280,6 +280,20 @@ impl RustAnalyzerClient {
                     "definition": {
                         "linkSupport": true
                     },
+                    // What a value's type is declared as, and which types carry a trait's
+                    // implementation -- the second being the one question no text search can
+                    // answer at all, since the answer is decided by dispatch rather than by
+                    // anything written at the call.
+                    "typeDefinition": {
+                        "linkSupport": true
+                    },
+                    "implementation": {
+                        "linkSupport": true
+                    },
+                    // Which functions call this one, as opposed to where its name appears.
+                    "callHierarchy": {
+                        "dynamicRegistration": false
+                    },
                     "references": {},
                     // Ask for the nested `DocumentSymbol` shape rather than the flat
                     // `SymbolInformation` one rust-analyzer falls back to. Only the nested shape

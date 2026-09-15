@@ -1,13 +1,16 @@
 mod integration {
     mod diagnostics;
     mod edits;
+    mod extensions;
     mod features;
     mod mcp_server_test;
+    mod navigation;
     mod notifications;
     mod rename;
     mod shared_test;
     mod shutdown;
     mod symbols;
+    mod workspace;
 }
 mod unit {
     mod protocol {
