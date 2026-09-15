@@ -89,6 +89,7 @@ pub async fn handle_tool_call(
         "rust_analyzer_references" => handle_references(server, args).await,
         "rust_analyzer_completion" => handle_completion(server, args).await,
         "rust_analyzer_symbols" => handle_symbols(server, args).await,
+        "rust_analyzer_workspace_symbols" => handle_workspace_symbols(server, args).await,
         "rust_analyzer_format" => handle_format(server, args).await,
         "rust_analyzer_code_actions" => handle_code_actions(server, args).await,
         "rust_analyzer_rename" => handle_rename(server, args).await,
@@ -204,6 +205,33 @@ async fn handle_symbols(server: &mut RustAnalyzerMCPServer, args: Value) -> Resu
     // it is.
     let result = client.document_symbols(&uri).await?;
     debug!("Document symbols result: {:?}", result);
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_workspace_symbols(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let Some(query) = args["query"].as_str() else {
+        return Err(anyhow!("Missing query"));
+    };
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    // Every symbol in the workspace is the answer to this, so an index that has only reached
+    // part of the workspace answers about part of it -- and short of a name is exactly how a
+    // complete answer looks too.
+    ensure_index_ready(client).await?;
+
+    let result = client.workspace_symbols(query).await?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
