@@ -139,6 +139,14 @@ pub fn start_server(workspace_path: &Path, project_type: &str) -> Result<()> {
 
         match listener.accept() {
             Ok((stream, _)) => {
+                // The listener is non-blocking so that the accept above can poll for shutdown,
+                // and on the BSDs -- macOS among them -- an accepted connection inherits that
+                // from its listener, where on Linux it does not. Everything below treats the
+                // connection as blocking: left inherited, a response larger than the socket's
+                // send buffer comes back as a partial write and the client is handed a line that
+                // stops mid-JSON.
+                stream.set_nonblocking(false)?;
+
                 // Update last activity
                 *last_activity.lock().unwrap() = Instant::now();
 
@@ -376,8 +384,15 @@ fn wait_for_ready(
     Ok(())
 }
 
+/// Where the daemon for `project_type` listens.
+///
+/// The directory is named as briefly as it can stand being: a unix socket's path has to fit in
+/// `sun_path`, which is 104 bytes on macOS including the terminator, and a temporary directory
+/// there is already about half of that (`/var/folders/xx/<26 characters>/T/`). Spelling the
+/// directory out in full put the longest project's socket at exactly 104 bytes, and every test
+/// using it failed to reach a daemon that could never bind.
 pub fn socket_path(project_type: &str) -> PathBuf {
-    let socket_dir = std::env::temp_dir().join("rust-analyzer-mcp-sockets");
+    let socket_dir = std::env::temp_dir().join("ra-mcp-socks");
     let _ = fs::create_dir_all(&socket_dir);
     socket_dir.join(format!("{}.sock", project_type))
 }

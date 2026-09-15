@@ -46,7 +46,8 @@ impl IpcClient {
             "test-project"
             | "test-project-singleton"
             | "test-project-concurrent"
-            | "test-project-rename" => {
+            | "test-project-rename"
+            | "test-project-symbols" => {
                 let manifest_dir =
                     std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
                 Path::new(&manifest_dir).join("test-project")
