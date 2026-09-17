@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod config;
 pub mod diagnostics;
+pub mod locations;
 pub mod lsp;
 pub mod mcp;
 pub mod position;
