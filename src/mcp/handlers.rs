@@ -76,6 +76,42 @@ async fn ensure_index_ready(client: &RustAnalyzerClient) -> Result<()> {
     ))
 }
 
+/// Explains an empty answer that the loaded workspace accounts for, and leaves every other
+/// answer alone.
+///
+/// rust-analyzer only knows the workspace it was pointed at. Asked about a file outside it, it
+/// does not say so -- it answers `null`, or an empty list, which is also what it answers for a
+/// symbol nothing refers to and for a position that is not on a symbol. That is the same silent
+/// wrong answer the readiness gate exists to prevent, arriving by a different route: the gate is
+/// satisfied, because a workspace with no Rust in it finishes loading immediately.
+///
+/// A file outside the root is not wrong in itself -- a definition can lead into a dependency's
+/// sources, and asking about one there works -- so this only speaks up when the answer was
+/// empty anyway.
+fn explain_empty_answer(
+    server: &RustAnalyzerMCPServer,
+    result: &Value,
+    file_path: &str,
+) -> Result<()> {
+    let empty = result.is_null() || result.as_array().is_some_and(|items| items.is_empty());
+    if !empty
+        || server
+            .resolve_path(file_path)
+            .starts_with(&server.workspace_root)
+    {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "rust-analyzer had nothing to say about {}, which is outside the workspace it has \
+         loaded ({}). Everything it knows comes from that workspace, so a file outside it reads \
+         as empty rather than as unknown. Point it at the project this file belongs to with \
+         rust_analyzer_set_workspace, then ask again.",
+        file_path,
+        server.workspace_root.display()
+    ))
+}
+
 pub async fn handle_tool_call(
     server: &mut RustAnalyzerMCPServer,
     tool_name: &str,
@@ -90,6 +126,13 @@ pub async fn handle_tool_call(
         "rust_analyzer_completion" => handle_completion(server, args).await,
         "rust_analyzer_symbols" => handle_symbols(server, args).await,
         "rust_analyzer_workspace_symbols" => handle_workspace_symbols(server, args).await,
+        "rust_analyzer_type_definition" => handle_type_definition(server, args).await,
+        "rust_analyzer_implementation" => handle_implementation(server, args).await,
+        "rust_analyzer_expand_macro" => handle_expand_macro(server, args).await,
+        "rust_analyzer_related_tests" => handle_related_tests(server, args).await,
+        "rust_analyzer_runnables" => handle_runnables(server, args).await,
+        "rust_analyzer_incoming_calls" => handle_calls(server, args, Calls::Incoming).await,
+        "rust_analyzer_outgoing_calls" => handle_calls(server, args, Calls::Outgoing).await,
         "rust_analyzer_format" => handle_format(server, args).await,
         "rust_analyzer_code_actions" => handle_code_actions(server, args).await,
         "rust_analyzer_rename" => handle_rename(server, args).await,
@@ -113,6 +156,7 @@ async fn handle_hover(server: &mut RustAnalyzerMCPServer, args: Value) -> Result
     ensure_index_ready(client).await?;
 
     let result = client.hover(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -135,6 +179,7 @@ async fn handle_definition(server: &mut RustAnalyzerMCPServer, args: Value) -> R
     ensure_index_ready(client).await?;
 
     let result = client.definition(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -157,6 +202,7 @@ async fn handle_references(server: &mut RustAnalyzerMCPServer, args: Value) -> R
     ensure_index_ready(client).await?;
 
     let result = client.references(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -179,6 +225,7 @@ async fn handle_completion(server: &mut RustAnalyzerMCPServer, args: Value) -> R
     ensure_index_ready(client).await?;
 
     let result = client.completion(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -203,13 +250,220 @@ async fn handle_symbols(server: &mut RustAnalyzerMCPServer, args: Value) -> Resu
     // symbols of one file are worked out from that file alone, so this answers correctly while
     // the rest of rust-analyzer is still catching up -- and it is the one thing left to ask when
     // it is.
-    let result = client.document_symbols(&uri).await?;
+    let mut result = client.document_symbols(&uri).await?;
+
+    // Except immediately after the file is opened, when rust-analyzer has yet to parse it and
+    // answers `null` -- an answer that reads as a file with nothing in it. Rare when the machine
+    // is idle and common when several rust-analyzers are competing for it, which is the sort of
+    // difference that turns into a test that fails only in CI. Waiting for the load it did not
+    // need is the cheapest way to be sure the second answer means something.
+    if result.is_null() {
+        debug!("No symbols for {} yet; waiting for rust-analyzer", uri);
+        ensure_index_ready(client).await?;
+        result = client.document_symbols(&uri).await?;
+    }
+
     debug!("Document symbols result: {:?}", result);
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
             text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_type_definition(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client.type_definition(&uri, line, character).await?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_implementation(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client.implementation(&uri, line, character).await?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_expand_macro(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client.expand_macro(&uri, line, character).await?;
+    if result.is_null() {
+        return Err(anyhow!(
+            "Nothing to expand at {}:{}:{}. The position has to be on a macro call; a macro \
+             whose expansion rust-analyzer cannot work out answers the same way.",
+            file_path,
+            line,
+            character
+        ));
+    }
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_related_tests(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client.related_tests(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+async fn handle_runnables(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    // A position is optional here, unlike everywhere else: without one the answer covers the
+    // whole file, which is what "how do I run this" usually means.
+    let position = match (args["line"].as_u64(), args["character"].as_u64()) {
+        (Some(line), Some(character)) => Some((line as u32, character as u32)),
+        _ => None,
+    };
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client.runnables(&uri, position).await?;
+    explain_empty_answer(server, &result, &file_path)?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+/// Which way round a call hierarchy is being asked about.
+#[derive(Clone, Copy)]
+enum Calls {
+    /// What calls the function at the position.
+    Incoming,
+    /// What the function at the position calls.
+    Outgoing,
+}
+
+async fn handle_calls(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+    direction: Calls,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = &mut server.client else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    // A call hierarchy is about an item rather than a position, and the item has to be asked for
+    // first. Doing it here rather than exposing it as a tool of its own keeps the round trip in
+    // one place: the item is of no use to anyone except as the argument to these two calls.
+    let prepared = client.prepare_call_hierarchy(&uri, line, character).await?;
+    let Some(item) = prepared.as_array().and_then(|items| items.first()) else {
+        return Err(anyhow!(
+            "Nothing callable at {}:{}:{}. A call hierarchy starts at a function, a method or \
+             something else that can be called; check the position is on the name of one.",
+            file_path,
+            line,
+            character
+        ));
+    };
+    let item = item.clone();
+
+    let result = match direction {
+        Calls::Incoming => client.incoming_calls(&item).await?,
+        Calls::Outgoing => client.outgoing_calls(&item).await?,
+    };
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&json!({
+                "item": item,
+                "calls": result,
+            }))?,
         }],
     })
 }
@@ -514,16 +768,36 @@ async fn handle_set_workspace(
         return Err(anyhow!("Missing workspace_path"));
     };
 
+    // Work out the new root before anything is torn down, taking a `file:` URI as readily as a
+    // path, and taking the manifest itself to mean the directory holding it.
+    let named = uri::uri_to_path(workspace_path).unwrap_or_else(|| workspace_path.into());
+    let named = uri::absolute(&named);
+    let workspace_root = match named.file_name() {
+        Some(name) if name == "Cargo.toml" => named.parent().unwrap_or(&named).to_path_buf(),
+        _ => named,
+    };
+
+    // A directory with no manifest in it is not a workspace, and rust-analyzer started on one
+    // has nothing loaded and says nothing about any file -- which reads as a workspace full of
+    // code nothing refers to. Refusing here costs a typo'd path; accepting one quietly redirects
+    // every question asked afterwards.
+    if !workspace_root.join("Cargo.toml").is_file() {
+        return Err(anyhow!(
+            "{} is not a Rust workspace: no Cargo.toml in it. rust-analyzer started there would \
+             load nothing and answer every question about every file with silence, so the \
+             workspace is left as it was ({}).",
+            workspace_root.display(),
+            server.workspace_root.display()
+        ));
+    }
+
     // Shutdown existing client.
     if let Some(client) = &mut server.client {
         client.shutdown().await?;
     }
     server.client = None;
 
-    // Set new workspace with proper absolute path handling, taking a `file:` URI as readily as
-    // a path.
-    let workspace_root = uri::uri_to_path(workspace_path).unwrap_or_else(|| workspace_path.into());
-    server.workspace_root = uri::absolute(&workspace_root);
+    server.workspace_root = workspace_root;
 
     // Start the new client automatically.
     server.ensure_client_started().await?;
