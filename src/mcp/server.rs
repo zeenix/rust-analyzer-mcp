@@ -12,7 +12,20 @@ use crate::{
 };
 
 pub struct RustAnalyzerMCPServer {
-    pub(super) client: Option<RustAnalyzerClient>,
+    /// One rust-analyzer per workspace that has been asked about, kept by its root.
+    ///
+    /// The workspace used to be a single setting, which made it shared mutable state: two callers
+    /// of one server -- an agent and the subagents it fans out, say -- would each point it at
+    /// their own project, and the loser of that race got answered from the winner's index. Not
+    /// wrongly enough to notice: a file the loaded workspace does not contain comes back empty,
+    /// which reads as dead code.
+    ///
+    /// A call that names its workspace is therefore answered by that workspace's own
+    /// rust-analyzer, and cannot be retargeted by anyone else. Each one costs what a
+    /// rust-analyzer costs, which is why nothing spawns one implicitly: only a call that asks for
+    /// a workspace by name, or `set_workspace`, adds to this.
+    pub(super) clients: std::collections::HashMap<PathBuf, RustAnalyzerClient>,
+    /// The workspace a call that does not name one is answered by.
     pub(super) workspace_root: PathBuf,
     /// What rust-analyzer is asked to run with, for every rust-analyzer this server starts.
     pub(super) settings: Settings,
@@ -27,7 +40,7 @@ impl Default for RustAnalyzerMCPServer {
 impl RustAnalyzerMCPServer {
     pub fn new() -> Self {
         Self {
-            client: None,
+            clients: std::collections::HashMap::new(),
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             settings: Settings::default(),
         }
@@ -35,9 +48,52 @@ impl RustAnalyzerMCPServer {
 
     pub fn with_workspace(workspace_root: PathBuf) -> Self {
         Self {
-            client: None,
+            clients: std::collections::HashMap::new(),
             workspace_root: uri::absolute(&workspace_root),
             settings: Settings::default(),
+        }
+    }
+
+    /// The rust-analyzer answering for the workspace this call is about, if it has been started.
+    pub(super) fn client(&mut self) -> Option<&mut RustAnalyzerClient> {
+        self.clients.get_mut(&self.workspace_root)
+    }
+
+    /// Points the rest of this call at `workspace_path`, leaving the default alone.
+    ///
+    /// A workspace named by a call is checked the way `set_workspace` checks one: a directory
+    /// with no `Cargo.toml` is refused rather than started in, because rust-analyzer there loads
+    /// nothing and answers every question emptily.
+    pub(super) fn select_workspace(&mut self, workspace_path: Option<&str>) -> Result<()> {
+        let Some(workspace_path) = workspace_path else {
+            return Ok(());
+        };
+
+        let named = uri::uri_to_path(workspace_path).unwrap_or_else(|| workspace_path.into());
+        self.workspace_root = manifest_directory(&uri::absolute(&named))
+            .map_err(|e| anyhow::anyhow!("{e} That is what this call's workspace_path names."))?;
+        Ok(())
+    }
+
+    /// Forgets every workspace but the one in use, shutting its rust-analyzer down.
+    ///
+    /// A workspace named per call is kept, on the grounds that it will be named again; moving the
+    /// default with `set_workspace` says the opposite, and an idle rust-analyzer is a gigabyte or
+    /// so of index nobody is asking about.
+    pub(super) async fn drop_other_workspaces(&mut self) {
+        let elsewhere: Vec<PathBuf> = self
+            .clients
+            .keys()
+            .filter(|root| **root != self.workspace_root)
+            .cloned()
+            .collect();
+
+        for root in elsewhere {
+            if let Some(mut client) = self.clients.remove(&root) {
+                info!("Shutting down rust-analyzer for {}", root.display());
+                // It kills the process either way, so a failed handshake is nothing to report.
+                let _ = client.shutdown().await;
+            }
         }
     }
 
@@ -51,21 +107,21 @@ impl RustAnalyzerMCPServer {
         // rust-analyzer does die on occasion (it panics on some requests, see open_document());
         // keeping a dead client around would fail every tool call for the rest of this server's
         // life, so respawn it instead.
-        if let Some(client) = &mut self.client {
+        if let Some(client) = self.clients.get_mut(&self.workspace_root) {
             if client.is_gone() {
                 match client.exit_status() {
                     Some(status) => warn!("rust-analyzer exited ({status}), restarting it"),
                     None => warn!("rust-analyzer closed its connection, restarting it"),
                 }
-                self.client = None;
+                self.clients.remove(&self.workspace_root);
             }
         }
 
-        if self.client.is_none() {
+        if !self.clients.contains_key(&self.workspace_root) {
             let mut client =
                 RustAnalyzerClient::new(self.workspace_root.clone(), self.settings.to_json());
             client.start().await?;
-            self.client = Some(client);
+            self.clients.insert(self.workspace_root.clone(), client);
         }
         Ok(())
     }
@@ -77,7 +133,7 @@ impl RustAnalyzerMCPServer {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", path.display(), e))?;
 
-        let Some(client) = &mut self.client else {
+        let Some(client) = self.clients.get_mut(&self.workspace_root) else {
             return Err(anyhow::anyhow!("Client not initialized"));
         };
 
@@ -91,7 +147,7 @@ impl RustAnalyzerMCPServer {
     /// across the workspace and is worked out from whatever rust-analyzer holds for each file it
     /// touches. Anything stale in there comes back as an edit to a line that has moved.
     pub(super) async fn refresh_open_documents(&mut self) -> Result<()> {
-        let Some(client) = &mut self.client else {
+        let Some(client) = self.clients.get_mut(&self.workspace_root) else {
             return Err(anyhow::anyhow!("Client not initialized"));
         };
 
@@ -243,7 +299,7 @@ impl RustAnalyzerMCPServer {
         // killing the process, so this cannot stall. A second signal — counting the one that may
         // have triggered the exit — skips the handshake and kills rust-analyzer immediately.
         info!("Shutting down");
-        if let Some(client) = &mut self.client {
+        for client in self.clients.values_mut() {
             let graceful = {
                 let shutting_down = client.shutdown();
                 tokio::pin!(shutting_down);
@@ -363,6 +419,33 @@ impl RustAnalyzerMCPServer {
             },
         }
     }
+}
+
+/// The workspace root `workspace_path` names, refusing anything that is not one.
+///
+/// Takes a `file:` URI as readily as a path, and takes the manifest itself to mean the directory
+/// holding it. A directory with no manifest in it is not a workspace: rust-analyzer started on one
+/// has nothing loaded and says nothing about any file, which reads as a workspace full of code
+/// nothing refers to. Refusing costs a typo'd path; accepting quietly redirects every question
+/// asked afterwards.
+pub(super) fn manifest_directory(workspace_path: &std::path::Path) -> Result<PathBuf> {
+    let root = match workspace_path.file_name() {
+        Some(name) if name == "Cargo.toml" => workspace_path
+            .parent()
+            .unwrap_or(workspace_path)
+            .to_path_buf(),
+        _ => workspace_path.to_path_buf(),
+    };
+
+    if !root.join("Cargo.toml").is_file() {
+        return Err(anyhow::anyhow!(
+            "{} is not a Rust workspace: no Cargo.toml in it. rust-analyzer started there would \
+             load nothing and answer every question about every file with silence.",
+            root.display()
+        ));
+    }
+
+    Ok(root)
 }
 
 /// Merged stream of the signals that request server shutdown.
