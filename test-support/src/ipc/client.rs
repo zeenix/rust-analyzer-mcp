@@ -47,7 +47,10 @@ impl IpcClient {
             | "test-project-singleton"
             | "test-project-concurrent"
             | "test-project-rename"
-            | "test-project-symbols" => {
+            | "test-project-symbols"
+            // Retargeting a daemon outlives the test that did it, so the test that retargets one
+            // gets a daemon nobody else shares.
+            | "test-project-set-workspace" => {
                 let manifest_dir =
                     std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
                 Path::new(&manifest_dir).join("test-project")

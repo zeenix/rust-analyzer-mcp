@@ -84,14 +84,32 @@ impl MCPTestClient {
         let release_binary = project_root.join("target/release/rust-analyzer-mcp");
         let debug_binary = project_root.join("target/debug/rust-analyzer-mcp");
 
-        let binary = if release_binary.exists() {
-            release_binary
-        } else if debug_binary.exists() {
-            debug_binary
+        // Take the binary built the way these tests were, and only fall back to the other one.
+        // Cargo rebuilds the profile it is running, and leaves the other exactly as it was: a
+        // release binary from an older revision sitting in target/ is not stale in any way the
+        // tests can see, so they would go on passing -- or failing -- against code that is no
+        // longer in the tree.
+        let (preferred, fallback) = if cfg!(debug_assertions) {
+            (debug_binary, release_binary)
         } else {
-            // Fall back to cargo run if binary not built
-            return Self::start_with_cargo_internal(workspace, isolated_project).await;
+            (release_binary, debug_binary)
         };
+
+        let binary =
+            if preferred.exists() {
+                preferred
+            } else if fallback.exists() {
+                eprintln!(
+                "warning: no {} build of rust-analyzer-mcp; testing {} instead, which cargo has \
+                 not rebuilt for this run",
+                if cfg!(debug_assertions) { "debug" } else { "release" },
+                fallback.display()
+            );
+                fallback
+            } else {
+                // Fall back to cargo run if binary not built
+                return Self::start_with_cargo_internal(workspace, isolated_project).await;
+            };
 
         // Generate unique IDs for this test instance
         let unique_id = format!(
