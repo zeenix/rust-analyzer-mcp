@@ -119,6 +119,105 @@ impl RustAnalyzerClient {
             .await
     }
 
+    /// Where the type of the thing at a position is defined, as opposed to the thing itself.
+    pub async fn type_definition(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        self.send_request("textDocument/typeDefinition", Some(params))
+            .await
+    }
+
+    /// What implements the trait, or the trait method, at a position.
+    pub async fn implementation(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        self.send_request("textDocument/implementation", Some(params))
+            .await
+    }
+
+    /// The call-hierarchy item at a position: what the calls asked for afterwards are about.
+    pub async fn prepare_call_hierarchy(
+        &mut self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        self.send_request("textDocument/prepareCallHierarchy", Some(params))
+            .await
+    }
+
+    /// The functions that call `item`, each with the places inside it where the call is made.
+    pub async fn incoming_calls(&mut self, item: &Value) -> Result<Value> {
+        let params = json!({ "item": item });
+
+        self.send_request("callHierarchy/incomingCalls", Some(params))
+            .await
+    }
+
+    /// The functions `item` calls.
+    pub async fn outgoing_calls(&mut self, item: &Value) -> Result<Value> {
+        let params = json!({ "item": item });
+
+        self.send_request("callHierarchy/outgoingCalls", Some(params))
+            .await
+    }
+
+    /// What the macro call at a position expands to.
+    ///
+    /// A rust-analyzer extension rather than LSP, and one it does not advertise in its
+    /// capabilities -- probed against rust-analyzer 1.97.1, which answers it.
+    pub async fn expand_macro(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        self.send_request("rust-analyzer/expandMacro", Some(params))
+            .await
+    }
+
+    /// The tests that exercise the symbol at a position.
+    ///
+    /// Another unadvertised rust-analyzer extension; also answered by 1.97.1.
+    pub async fn related_tests(&mut self, uri: &str, line: u32, character: u32) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        });
+
+        self.send_request("rust-analyzer/relatedTests", Some(params))
+            .await
+    }
+
+    /// The cargo commands that run what is in a file, or what is at a position within it.
+    ///
+    /// Note the `experimental/` prefix: `rust-analyzer/runnables` is not a method, and answers
+    /// `unknown request`. The two namespaces are not interchangeable and which extension lives
+    /// in which is not derivable from anything.
+    pub async fn runnables(&mut self, uri: &str, position: Option<(u32, u32)>) -> Result<Value> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": position.map(|(line, character)| json!({
+                "line": line,
+                "character": character
+            }))
+        });
+
+        self.send_request("experimental/runnables", Some(params))
+            .await
+    }
+
     /// The symbols across the whole workspace whose names match `query`.
     ///
     /// rust-analyzer scores this fuzzily rather than matching it, and answers with the best few

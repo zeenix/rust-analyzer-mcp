@@ -121,7 +121,10 @@ async fn test_file_uri_is_accepted_as_a_path() -> Result<()> {
 
 #[tokio::test]
 async fn test_workspace_change() -> Result<()> {
-    let mut client = IpcClient::get_or_create("test-project").await?;
+    // A daemon of this test's own: the workspace it is about to be pointed at outlives this
+    // test, and every later question asked of a shared daemon would be answered about the wrong
+    // project.
+    let mut client = IpcClient::get_or_create("test-project-set-workspace").await?;
 
     // Create a second isolated project to switch to
     let second_project = test_support::IsolatedProject::new()?;
