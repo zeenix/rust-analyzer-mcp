@@ -8,6 +8,7 @@ mod integration {
     mod shared_test;
     mod shutdown;
     mod symbols;
+    mod workspace;
 }
 mod unit {
     mod protocol {
